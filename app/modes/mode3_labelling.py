@@ -6,7 +6,7 @@ import logging
 import math
 import os
 import shutil
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -756,6 +756,7 @@ class Mode3Widget(QWidget):
                 except Exception as exc:
                     log.error("Trim failed for %s: %s", dst, exc)
 
+            signal_exported = False
             if self._merged_df is not None and not self._merged_df.empty:
                 try:
                     t0 = self.state.tracks[0]
@@ -771,21 +772,54 @@ class Mode3Widget(QWidget):
                         ]
                         if not sub.empty:
                             sub.to_csv(seg_dir / "signal.csv", index=False)
+                            signal_exported = True
                 except Exception as exc:
                     log.error("Signal export error for segment %d: %s", idx, exc)
 
+            # Build enriched meta.json (aligned with project_meta.json)
+            cameras_meta = []
+            for ti, track in enumerate(self.state.tracks):
+                cam_file = f"cam{ti+1}_{track.camera_label}.mp4"
+                cameras_meta.append({
+                    "label": track.camera_label,
+                    "video_file": cam_file,
+                    "fps": track.fps,
+                    "dimensions": [track.width, track.height],
+                    "codec": track.codec,
+                })
+
+            # Resolve synced_signal_path relative to the segment folder
+            synced_rel = None
+            sp = self.state.synced_signal_path
+            if sp and Path(sp).exists():
+                try:
+                    synced_rel = os.path.relpath(sp, seg_dir)
+                except ValueError:
+                    synced_rel = sp
+
             meta = {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
                 "index": idx,
                 "label": iv.label,
                 "start_sec": iv.start_sec,
                 "end_sec": iv.end_sec,
                 "duration_sec": iv.end_sec - iv.start_sec,
                 "folder": seg_name,
+                "cameras": cameras_meta,
+                "signal_file": "signal.csv" if signal_exported else None,
+                "synced_signal_path": synced_rel,
             }
             (seg_dir / "meta.json").write_text(
                 json.dumps(meta, indent=2), encoding="utf-8"
             )
-            manifest_rows.append(meta)
+            manifest_rows.append({
+                "index": idx,
+                "label": iv.label,
+                "start_sec": iv.start_sec,
+                "end_sec": iv.end_sec,
+                "duration_sec": iv.end_sec - iv.start_sec,
+                "folder": seg_name,
+            })
 
         manifest_path = segments_dir / "manifest.csv"
         with open(manifest_path, "w", newline="", encoding="utf-8") as f:
