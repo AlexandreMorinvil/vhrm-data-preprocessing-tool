@@ -169,13 +169,36 @@ class Mode3Widget(QWidget):
                 dfs.append(df)
         if dfs:
             merged = pd.concat(dfs, ignore_index=True)
-            if self.state.signal_mode == "average":
-                merged = (
-                    merged.groupby("timestamp_utc", as_index=False)
-                    .agg({"value": "mean", "sensor_id": "first"})
-                )
-                merged["sensor_id"] = "averaged"
-            self._merged_df = merged.sort_values("timestamp_utc").reset_index(drop=True)
+
+            # Clip to video time range if tracks are available
+            if self.state.tracks:
+                t0_track = self.state.tracks[0]
+                dt_start = t0_track.parsed_start_datetime()
+                dur = t0_track.duration_sec
+                if dt_start is not None:
+                    from datetime import timedelta as _td
+                    dt_end = dt_start + _td(seconds=dur)
+                    start_ts = pd.Timestamp(dt_start)
+                    end_ts = pd.Timestamp(dt_end)
+                    merged = merged[
+                        (merged["timestamp_utc"] >= start_ts)
+                        & (merged["timestamp_utc"] <= end_ts)
+                    ]
+
+            if merged.empty:
+                return
+
+            # Pivot to wide format
+            wide = merged.pivot_table(
+                index="timestamp_utc", columns="sensor_id", values="value", aggfunc="first"
+            )
+            wide.columns.name = None
+            wide = wide.sort_index().ffill().bfill()
+
+            if self.state.include_signal_average:
+                wide["averaged"] = wide.mean(axis=1)
+
+            self._merged_df = wide.reset_index()
             dur = self.state.tracks[0].duration_sec if self.state.tracks else 0
             self._plot.set_data(self._merged_df, video_duration_sec=dur)
 

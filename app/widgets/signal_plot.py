@@ -54,12 +54,27 @@ class SignalPlot(QWidget):
             self._canvas.draw_idle()
             return
 
-        self._sensor_ids = list(self._df["sensor_id"].unique())
-        for sid in self._sensor_ids:
-            sub = self._df[self._df["sensor_id"] == sid]
-            t0 = sub["timestamp_utc"].iloc[0]
-            rel_sec = (sub["timestamp_utc"] - t0).dt.total_seconds() + self._video_start_sec
-            self._ax.plot(rel_sec, sub["value"], label=str(sid), linewidth=0.8)
+        # Detect format: wide (no sensor_id column) vs legacy long
+        if "sensor_id" in self._df.columns:
+            # Legacy long format
+            self._sensor_ids = list(self._df["sensor_id"].unique())
+            for sid in self._sensor_ids:
+                sub = self._df[self._df["sensor_id"] == sid]
+                t0 = sub["timestamp_utc"].iloc[0]
+                rel_sec = (sub["timestamp_utc"] - t0).dt.total_seconds() + self._video_start_sec
+                self._ax.plot(rel_sec, sub["value"], label=str(sid), linewidth=0.8)
+        else:
+            # Wide format: each column except timestamp_utc is a series
+            value_cols = [c for c in self._df.columns if c != "timestamp_utc"]
+            self._sensor_ids = value_cols
+            t0 = self._df["timestamp_utc"].iloc[0]
+            rel_sec = (self._df["timestamp_utc"] - t0).dt.total_seconds() + self._video_start_sec
+            for col in value_cols:
+                if col == "averaged":
+                    self._ax.plot(rel_sec, self._df[col], label=col,
+                                  linewidth=1.2, linestyle="--")
+                else:
+                    self._ax.plot(rel_sec, self._df[col], label=col, linewidth=0.8)
 
         self._ax.set_xlabel("Time (s from video start)")
         self._ax.set_ylabel("Value")

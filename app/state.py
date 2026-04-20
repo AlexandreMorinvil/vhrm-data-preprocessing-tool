@@ -85,7 +85,7 @@ class ProjectState:
     num_cameras: int = 2
     tracks: list[VideoTrack] = field(default_factory=list)
     signal_paths: list[str] = field(default_factory=list)
-    signal_mode: str = "separate"
+    include_signal_average: bool = False
     labels_library: list[str] = field(default_factory=lambda: [
         "Baseline", "Resting", "Resistance exercise", "Cardio exercise"
     ])
@@ -107,6 +107,10 @@ class ProjectState:
     def from_dict(cls, d: dict[str, Any]) -> ProjectState:
         tracks = [VideoTrack.from_dict(t) for t in d.pop("tracks", [])]
         intervals = [LabelInterval.from_dict(i) for i in d.pop("intervals", [])]
+        # Backward compat: old "signal_mode" → new "include_signal_average"
+        old_mode = d.pop("signal_mode", None)
+        if old_mode is not None and "include_signal_average" not in d:
+            d["include_signal_average"] = (old_mode == "average")
         valid = {k for k in cls.__dataclass_fields__}
         filtered = {k: v for k, v in d.items() if k in valid}
         state = cls(**filtered)

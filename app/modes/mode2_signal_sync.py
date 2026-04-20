@@ -10,7 +10,6 @@ import pandas as pd
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QCheckBox,
-    QComboBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -82,16 +81,10 @@ class Mode2Widget(QWidget):
         btn_row.addWidget(remove_btn)
         ll.addLayout(btn_row)
 
-        mode_grp = QGroupBox("Dual-sensor handling")
-        mode_lay = QVBoxLayout(mode_grp)
-        self._mode_combo = QComboBox()
-        self._mode_combo.addItems(["Keep separate", "Average values"])
-        self._mode_combo.setCurrentText(
-            "Average values" if state.signal_mode == "average" else "Keep separate"
-        )
-        self._mode_combo.currentTextChanged.connect(self._on_mode_changed)
-        mode_lay.addWidget(self._mode_combo)
-        ll.addWidget(mode_grp)
+        self._avg_checkbox = QCheckBox("Include average column")
+        self._avg_checkbox.setChecked(state.include_signal_average)
+        self._avg_checkbox.toggled.connect(self._on_avg_toggled)
+        ll.addWidget(self._avg_checkbox)
 
         self._load_btn = QPushButton("Load && synchronise signals")
         self._load_btn.setStyleSheet("font-weight:bold; padding:8px;")
@@ -194,8 +187,8 @@ class Mode2Widget(QWidget):
         for item in self._file_list.selectedItems():
             self._file_list.takeItem(self._file_list.row(item))
 
-    def _on_mode_changed(self, text):
-        self.state.signal_mode = "average" if "Average" in text else "separate"
+    def _on_avg_toggled(self, checked):
+        self.state.include_signal_average = checked
 
     def _load_and_sync(self):
         paths = []
@@ -221,6 +214,9 @@ class Mode2Widget(QWidget):
 
         merged = pd.concat(self._signal_dfs, ignore_index=True)
 
+        # Track which sensors exist before clipping
+        all_sensors = set(merged["sensor_id"].unique())
+
         if self.state.tracks:
             t0_track = self.state.tracks[0]
             dt_start = t0_track.parsed_start_datetime()
@@ -235,14 +231,34 @@ class Mode2Widget(QWidget):
                     & (merged["timestamp_utc"] <= end_ts)
                 ]
 
-        if self.state.signal_mode == "average":
-            merged = (
-                merged.groupby("timestamp_utc", as_index=False)
-                .agg({"value": "mean", "sensor_id": "first"})
-            )
-            merged["sensor_id"] = "averaged"
+                # Warn about sensors that were completely filtered out
+                surviving_sensors = set(merged["sensor_id"].unique())
+                lost = all_sensors - surviving_sensors
+                if lost:
+                    QMessageBox.warning(
+                        self, "Sensors outside video range",
+                        f"The following sensor(s) had no data within the video "
+                        f"time range and were excluded:\n\n"
+                        + "\n".join(f"  • {s}" for s in sorted(lost))
+                    )
 
-        self._merged_df = merged.sort_values("timestamp_utc").reset_index(drop=True)
+        if merged.empty:
+            QMessageBox.warning(self, "Warning", "No signal data within the video time range.")
+            return
+
+        # Pivot from long to wide format
+        wide = merged.pivot_table(
+            index="timestamp_utc", columns="sensor_id", values="value", aggfunc="first"
+        )
+        wide.columns.name = None  # remove the "sensor_id" label from columns
+        wide = wide.sort_index().ffill().bfill()
+
+        if self.state.include_signal_average:
+            wide["averaged"] = wide.mean(axis=1)
+
+        wide = wide.reset_index()
+
+        self._merged_df = wide
 
         video_dur = 0.0
         if self.state.tracks:
@@ -250,7 +266,7 @@ class Mode2Widget(QWidget):
         self._plot.set_data(self._merged_df, video_duration_sec=video_dur)
 
         # Export clipped signal CSV
-        csv_name = "signal_synced_averaged.csv" if self.state.signal_mode == "average" else "signal_synced.csv"
+        csv_name = "signal_synced.csv"
         out_dir = self.state.output_directory
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
