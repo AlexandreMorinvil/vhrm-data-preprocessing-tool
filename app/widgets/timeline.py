@@ -64,6 +64,7 @@ class TimelineWidget(QWidget):
     interval_relabelled = pyqtSignal(int, str)
     interval_resized = pyqtSignal(int, float, float)   # idx, new_start, new_end
     subdivide_requested = pyqtSignal(int)
+    mosaic_requested = pyqtSignal(int)
     playhead_moved = pyqtSignal(float)
 
     def __init__(self, parent=None):
@@ -346,7 +347,8 @@ class TimelineWidget(QWidget):
     def _show_context_menu(self, event, idx):
         menu = QMenu(self)
         relabel_action = menu.addAction("Relabel")
-        subdivide_action = menu.addAction("Subdivide …")
+        subdivide_action = menu.addAction("Subdivide \u2026")
+        mosaic_action = menu.addAction("Export mosaic \u2026")
         menu.addSeparator()
         delete_action = menu.addAction("Delete")
         chosen = menu.exec(event.globalPosition().toPoint())
@@ -361,5 +363,7 @@ class TimelineWidget(QWidget):
                 self.update()
         elif chosen == subdivide_action:
             self.subdivide_requested.emit(idx)
+        elif chosen == mosaic_action:
+            self.mosaic_requested.emit(idx)
         elif chosen == delete_action:
             self.interval_deleted.emit(idx)

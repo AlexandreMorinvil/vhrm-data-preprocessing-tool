@@ -15,12 +15,15 @@ from PyQt6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
+    QProgressBar,
     QPushButton,
     QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
+from ..mosaic_export import MosaicWorker
 from ..state import ProjectState
 from ..widgets.frame_preview import MultiCameraPlayer
 from ..widgets.signal_plot import SignalPlot
@@ -54,6 +57,8 @@ class Mode4Widget(QWidget):
         self._segments: list[_SegmentInfo] = []
         self._current_seg: Optional[_SegmentInfo] = None
         self._synced_signal_df: Optional[pd.DataFrame] = None
+        self._mosaic_worker: MosaicWorker | None = None
+        self._seg_signal_df: Optional[pd.DataFrame] = None
 
         root = QHBoxLayout(self)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -74,6 +79,25 @@ class Mode4Widget(QWidget):
         self._info_label = QLabel("")
         self._info_label.setWordWrap(True)
         ll.addWidget(self._info_label)
+
+        # --- Mosaic export ---
+        mosaic_grp = QGroupBox("Mosaic video export")
+        mosaic_lay = QVBoxLayout(mosaic_grp)
+        self._mosaic_btn = QPushButton("Export mosaic for selected segment")
+        self._mosaic_btn.setStyleSheet("font-weight:bold; padding:6px;")
+        self._mosaic_btn.clicked.connect(self._export_mosaic)
+        mosaic_lay.addWidget(self._mosaic_btn)
+        self._mosaic_cancel_btn = QPushButton("Cancel")
+        self._mosaic_cancel_btn.setEnabled(False)
+        self._mosaic_cancel_btn.clicked.connect(self._cancel_mosaic)
+        mosaic_lay.addWidget(self._mosaic_cancel_btn)
+        self._mosaic_progress = QProgressBar()
+        self._mosaic_progress.setTextVisible(True)
+        mosaic_lay.addWidget(self._mosaic_progress)
+        self._mosaic_status = QLabel("")
+        mosaic_lay.addWidget(self._mosaic_status)
+        ll.addWidget(mosaic_grp)
+
         ll.addStretch()
         splitter.addWidget(left)
 
@@ -282,6 +306,11 @@ class Mode4Widget(QWidget):
                 info_lines.append(f"Cameras: {len(meta['cameras'])}")
         self._info_label.setText("\n".join(info_lines))
 
+        # Store the loaded signal for mosaic use
+        if signal_loaded:
+            self._seg_signal_df = self._plot._df
+        else:
+            self._seg_signal_df = None
     def _on_playhead(self, sec: float):
         cumulative = 0.0
         for i, seg in enumerate(self._segments):
@@ -306,3 +335,73 @@ class Mode4Widget(QWidget):
                 cumulative += seg.end_sec - seg.start_sec
             self._timeline.set_playhead(cumulative + sec)
         self._plot.set_cursor(sec)
+
+    # ------------------------------------------------------------------
+    # Mosaic export
+    # ------------------------------------------------------------------
+
+    def _export_mosaic(self):
+        seg = self._current_seg
+        if seg is None:
+            QMessageBox.information(self, "Info", "Select a segment first.")
+            return
+
+        seg_dir = seg.dir_path
+        video_files = sorted(seg_dir.glob("cam*.*"))
+        if not video_files:
+            QMessageBox.warning(self, "Warning", "No video files found in segment folder.")
+            return
+
+        video_paths = [str(f) for f in video_files]
+        labels = [f.stem for f in video_files]
+
+        default_name = str(seg_dir / f"mosaic_{seg.index:04d}_{seg.label.replace(' ', '_')}.mp4")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save mosaic video", default_name,
+            "MP4 video (*.mp4);;All files (*)",
+        )
+        if not path:
+            return
+
+        fps = self._player.get_fps() or 30.0
+        total_frames = int(seg.duration_sec * fps)
+
+        self._mosaic_worker = MosaicWorker(
+            video_paths=video_paths,
+            camera_labels=labels,
+            fps=fps,
+            total_frames=total_frames,
+            video_duration_sec=seg.duration_sec,
+            output_path=path,
+            signal_df=self._seg_signal_df,
+            ffmpeg_path=self.state.ffmpeg_path,
+        )
+        self._mosaic_worker.progress.connect(self._on_mosaic_progress)
+        self._mosaic_worker.finished.connect(self._on_mosaic_finished)
+        self._mosaic_btn.setEnabled(False)
+        self._mosaic_cancel_btn.setEnabled(True)
+        self._mosaic_progress.setValue(0)
+        self._mosaic_status.setText("Exporting\u2026")
+        self._mosaic_worker.start()
+
+    def _cancel_mosaic(self):
+        if self._mosaic_worker:
+            self._mosaic_worker.cancel()
+
+    def _on_mosaic_progress(self, current: int, total: int):
+        if total > 0:
+            self._mosaic_progress.setValue(int(current * 100 / total))
+        self._mosaic_status.setText(f"Frame {current} / {total}")
+
+    def _on_mosaic_finished(self, success: bool, msg: str):
+        self._mosaic_btn.setEnabled(True)
+        self._mosaic_cancel_btn.setEnabled(False)
+        if success:
+            self._mosaic_progress.setValue(100)
+            self._mosaic_status.setText(f"Saved: {Path(msg).name}")
+            QMessageBox.information(self, "Mosaic export", f"Mosaic video saved:\n{msg}")
+        else:
+            self._mosaic_status.setText(f"Failed: {msg}")
+            if "Cancelled" not in msg:
+                QMessageBox.critical(self, "Error", f"Mosaic export failed:\n{msg}")
+        self._mosaic_worker = None
