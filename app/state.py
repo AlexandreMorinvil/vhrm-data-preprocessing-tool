@@ -284,6 +284,15 @@ def load_sidecar(path: str, state: ProjectState) -> None:
 
     state.output_directory = str(base_dir)
     state.mode1_complete = True
+
+    # Load synced signal path if present
+    synced_name = raw.get("synced_signal_path")
+    if synced_name:
+        abs_synced = str(base_dir / synced_name)
+        if Path(abs_synced).exists():
+            state.synced_signal_path = abs_synced
+            state.mode2_complete = True
+
     log.info("Loaded sidecar with %d camera(s) from %s", len(state.tracks), path)
 
 

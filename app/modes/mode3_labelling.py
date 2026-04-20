@@ -202,6 +202,22 @@ class Mode3Widget(QWidget):
             dur = self.state.tracks[0].duration_sec if self.state.tracks else 0
             self._plot.set_data(self._merged_df, video_duration_sec=dur)
 
+    def _load_synced_signal(self) -> bool:
+        """Load pre-synced signal CSV from state. Returns True if loaded."""
+        sp = self.state.synced_signal_path
+        if not sp or not Path(sp).exists():
+            return False
+        try:
+            df = pd.read_csv(sp)
+            df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
+            self._merged_df = df
+            dur = self.state.tracks[0].duration_sec if self.state.tracks else 0
+            self._plot.set_data(self._merged_df, video_duration_sec=dur)
+            return True
+        except Exception as exc:
+            log.warning("Could not load synced signal CSV: %s", exc)
+            return False
+
     def _load_from_meta(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select metadata sidecar", "", _META_FILTER,
@@ -214,7 +230,8 @@ class Mode3Widget(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to load metadata:\n{exc}")
             return
         self._refresh_from_tracks()
-        self._load_signals()
+        if not self._load_synced_signal():
+            self._load_signals()
         n = len(self.state.tracks)
         self._load_status.setText(f"Loaded {n} camera(s) from sidecar.")
 

@@ -145,6 +145,7 @@ class Mode2Widget(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to load metadata:\n{exc}")
             return
         self._refresh_player()
+        self._load_synced_signal()
         n = len(self.state.tracks)
         self._load_status.setText(f"Loaded {n} camera(s) from sidecar.")
 
@@ -172,6 +173,21 @@ class Mode2Widget(QWidget):
             valid = [p for p in paths if p and Path(p).exists()]
             if valid:
                 self._player.load_videos(valid)
+
+    def _load_synced_signal(self):
+        """Load synced signal CSV from state if available."""
+        sp = self.state.synced_signal_path
+        if not sp or not Path(sp).exists():
+            return
+        try:
+            df = pd.read_csv(sp)
+            df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
+            self._merged_df = df
+            video_dur = self.state.tracks[0].duration_sec if self.state.tracks else 0.0
+            self._plot.set_data(self._merged_df, video_duration_sec=video_dur)
+            self._status.setText(f"Signal loaded from {Path(sp).name}")
+        except Exception as exc:
+            log.warning("Could not load synced signal CSV: %s", exc)
 
     def _add_signal(self):
         files, _ = QFileDialog.getOpenFileNames(
