@@ -254,12 +254,13 @@ def extract_audio(
     output_path: str,
     ffmpeg: str = "",
     log_callback=None,
+    duration_sec: float | None = None,
 ) -> str:
-    _run_ffmpeg(
-        ["-i", input_path, "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", output_path],
-        ffmpeg=ffmpeg,
-        log_callback=log_callback,
-    )
+    args = ["-i", input_path]
+    if duration_sec is not None and duration_sec > 0:
+        args += ["-t", str(duration_sec)]
+    args += ["-vn", "-ac", "1", "-ar", "16000", "-f", "wav", output_path]
+    _run_ffmpeg(args, ffmpeg=ffmpeg, log_callback=log_callback)
     return output_path
 
 

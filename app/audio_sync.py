@@ -23,12 +23,15 @@ def compute_sync_offset(
     target_path: str,
     ffmpeg: str = "",
     max_offset_sec: float = 60.0,
+    audio_duration_sec: float | None = 60.0,
 ) -> float:
     with tempfile.TemporaryDirectory() as tmp:
         ref_wav = str(Path(tmp) / "ref.wav")
         tgt_wav = str(Path(tmp) / "tgt.wav")
-        extract_audio(reference_path, ref_wav, ffmpeg=ffmpeg)
-        extract_audio(target_path, tgt_wav, ffmpeg=ffmpeg)
+        extract_audio(reference_path, ref_wav, ffmpeg=ffmpeg,
+                       duration_sec=audio_duration_sec)
+        extract_audio(target_path, tgt_wav, ffmpeg=ffmpeg,
+                       duration_sec=audio_duration_sec)
 
         ref_y, sr = _load_audio(ref_wav)
         tgt_y, _ = _load_audio(tgt_wav)
@@ -64,6 +67,7 @@ def compute_all_offsets(
     segment_first_per_camera: list[str],
     ffmpeg: str = "",
     max_offset_sec: float = 60.0,
+    audio_duration_sec: float | None = 60.0,
 ) -> list[float]:
     if not segment_first_per_camera:
         return []
@@ -74,6 +78,7 @@ def compute_all_offsets(
             segment_first_per_camera[i],
             ffmpeg=ffmpeg,
             max_offset_sec=max_offset_sec,
+            audio_duration_sec=audio_duration_sec,
         )
         offsets.append(off)
     return offsets

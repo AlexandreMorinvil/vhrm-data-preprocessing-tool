@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -195,6 +196,21 @@ class Mode1Widget(QWidget):
         self._camera_groups: list[_CameraGroup] = []
         left_layout.addLayout(self._camera_area)
 
+        sync_row = QHBoxLayout()
+        sync_row.addWidget(QLabel("Audio sync duration (s):"))
+        self._sync_duration_spin = QDoubleSpinBox()
+        self._sync_duration_spin.setRange(0, 600)
+        self._sync_duration_spin.setValue(60.0)
+        self._sync_duration_spin.setDecimals(1)
+        self._sync_duration_spin.setSingleStep(10)
+        self._sync_duration_spin.setSpecialValueText("Full audio")
+        self._sync_duration_spin.setToolTip(
+            "How many seconds of audio to use for cross-correlation sync.\n"
+            "Set to 0 to use the entire audio (slower)."
+        )
+        sync_row.addWidget(self._sync_duration_spin)
+        left_layout.addLayout(sync_row)
+
         self._delete_intermediates_cb = QCheckBox("Delete intermediate files automatically")
         self._delete_intermediates_cb.setChecked(True)
         self._delete_intermediates_cb.setToolTip(
@@ -336,6 +352,7 @@ class Mode1Widget(QWidget):
             out_dir=out_dir,
             cameras=cameras,
             delete_intermediates=self._delete_intermediates_cb.isChecked(),
+            sync_audio_duration=self._sync_duration_spin.value() or None,
         )
         worker.log_message.connect(self._log)
         worker.progress.connect(lambda v, m: (self._progress.setValue(v), self._status_label.setText(m)))
@@ -380,7 +397,7 @@ class Mode1Widget(QWidget):
                     info[f"Cam{i+1} error"] = str(exc)
         self._metadata_panel.set_info(info)
 
-    def _preprocessing_pipeline(self, *, ffmpeg, out_dir, cameras, delete_intermediates, worker: FFmpegWorker):
+    def _preprocessing_pipeline(self, *, ffmpeg, out_dir, cameras, delete_intermediates, sync_audio_duration, worker: FFmpegWorker):
         num = len(cameras)
         tracks: list[VideoTrack] = []
 
@@ -438,7 +455,8 @@ class Mode1Widget(QWidget):
         worker.progress.emit(55, "Synchronising audio …")
         first_segments = [cam.segment_paths[0] for cam in cameras]
         from ..audio_sync import compute_all_offsets
-        offsets = compute_all_offsets(first_segments, ffmpeg=ffmpeg)
+        offsets = compute_all_offsets(first_segments, ffmpeg=ffmpeg,
+                                        audio_duration_sec=sync_audio_duration)
         for i, off in enumerate(offsets):
             tracks[i].sync_offset_sec = off
             worker.log_message.emit(f"Camera {i+1} offset: {off:.4f}s")
