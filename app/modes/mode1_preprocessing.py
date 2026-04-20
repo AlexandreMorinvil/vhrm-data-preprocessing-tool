@@ -195,6 +195,14 @@ class Mode1Widget(QWidget):
         self._camera_groups: list[_CameraGroup] = []
         left_layout.addLayout(self._camera_area)
 
+        self._delete_intermediates_cb = QCheckBox("Delete intermediate files automatically")
+        self._delete_intermediates_cb.setChecked(True)
+        self._delete_intermediates_cb.setToolTip(
+            "When checked, concatenated and start-trimmed files are deleted\n"
+            "as soon as the pipeline no longer needs them."
+        )
+        left_layout.addWidget(self._delete_intermediates_cb)
+
         btn_row = QHBoxLayout()
         self._run_btn = QPushButton("Run preprocessing")
         self._run_btn.setStyleSheet("font-weight:bold; padding:8px;")
@@ -219,17 +227,6 @@ class Mode1Widget(QWidget):
         self._log_area.setReadOnly(True)
         self._log_area.setMaximumHeight(120)
         left_layout.addWidget(self._log_area)
-
-        # --- Intermediate file management ---
-        self._intermediates_group = QGroupBox("Manage intermediate files")
-        self._intermediates_group.setVisible(False)
-        inter_layout = QVBoxLayout(self._intermediates_group)
-        self._inter_list_layout = QVBoxLayout()
-        inter_layout.addLayout(self._inter_list_layout)
-        self._delete_unchecked_btn = QPushButton("Delete unchecked")
-        self._delete_unchecked_btn.clicked.connect(self._delete_unchecked_intermediates)
-        inter_layout.addWidget(self._delete_unchecked_btn)
-        left_layout.addWidget(self._intermediates_group)
 
         left_layout.addStretch()
         scroll.setWidget(left)
@@ -292,7 +289,6 @@ class Mode1Widget(QWidget):
                 labels = [t.camera_label for t in self.state.tracks]
                 self._player.set_cameras(labels)
                 self._player.load_videos(valid)
-            self._populate_intermediates()
 
     def _preview_first_segments(self):
         """Load the first segment of each camera into the preview player."""
@@ -339,6 +335,7 @@ class Mode1Widget(QWidget):
             ffmpeg=ffmpeg,
             out_dir=out_dir,
             cameras=cameras,
+            delete_intermediates=self._delete_intermediates_cb.isChecked(),
         )
         worker.log_message.connect(self._log)
         worker.progress.connect(lambda v, m: (self._progress.setValue(v), self._status_label.setText(m)))
@@ -364,7 +361,6 @@ class Mode1Widget(QWidget):
             self._player.set_cameras(labels)
             self._player.load_videos(paths)
             self._update_metadata()
-            self._populate_intermediates()
 
     def _update_metadata(self):
         info = {}
@@ -384,93 +380,7 @@ class Mode1Widget(QWidget):
                     info[f"Cam{i+1} error"] = str(exc)
         self._metadata_panel.set_info(info)
 
-    # ------------------------------------------------------------------
-    # Intermediate file management
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _format_size(nbytes: int) -> str:
-        for unit in ("B", "KB", "MB", "GB"):
-            if abs(nbytes) < 1024:
-                return f"{nbytes:.1f} {unit}"
-            nbytes /= 1024  # type: ignore[assignment]
-        return f"{nbytes:.1f} TB"
-
-    def _populate_intermediates(self):
-        """Build the checkbox list from current state.tracks."""
-        # Clear previous entries
-        while self._inter_list_layout.count():
-            item = self._inter_list_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-        self._inter_checkboxes: list[tuple[QCheckBox, str]] = []
-
-        has_any = False
-        for t in self.state.tracks:
-            stages = [
-                ("Concatenated", t.concatenated_path),
-                ("Start-trimmed", t.trimstart_path),
-                ("Final", t.final_output_path),
-            ]
-            cam_label = QLabel(f"<b>Camera {t.camera_index + 1} ({t.camera_label})</b>")
-            self._inter_list_layout.addWidget(cam_label)
-            for stage_name, fpath in stages:
-                if not fpath or not Path(fpath).exists():
-                    continue
-                has_any = True
-                size = self._format_size(os.path.getsize(fpath))
-                cb = QCheckBox(f"{stage_name}: {Path(fpath).name}  ({size})")
-                cb.setToolTip(fpath)
-                # Default: keep only final
-                cb.setChecked(stage_name == "Final")
-                self._inter_list_layout.addWidget(cb)
-                self._inter_checkboxes.append((cb, fpath))
-
-        self._intermediates_group.setVisible(has_any)
-
-    def _delete_unchecked_intermediates(self):
-        to_delete: list[str] = []
-        for cb, fpath in self._inter_checkboxes:
-            if not cb.isChecked() and Path(fpath).exists():
-                to_delete.append(fpath)
-
-        if not to_delete:
-            QMessageBox.information(self, "Info", "Nothing to delete — all files are checked to keep.")
-            return
-
-        total_bytes = sum(os.path.getsize(p) for p in to_delete)
-        details = "\n".join(f"  • {Path(p).name}" for p in to_delete)
-        reply = QMessageBox.question(
-            self, "Confirm deletion",
-            f"Delete {len(to_delete)} file(s) and reclaim "
-            f"{self._format_size(total_bytes)}?\n\n{details}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        deleted = 0
-        for fpath in to_delete:
-            try:
-                os.remove(fpath)
-                deleted += 1
-                self._log(f"Deleted: {fpath}")
-            except OSError as exc:
-                self._log(f"Failed to delete {fpath}: {exc}")
-
-        # Clear the path references in state so they don't linger
-        for t in self.state.tracks:
-            if t.concatenated_path and not Path(t.concatenated_path).exists():
-                t.concatenated_path = ""
-            if t.trimstart_path and not Path(t.trimstart_path).exists():
-                t.trimstart_path = ""
-
-        self._populate_intermediates()
-        self._log(f"Deleted {deleted}/{len(to_delete)} intermediate file(s).")
-
-    def _preprocessing_pipeline(self, *, ffmpeg, out_dir, cameras, worker: FFmpegWorker):
+    def _preprocessing_pipeline(self, *, ffmpeg, out_dir, cameras, delete_intermediates, worker: FFmpegWorker):
         num = len(cameras)
         tracks: list[VideoTrack] = []
 
@@ -568,6 +478,15 @@ class Mode1Widget(QWidget):
                 t.duration_sec = vinfo2.get("duration", 0)
                 t.frame_count = vinfo2.get("frame_count", 0)
 
+                # Cleanup: concat file is no longer needed
+                if delete_intermediates and t.concatenated_path and Path(t.concatenated_path).exists():
+                    try:
+                        os.remove(t.concatenated_path)
+                        worker.log_message.emit(f"Deleted intermediate: {Path(t.concatenated_path).name}")
+                    except OSError as exc:
+                        worker.log_message.emit(f"Could not delete {t.concatenated_path}: {exc}")
+                    t.concatenated_path = ""
+
         if worker.is_cancelled:
             return
 
@@ -606,6 +525,24 @@ class Mode1Widget(QWidget):
             t.duration_sec = vinfo3.get("duration", 0)
             t.frame_count = vinfo3.get("frame_count", 0)
             t.fps = vinfo3.get("fps", t.fps)
+
+            # Cleanup: source intermediate is no longer needed
+            if delete_intermediates:
+                if t.trimstart_path and Path(t.trimstart_path).exists():
+                    try:
+                        os.remove(t.trimstart_path)
+                        worker.log_message.emit(f"Deleted intermediate: {Path(t.trimstart_path).name}")
+                    except OSError as exc:
+                        worker.log_message.emit(f"Could not delete {t.trimstart_path}: {exc}")
+                    t.trimstart_path = ""
+                elif t.concatenated_path and Path(t.concatenated_path).exists():
+                    # No trimstart was created, so concat was used directly as source
+                    try:
+                        os.remove(t.concatenated_path)
+                        worker.log_message.emit(f"Deleted intermediate: {Path(t.concatenated_path).name}")
+                    except OSError as exc:
+                        worker.log_message.emit(f"Could not delete {t.concatenated_path}: {exc}")
+                    t.concatenated_path = ""
 
         if worker.is_cancelled:
             return
