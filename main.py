@@ -135,14 +135,6 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(w)
 
     def _on_tab_changed(self, index: int):
-        if index == 1 and not self.state.mode1_complete:
-            QMessageBox.information(self, "Info", "Please complete preprocessing first.")
-            self._mode_tabs.setCurrentIndex(0)
-            return
-        if index == 2 and not self.state.mode1_complete:
-            QMessageBox.information(self, "Info", "Please complete preprocessing first.")
-            self._mode_tabs.setCurrentIndex(0)
-            return
         self._ensure_mode_widget(index)
         self._stack.setCurrentWidget(self._mode_widgets[index])
         self.state.active_mode = index + 1

@@ -42,6 +42,7 @@ from ..ffmpeg_utils import (
     trim_video,
 )
 from ..state import ProjectState, VideoTrack, parse_dji_datetime, dji_datetime_str
+from ..state import generate_sidecar
 from ..widgets.frame_preview import MultiCameraPlayer
 
 log = logging.getLogger(__name__)
@@ -373,6 +374,12 @@ class Mode1Widget(QWidget):
         self._worker = None
         if ok:
             self.state.mode1_complete = True
+            # Generate metadata sidecar
+            try:
+                sidecar = generate_sidecar(self.state)
+                self._log(f"Wrote metadata sidecar: {Path(sidecar).name}")
+            except Exception as exc:
+                self._log(f"Warning: could not write sidecar: {exc}")
             paths = [t.final_output_path for t in self.state.tracks]
             labels = [t.camera_label for t in self.state.tracks]
             self._player.set_cameras(labels)
@@ -398,8 +405,10 @@ class Mode1Widget(QWidget):
         self._metadata_panel.set_info(info)
 
     def _preprocessing_pipeline(self, *, ffmpeg, out_dir, cameras, delete_intermediates, sync_audio_duration, worker: FFmpegWorker):
+        import shutil as _shutil
         num = len(cameras)
         tracks: list[VideoTrack] = []
+        single_camera = (num == 1)
 
         # --- Concatenation (0–55%) -------------------------------------------
         for ci, cam in enumerate(cameras):
@@ -413,6 +422,29 @@ class Mode1Widget(QWidget):
             step_label = f"Concatenating camera {ci+1}/{num} …"
             worker.progress.emit(int(ci * 55 / num), step_label)
             worker.log_message.emit(f"Camera {ci+1}: {len(seg_paths)} segment(s)")
+
+            # Single camera with one segment: use original file directly
+            if single_camera and len(seg_paths) == 1:
+                worker.log_message.emit("Single camera, single segment — skipping concatenation.")
+                final_name = f"cam{ci+1}_{label}_final.mp4"
+                final_path = str(Path(out_dir) / final_name)
+                _shutil.copy2(seg_paths[0], final_path)
+                vinfo = probe_video(final_path, find_ffprobe())
+                track = VideoTrack(
+                    camera_index=ci,
+                    camera_label=label,
+                    segment_paths=seg_paths,
+                    final_output_path=final_path,
+                    fps=vinfo.get("fps", 0),
+                    frame_count=vinfo.get("frame_count", 0),
+                    width=vinfo.get("width", 0),
+                    height=vinfo.get("height", 0),
+                    codec=vinfo.get("codec", ""),
+                    duration_sec=vinfo.get("duration", 0),
+                )
+                track.set_start_datetime(first_dt)
+                tracks.append(track)
+                continue
 
             concat_name = f"cam{ci+1}_{label}_concat.mp4"
             concat_path = str(Path(out_dir) / concat_name)
@@ -449,6 +481,32 @@ class Mode1Widget(QWidget):
             tracks.append(track)
 
         if worker.is_cancelled:
+            return
+
+        # --- Single camera: skip sync & trim, use concat as final -------------
+        if single_camera:
+            t = tracks[0]
+            if not t.final_output_path:
+                # Multi-segment single camera: rename concat → final
+                final_name = f"cam1_{t.camera_label}_final.mp4"
+                final_path = str(Path(out_dir) / final_name)
+                _shutil.copy2(t.concatenated_path, final_path)
+                if delete_intermediates and t.concatenated_path and Path(t.concatenated_path).exists():
+                    try:
+                        os.remove(t.concatenated_path)
+                        worker.log_message.emit(f"Deleted intermediate: {Path(t.concatenated_path).name}")
+                    except OSError as exc:
+                        worker.log_message.emit(f"Could not delete {t.concatenated_path}: {exc}")
+                    t.concatenated_path = ""
+                t.final_output_path = final_path
+                vf = probe_video(final_path, find_ffprobe())
+                t.duration_sec = vf.get("duration", 0)
+                t.frame_count = vf.get("frame_count", 0)
+                t.fps = vf.get("fps", t.fps)
+            worker.log_message.emit("Single camera — skipping audio sync and trim steps.")
+            worker.progress.emit(98, "Finalising …")
+            self.state.tracks = tracks
+            worker.progress.emit(100, "Done ✓")
             return
 
         # --- Audio sync (55–70%) ---------------------------------------------

@@ -24,13 +24,15 @@ from PyQt6.QtWidgets import (
 )
 
 from ..signals import get_loaders, load_signal
-from ..state import ProjectState
+from ..state import ProjectState, load_sidecar, populate_tracks_from_videos
 from ..widgets.frame_preview import MultiCameraPlayer
 from ..widgets.signal_plot import SignalPlot
 
 log = logging.getLogger(__name__)
 
 _SIGNAL_FILTER = "CSV / signal files (*.csv *.tsv *.txt);;All files (*)"
+_META_FILTER = "Metadata sidecar (*.json);;All files (*)"
+_VIDEO_FILTER = "Videos (*.mp4 *.mov *.lrf *.avi *.mkv);;All files (*)"
 
 
 class Mode2Widget(QWidget):
@@ -47,6 +49,20 @@ class Mode2Widget(QWidget):
         left = QWidget()
         ll = QVBoxLayout(left)
         ll.setContentsMargins(4, 4, 4, 4)
+
+        # --- Load videos section (allows skipping Mode 1) ---
+        load_grp = QGroupBox("Load videos")
+        load_lay = QVBoxLayout(load_grp)
+        meta_btn = QPushButton("Load from metadata file …")
+        meta_btn.clicked.connect(self._load_from_meta)
+        load_lay.addWidget(meta_btn)
+        vids_btn = QPushButton("Select video files directly …")
+        vids_btn.clicked.connect(self._load_from_videos)
+        load_lay.addWidget(vids_btn)
+        self._load_status = QLabel("")
+        self._load_status.setWordWrap(True)
+        load_lay.addWidget(self._load_status)
+        ll.addWidget(load_grp)
 
         loader_names = [type(l).__name__ for l in get_loaders()]
         info = QLabel(f"Available loaders: {', '.join(loader_names) or 'none'}")
@@ -115,6 +131,46 @@ class Mode2Widget(QWidget):
             item.setToolTip(p)
             self._file_list.addItem(item)
 
+        if self.state.tracks:
+            labels = [t.camera_label for t in self.state.tracks]
+            self._player.set_cameras(labels)
+            paths = [t.final_output_path for t in self.state.tracks]
+            valid = [p for p in paths if p and Path(p).exists()]
+            if valid:
+                self._player.load_videos(valid)
+
+    def _load_from_meta(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select metadata sidecar", "", _META_FILTER,
+        )
+        if not path:
+            return
+        try:
+            load_sidecar(path, self.state)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to load metadata:\n{exc}")
+            return
+        self._refresh_player()
+        n = len(self.state.tracks)
+        self._load_status.setText(f"Loaded {n} camera(s) from sidecar.")
+
+    def _load_from_videos(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Select video files", "", _VIDEO_FILTER,
+        )
+        if not files:
+            return
+        try:
+            populate_tracks_from_videos(files, self.state)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to probe videos:\n{exc}")
+            return
+        self._refresh_player()
+        n = len(self.state.tracks)
+        self._load_status.setText(f"Loaded {n} video(s) directly.")
+
+    def _refresh_player(self):
+        """Reload the player/plot from the current state.tracks."""
         if self.state.tracks:
             labels = [t.camera_label for t in self.state.tracks]
             self._player.set_cameras(labels)

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+log = logging.getLogger(__name__)
 
 _DJI_RE = re.compile(
     r"DJI_(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})_(\d+)"
@@ -184,3 +187,126 @@ def _resolve_paths(d, base):
     if isinstance(d, list):
         return [_resolve_paths(item, base) for item in d]
     return d
+
+
+# ---------------------------------------------------------------------------
+# Metadata sidecar (.vrt-meta.json)
+# ---------------------------------------------------------------------------
+
+def generate_sidecar(state: ProjectState) -> str:
+    """Write a ``_meta.json`` sidecar alongside the final videos.
+
+    Returns the path of the generated file.
+    """
+    out_dir = state.output_directory
+    if not out_dir:
+        raise ValueError("No output directory set in project state.")
+
+    project_name = Path(state.project_path).stem if state.project_path else "project"
+    sidecar_path = str(Path(out_dir) / f"{project_name}_meta.json")
+
+    cameras = []
+    for t in state.tracks:
+        cameras.append({
+            "label": t.camera_label,
+            "final_video_path": Path(t.final_output_path).name if t.final_output_path else "",
+            "fps": t.fps,
+            "frame_count": t.frame_count,
+            "duration_sec": t.duration_sec,
+            "dimensions": [t.width, t.height],
+            "codec": t.codec,
+            "start_datetime_utc": t.start_datetime or "",
+            "sync_offset_sec": t.sync_offset_sec,
+        })
+
+    common_dur = min((t.duration_sec for t in state.tracks), default=0.0)
+    data = {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "cameras": cameras,
+        "common_duration_sec": common_dur,
+        "signal_paths": [Path(p).name for p in state.signal_paths],
+        "signal_time_range_sec": None,
+    }
+
+    Path(sidecar_path).write_text(
+        json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    log.info("Wrote sidecar: %s", sidecar_path)
+    return sidecar_path
+
+
+def load_sidecar(path: str, state: ProjectState) -> None:
+    """Populate *state*.tracks from a ``_meta.json`` sidecar file."""
+    p = Path(path)
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    base_dir = p.parent
+
+    state.tracks.clear()
+    for i, cam in enumerate(raw.get("cameras", [])):
+        video_file = cam.get("final_video_path", "")
+        abs_video = str(base_dir / video_file) if video_file else ""
+        dims = cam.get("dimensions", [0, 0])
+        track = VideoTrack(
+            camera_index=i,
+            camera_label=cam.get("label", f"Camera {i+1}"),
+            final_output_path=abs_video,
+            fps=cam.get("fps", 0.0),
+            frame_count=cam.get("frame_count", 0),
+            width=dims[0] if len(dims) > 0 else 0,
+            height=dims[1] if len(dims) > 1 else 0,
+            codec=cam.get("codec", ""),
+            duration_sec=cam.get("duration_sec", 0.0),
+            start_datetime=cam.get("start_datetime_utc") or None,
+            sync_offset_sec=cam.get("sync_offset_sec", 0.0),
+        )
+        state.tracks.append(track)
+
+    state.num_cameras = len(state.tracks)
+
+    # Load signal paths relative to sidecar directory
+    sig_names = raw.get("signal_paths", [])
+    for name in sig_names:
+        if name:
+            abs_sig = str(base_dir / name)
+            if abs_sig not in state.signal_paths:
+                state.signal_paths.append(abs_sig)
+
+    state.output_directory = str(base_dir)
+    state.mode1_complete = True
+    log.info("Loaded sidecar with %d camera(s) from %s", len(state.tracks), path)
+
+
+def populate_tracks_from_videos(
+    video_paths: list[str],
+    state: ProjectState,
+    probe_func=None,
+) -> None:
+    """Populate *state*.tracks by probing raw video files directly.
+
+    *probe_func* defaults to :func:`ffmpeg_utils.probe_video`.
+    """
+    if probe_func is None:
+        from .ffmpeg_utils import probe_video, find_ffprobe
+        ffprobe = find_ffprobe()
+        probe_func = lambda p: probe_video(p, ffprobe)  # noqa: E731
+
+    state.tracks.clear()
+    for i, vp in enumerate(video_paths):
+        info = probe_func(vp)
+        track = VideoTrack(
+            camera_index=i,
+            camera_label=Path(vp).stem,
+            final_output_path=vp,
+            fps=info.get("fps", 0.0),
+            frame_count=info.get("frame_count", 0),
+            width=info.get("width", 0),
+            height=info.get("height", 0),
+            codec=info.get("codec", ""),
+            duration_sec=info.get("duration", 0.0),
+        )
+        dt = parse_dji_datetime(Path(vp).stem)
+        track.set_start_datetime(dt)
+        state.tracks.append(track)
+    state.num_cameras = len(state.tracks)
+    state.mode1_complete = True
+    log.info("Populated %d track(s) from video files", len(state.tracks))
