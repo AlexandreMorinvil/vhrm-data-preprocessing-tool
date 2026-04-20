@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -24,7 +25,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..signals import get_loaders, load_signal
-from ..state import ProjectState, load_sidecar, populate_tracks_from_videos
+from ..state import ProjectState, generate_sidecar, load_sidecar, populate_tracks_from_videos
 from ..widgets.frame_preview import MultiCameraPlayer
 from ..widgets.signal_plot import SignalPlot
 
@@ -247,7 +248,27 @@ class Mode2Widget(QWidget):
         if self.state.tracks:
             video_dur = self.state.tracks[0].duration_sec
         self._plot.set_data(self._merged_df, video_duration_sec=video_dur)
-        self._status.setText(f"Loaded {len(self._merged_df)} samples from {len(self._signal_dfs)} file(s)")
+
+        # Export clipped signal CSV
+        csv_name = "signal_synced_averaged.csv" if self.state.signal_mode == "average" else "signal_synced.csv"
+        out_dir = self.state.output_directory
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+            csv_path = str(Path(out_dir) / csv_name)
+            self._merged_df.to_csv(csv_path, index=False)
+            self.state.synced_signal_path = csv_path
+            log.info("Exported synced signal: %s", csv_path)
+
+            # Re-generate sidecar with signal info
+            try:
+                generate_sidecar(self.state)
+            except Exception as exc:
+                log.warning("Could not update sidecar: %s", exc)
+
+        status_parts = [f"Loaded {len(self._merged_df)} samples from {len(self._signal_dfs)} file(s)"]
+        if self.state.synced_signal_path:
+            status_parts.append(f"Exported: {csv_name}")
+        self._status.setText(" — ".join(status_parts))
         self.state.mode2_complete = True
 
     def _skip(self):

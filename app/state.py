@@ -95,6 +95,7 @@ class ProjectState:
     mode2_complete: bool = False
     ffmpeg_path: str = ""
     keep_temp_files: bool = False
+    synced_signal_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -135,6 +136,7 @@ class ProjectState:
 _PATH_KEYS = {
     "project_path", "output_directory", "concatenated_path",
     "trimstart_path", "final_output_path", "ffmpeg_path",
+    "synced_signal_path",
 }
 _PATH_LIST_KEYS = {"segment_paths", "signal_paths"}
 
@@ -220,12 +222,17 @@ def generate_sidecar(state: ProjectState) -> str:
         })
 
     common_dur = min((t.duration_sec for t in state.tracks), default=0.0)
+
+    synced_name = Path(state.synced_signal_path).name if state.synced_signal_path else None
+    sig_range = [0.0, common_dur] if state.synced_signal_path else None
+
     data = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "cameras": cameras,
         "common_duration_sec": common_dur,
         "signal_paths": [Path(p).name for p in state.signal_paths],
-        "signal_time_range_sec": None,
+        "synced_signal_path": synced_name,
+        "signal_time_range_sec": sig_range,
     }
 
     Path(sidecar_path).write_text(
