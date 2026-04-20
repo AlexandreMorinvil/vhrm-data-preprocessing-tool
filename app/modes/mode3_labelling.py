@@ -152,6 +152,20 @@ class Mode3Widget(QWidget):
         ll.addWidget(QLabel("Current label:"))
         ll.addWidget(self._label_combo)
 
+        # --- Start / End label at playhead ---
+        ph_row = QHBoxLayout()
+        self._start_label_btn = QPushButton("Start label ▶")
+        self._start_label_btn.setCheckable(True)
+        self._start_label_btn.setToolTip("Mark current playhead position as label start")
+        self._start_label_btn.clicked.connect(self._start_label_at_playhead)
+        ph_row.addWidget(self._start_label_btn)
+        self._end_label_btn = QPushButton("End label ■")
+        self._end_label_btn.setToolTip("Mark current playhead position as label end")
+        self._end_label_btn.clicked.connect(self._end_label_at_playhead)
+        ph_row.addWidget(self._end_label_btn)
+        ll.addLayout(ph_row)
+        self._pending_start: Optional[float] = None
+
         # --- Add interval manually ---
         add_grp = QGroupBox("Add interval manually")
         add_lay = QFormLayout(add_grp)
@@ -233,6 +247,7 @@ class Mode3Widget(QWidget):
         self._timeline.interval_deleted.connect(self._on_interval_deleted)
         self._timeline.interval_selected.connect(self._on_interval_selected)
         self._timeline.interval_relabelled.connect(self._on_interval_relabelled)
+        self._timeline.interval_resized.connect(self._on_interval_resized)
         self._timeline.subdivide_requested.connect(self._on_subdivide_single)
         self._timeline.playhead_moved.connect(self._on_playhead)
         self._player.frame_changed.connect(self._on_frame_changed)
@@ -436,6 +451,77 @@ class Mode3Widget(QWidget):
             color = colour_for_label(new_label, self.state.labels_library)
             self.state.intervals[idx].color = color
             self._sync_timeline()
+
+    def _on_interval_resized(self, idx, new_start, new_end):
+        """Handle edge-drag resize from the timeline widget."""
+        if idx < 0 or idx >= len(self.state.intervals):
+            return
+        # Overlap check (excluding self)
+        if self._overlaps_existing(new_start, new_end, exclude_idx=idx):
+            # Revert: re-sync timeline with unchanged state
+            self._sync_timeline()
+            return
+        iv = self.state.intervals[idx]
+        iv.start_sec = new_start
+        iv.end_sec = new_end
+        self._sync_timeline()
+        # Refresh the editor panel if this interval is selected
+        if self._timeline.selected_index == idx:
+            self._populate_editor(iv)
+
+    # ------------------------------------------------------------------
+    # Start / End label at playhead
+    # ------------------------------------------------------------------
+
+    def _start_label_at_playhead(self):
+        sec = self._timeline._playhead_sec
+        self._pending_start = sec
+        self._start_label_btn.setChecked(True)
+        label = self._label_combo.currentText().strip() or "Unlabelled"
+        color = colour_for_label(label, self.state.labels_library)
+        self._timeline.set_pending_start(sec, color)
+        self._status.setText(f"Label start marked at {_format_duration(sec)}. "
+                             "Play/seek to the end, then click 'End label'.")
+
+    def _end_label_at_playhead(self):
+        if self._pending_start is None:
+            QMessageBox.information(self, "Info",
+                                    "Click 'Start label' first to mark the start position.")
+            return
+        end_sec = self._timeline._playhead_sec
+        start_sec = self._pending_start
+
+        # Allow either order
+        if start_sec > end_sec:
+            start_sec, end_sec = end_sec, start_sec
+
+        start_sec = round(start_sec, 3)
+        end_sec = round(end_sec, 3)
+
+        if end_sec - start_sec < 0.5:
+            QMessageBox.warning(self, "Too short",
+                                "The interval is shorter than 0.5 seconds.")
+            return
+
+        if self._overlaps_existing(start_sec, end_sec):
+            QMessageBox.warning(self, "Overlap",
+                                "This interval overlaps with an existing one.")
+            return
+
+        label = self._label_combo.currentText().strip() or "Unlabelled"
+        color = colour_for_label(label, self.state.labels_library)
+        iv = LabelInterval(label=label, start_sec=start_sec,
+                           end_sec=end_sec, color=color)
+        self.state.intervals.append(iv)
+        self._sync_timeline()
+
+        # Clear pending state
+        self._pending_start = None
+        self._start_label_btn.setChecked(False)
+        self._timeline.set_pending_start(None)
+        self._status.setText(
+            f"Created '{label}' ({_format_duration(end_sec - start_sec)})."
+        )
 
     # ------------------------------------------------------------------
     # Interval editor panel

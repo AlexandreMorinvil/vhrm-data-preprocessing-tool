@@ -4,7 +4,7 @@ import logging
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QRectF, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPen
+from PyQt6.QtGui import QColor, QCursor, QFont, QMouseEvent, QPainter, QPen
 from PyQt6.QtWidgets import QInputDialog, QMenu, QToolTip, QWidget
 
 log = logging.getLogger(__name__)
@@ -16,6 +16,7 @@ _COLOURS = [
 ]
 
 _AXIS_HEIGHT = 18  # pixels reserved for the time-axis labels
+_EDGE_PX = 5       # hit zone width for interval edge dragging
 
 
 def colour_for_label(label: str, library: list[str]) -> str:
@@ -61,6 +62,7 @@ class TimelineWidget(QWidget):
     interval_selected = pyqtSignal(int)
     interval_deleted = pyqtSignal(int)
     interval_relabelled = pyqtSignal(int, str)
+    interval_resized = pyqtSignal(int, float, float)   # idx, new_start, new_end
     subdivide_requested = pyqtSignal(int)
     playhead_moved = pyqtSignal(float)
 
@@ -75,6 +77,15 @@ class TimelineWidget(QWidget):
         self._drag_start: Optional[float] = None
         self._drag_current: Optional[float] = None
         self._selected_idx: int = -1
+
+        # Edge-drag state
+        self._edge_drag_idx: int = -1         # which interval is being resized
+        self._edge_drag_side: str = ""        # "start" or "end"
+        self._edge_drag_orig: float = 0.0     # original value before drag
+
+        # Pending label (for "Start label / End label" workflow)
+        self._pending_start_sec: Optional[float] = None
+        self._pending_color: str = "#ffffff"
 
     def set_duration(self, duration_sec):
         self._duration_sec = max(0.0, duration_sec)
@@ -102,6 +113,20 @@ class TimelineWidget(QWidget):
         self._selected_idx = idx
         self.update()
 
+    # ------------------------------------------------------------------
+    # Pending label (start/end at playhead)
+    # ------------------------------------------------------------------
+
+    def set_pending_start(self, sec: Optional[float], color: str = "#ffffff"):
+        """Mark *sec* as the pending label start. Pass *None* to clear."""
+        self._pending_start_sec = sec
+        self._pending_color = color
+        self.update()
+
+    @property
+    def pending_start(self) -> Optional[float]:
+        return self._pending_start_sec
+
     def _bar_height(self) -> int:
         return self.height() - _AXIS_HEIGHT
 
@@ -121,6 +146,18 @@ class TimelineWidget(QWidget):
             if iv.start_sec <= sec <= iv.end_sec:
                 return i
         return -1
+
+    def _edge_at(self, x) -> tuple[int, str]:
+        """Return ``(interval_index, 'start'|'end')`` if *x* is within
+        ``_EDGE_PX`` of an interval boundary, else ``(-1, '')``."""
+        for i, iv in enumerate(self._intervals):
+            x_start = self._sec_to_x(iv.start_sec)
+            x_end = self._sec_to_x(iv.end_sec)
+            if abs(x - x_start) <= _EDGE_PX:
+                return i, "start"
+            if abs(x - x_end) <= _EDGE_PX:
+                return i, "end"
+        return -1, ""
 
     # ------------------------------------------------------------------
     # Tick interval helpers
@@ -167,6 +204,20 @@ class TimelineWidget(QWidget):
             x1 = self._sec_to_x(max(self._drag_start, self._drag_current))
             p.fillRect(QRectF(x0, 0, x1 - x0, bar_h), QColor(255, 255, 255, 40))
 
+        # ---- pending label highlight ----
+        if self._pending_start_sec is not None:
+            pend_x = self._sec_to_x(self._pending_start_sec)
+            head_x = self._sec_to_x(self._playhead_sec)
+            lx = min(pend_x, head_x)
+            rx = max(pend_x, head_x)
+            pc = QColor(self._pending_color)
+            pc.setAlpha(50)
+            p.fillRect(QRectF(lx, 0, rx - lx, bar_h), pc)
+            # Dashed line at pending start
+            pen = QPen(QColor(self._pending_color), 1, Qt.PenStyle.DashLine)
+            p.setPen(pen)
+            p.drawLine(int(pend_x), 0, int(pend_x), bar_h)
+
         # ---- playhead ----
         px = self._sec_to_x(self._playhead_sec)
         p.setPen(QPen(QColor("red"), 2))
@@ -197,15 +248,27 @@ class TimelineWidget(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            idx = self._interval_at(event.position().x())
+            x = event.position().x()
+            # Priority 1: edge drag
+            edge_idx, edge_side = self._edge_at(x)
+            if edge_idx >= 0:
+                self._edge_drag_idx = edge_idx
+                self._edge_drag_side = edge_side
+                iv = self._intervals[edge_idx]
+                self._edge_drag_orig = iv.start_sec if edge_side == "start" else iv.end_sec
+                return
+
+            # Priority 2: select existing interval
+            idx = self._interval_at(x)
             if idx >= 0:
                 self._selected_idx = idx
                 self.interval_selected.emit(idx)
                 self.update()
             else:
+                # Priority 3: drag to create new interval
                 self._selected_idx = -1
                 self.interval_selected.emit(-1)
-                self._drag_start = self._x_to_sec(event.position().x())
+                self._drag_start = self._x_to_sec(x)
                 self._drag_current = self._drag_start
                 self.update()
         elif event.button() == Qt.MouseButton.RightButton:
@@ -214,18 +277,61 @@ class TimelineWidget(QWidget):
                 self._show_context_menu(event, idx)
 
     def mouseMoveEvent(self, event: QMouseEvent):
-        if self._drag_start is not None:
-            self._drag_current = self._x_to_sec(event.position().x())
+        x = event.position().x()
+
+        # Edge drag in progress
+        if self._edge_drag_idx >= 0:
+            sec = max(0.0, min(self._x_to_sec(x), self._duration_sec))
+            iv = self._intervals[self._edge_drag_idx]
+            if self._edge_drag_side == "start":
+                iv.start_sec = sec
+            else:
+                iv.end_sec = sec
             self.update()
+            return
+
+        # New-interval drag in progress
+        if self._drag_start is not None:
+            self._drag_current = self._x_to_sec(x)
+            self.update()
+
+        # Cursor shape: resize arrow when hovering over an edge
+        edge_idx, _ = self._edge_at(x)
+        if edge_idx >= 0:
+            self.setCursor(QCursor(Qt.CursorShape.SizeHorCursor))
+        else:
+            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+
         # Hover tooltip
         if self._duration_sec > 0:
-            sec = self._x_to_sec(event.position().x())
+            sec = self._x_to_sec(x)
             sec = max(0.0, min(sec, self._duration_sec))
             QToolTip.showText(event.globalPosition().toPoint(),
                               _format_time_ms(sec), self)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            # Finish edge drag
+            if self._edge_drag_idx >= 0:
+                iv = self._intervals[self._edge_drag_idx]
+                # Ensure start < end (min 0.5s); otherwise revert
+                if iv.end_sec - iv.start_sec < 0.5:
+                    if self._edge_drag_side == "start":
+                        iv.start_sec = self._edge_drag_orig
+                    else:
+                        iv.end_sec = self._edge_drag_orig
+                else:
+                    self.interval_resized.emit(
+                        self._edge_drag_idx,
+                        round(iv.start_sec, 3),
+                        round(iv.end_sec, 3),
+                    )
+                self._edge_drag_idx = -1
+                self._edge_drag_side = ""
+                self.update()
+                return
+
+            # Finish new-interval drag
             if self._drag_start is not None and self._drag_current is not None:
                 s = min(self._drag_start, self._drag_current)
                 e = max(self._drag_start, self._drag_current)
