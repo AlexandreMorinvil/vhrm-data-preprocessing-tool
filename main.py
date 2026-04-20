@@ -233,6 +233,9 @@ def main():
         level=logging.DEBUG,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    # Silence extremely verbose third-party debug loggers
+    logging.getLogger("numba").setLevel(logging.WARNING)
+    logging.getLogger("librosa").setLevel(logging.INFO)
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()

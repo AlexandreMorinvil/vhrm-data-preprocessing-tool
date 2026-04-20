@@ -33,6 +33,7 @@ class VideoTrack:
     camera_label: str = ""
     segment_paths: list[str] = field(default_factory=list)
     concatenated_path: str = ""
+    trimstart_path: str = ""
     final_output_path: str = ""
     fps: float = 0.0
     frame_count: int = 0
@@ -130,7 +131,7 @@ class ProjectState:
 
 _PATH_KEYS = {
     "project_path", "output_directory", "concatenated_path",
-    "final_output_path", "ffmpeg_path",
+    "trimstart_path", "final_output_path", "ffmpeg_path",
 }
 _PATH_LIST_KEYS = {"segment_paths", "signal_paths"}
 

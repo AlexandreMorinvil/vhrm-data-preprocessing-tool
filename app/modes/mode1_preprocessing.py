@@ -10,6 +10,7 @@ from typing import Optional
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -219,6 +220,17 @@ class Mode1Widget(QWidget):
         self._log_area.setMaximumHeight(120)
         left_layout.addWidget(self._log_area)
 
+        # --- Intermediate file management ---
+        self._intermediates_group = QGroupBox("Manage intermediate files")
+        self._intermediates_group.setVisible(False)
+        inter_layout = QVBoxLayout(self._intermediates_group)
+        self._inter_list_layout = QVBoxLayout()
+        inter_layout.addLayout(self._inter_list_layout)
+        self._delete_unchecked_btn = QPushButton("Delete unchecked")
+        self._delete_unchecked_btn.clicked.connect(self._delete_unchecked_intermediates)
+        inter_layout.addWidget(self._delete_unchecked_btn)
+        left_layout.addWidget(self._intermediates_group)
+
         left_layout.addStretch()
         scroll.setWidget(left)
         splitter.addWidget(scroll)
@@ -280,6 +292,7 @@ class Mode1Widget(QWidget):
                 labels = [t.camera_label for t in self.state.tracks]
                 self._player.set_cameras(labels)
                 self._player.load_videos(valid)
+            self._populate_intermediates()
 
     def _preview_first_segments(self):
         """Load the first segment of each camera into the preview player."""
@@ -351,6 +364,7 @@ class Mode1Widget(QWidget):
             self._player.set_cameras(labels)
             self._player.load_videos(paths)
             self._update_metadata()
+            self._populate_intermediates()
 
     def _update_metadata(self):
         info = {}
@@ -370,10 +384,97 @@ class Mode1Widget(QWidget):
                     info[f"Cam{i+1} error"] = str(exc)
         self._metadata_panel.set_info(info)
 
+    # ------------------------------------------------------------------
+    # Intermediate file management
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_size(nbytes: int) -> str:
+        for unit in ("B", "KB", "MB", "GB"):
+            if abs(nbytes) < 1024:
+                return f"{nbytes:.1f} {unit}"
+            nbytes /= 1024  # type: ignore[assignment]
+        return f"{nbytes:.1f} TB"
+
+    def _populate_intermediates(self):
+        """Build the checkbox list from current state.tracks."""
+        # Clear previous entries
+        while self._inter_list_layout.count():
+            item = self._inter_list_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self._inter_checkboxes: list[tuple[QCheckBox, str]] = []
+
+        has_any = False
+        for t in self.state.tracks:
+            stages = [
+                ("Concatenated", t.concatenated_path),
+                ("Start-trimmed", t.trimstart_path),
+                ("Final", t.final_output_path),
+            ]
+            cam_label = QLabel(f"<b>Camera {t.camera_index + 1} ({t.camera_label})</b>")
+            self._inter_list_layout.addWidget(cam_label)
+            for stage_name, fpath in stages:
+                if not fpath or not Path(fpath).exists():
+                    continue
+                has_any = True
+                size = self._format_size(os.path.getsize(fpath))
+                cb = QCheckBox(f"{stage_name}: {Path(fpath).name}  ({size})")
+                cb.setToolTip(fpath)
+                # Default: keep only final
+                cb.setChecked(stage_name == "Final")
+                self._inter_list_layout.addWidget(cb)
+                self._inter_checkboxes.append((cb, fpath))
+
+        self._intermediates_group.setVisible(has_any)
+
+    def _delete_unchecked_intermediates(self):
+        to_delete: list[str] = []
+        for cb, fpath in self._inter_checkboxes:
+            if not cb.isChecked() and Path(fpath).exists():
+                to_delete.append(fpath)
+
+        if not to_delete:
+            QMessageBox.information(self, "Info", "Nothing to delete — all files are checked to keep.")
+            return
+
+        total_bytes = sum(os.path.getsize(p) for p in to_delete)
+        details = "\n".join(f"  • {Path(p).name}" for p in to_delete)
+        reply = QMessageBox.question(
+            self, "Confirm deletion",
+            f"Delete {len(to_delete)} file(s) and reclaim "
+            f"{self._format_size(total_bytes)}?\n\n{details}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        deleted = 0
+        for fpath in to_delete:
+            try:
+                os.remove(fpath)
+                deleted += 1
+                self._log(f"Deleted: {fpath}")
+            except OSError as exc:
+                self._log(f"Failed to delete {fpath}: {exc}")
+
+        # Clear the path references in state so they don't linger
+        for t in self.state.tracks:
+            if t.concatenated_path and not Path(t.concatenated_path).exists():
+                t.concatenated_path = ""
+            if t.trimstart_path and not Path(t.trimstart_path).exists():
+                t.trimstart_path = ""
+
+        self._populate_intermediates()
+        self._log(f"Deleted {deleted}/{len(to_delete)} intermediate file(s).")
+
     def _preprocessing_pipeline(self, *, ffmpeg, out_dir, cameras, worker: FFmpegWorker):
         num = len(cameras)
         tracks: list[VideoTrack] = []
 
+        # --- Concatenation (0–55%) -------------------------------------------
         for ci, cam in enumerate(cameras):
             if worker.is_cancelled:
                 return
@@ -382,14 +483,25 @@ class Mode1Widget(QWidget):
 
             first_dt = parse_dji_datetime(Path(seg_paths[0]).stem)
 
-            worker.progress.emit(int(10 + ci * 30 / num), f"Concatenating camera {ci+1} …")
+            step_label = f"Concatenating camera {ci+1}/{num} …"
+            worker.progress.emit(int(ci * 55 / num), step_label)
             worker.log_message.emit(f"Camera {ci+1}: {len(seg_paths)} segment(s)")
 
             concat_name = f"cam{ci+1}_{label}_concat.mp4"
             concat_path = str(Path(out_dir) / concat_name)
+
+            base_pct = ci * 55 / num
+            span_pct = 55 / num
+
+            def _concat_progress(cur, total, _b=base_pct, _s=span_pct):
+                frac = min(cur / total, 1.0) if total > 0 else 0
+                worker.progress.emit(int(_b + frac * _s), step_label)
+
             concatenate_segments(
                 seg_paths, concat_path, ffmpeg=ffmpeg,
                 log_callback=lambda m: worker.log_message.emit(m),
+                progress_callback=_concat_progress,
+                cancel_check=lambda: worker.is_cancelled,
             )
 
             vinfo = probe_video(concat_path, find_ffprobe())
@@ -412,7 +524,8 @@ class Mode1Widget(QWidget):
         if worker.is_cancelled:
             return
 
-        worker.progress.emit(60, "Computing sync offsets …")
+        # --- Audio sync (55–70%) ---------------------------------------------
+        worker.progress.emit(55, "Synchronising audio …")
         first_segments = [cam.segment_paths[0] for cam in cameras]
         from ..audio_sync import compute_all_offsets
         offsets = compute_all_offsets(first_segments, ffmpeg=ffmpeg)
@@ -423,19 +536,34 @@ class Mode1Widget(QWidget):
         if worker.is_cancelled:
             return
 
+        # --- Trim starts (70–85%) --------------------------------------------
         worker.progress.emit(70, "Trimming starts …")
         max_start_offset = max(t.sync_offset_sec for t in tracks)
         for i, t in enumerate(tracks):
+            if worker.is_cancelled:
+                return
             trim_start = max_start_offset - t.sync_offset_sec
             if trim_start > 0.01:
                 trimmed_name = f"cam{i+1}_{t.camera_label}_trimstart.mp4"
                 trimmed_path = str(Path(out_dir) / trimmed_name)
+                expected_dur = t.duration_sec - trim_start
+
+                step_label = f"Trimming start camera {i+1}/{num} …"
+                worker.progress.emit(int(70 + i * 15 / num), step_label)
+
+                def _trim_progress(cur_s, total_s, _i=i):
+                    frac = min(cur_s / total_s, 1.0) if total_s > 0 else 0
+                    worker.progress.emit(int(70 + (_i * 15 / num) + frac * 15 / num), step_label)
+
                 trim_video(
                     t.concatenated_path, trimmed_path,
                     start_sec=trim_start, ffmpeg=ffmpeg,
                     log_callback=lambda m: worker.log_message.emit(m),
+                    progress_callback=_trim_progress,
+                    expected_duration_sec=expected_dur,
+                    cancel_check=lambda: worker.is_cancelled,
                 )
-                t.concatenated_path = trimmed_path
+                t.trimstart_path = trimmed_path
                 vinfo2 = probe_video(trimmed_path)
                 t.duration_sec = vinfo2.get("duration", 0)
                 t.frame_count = vinfo2.get("frame_count", 0)
@@ -443,20 +571,36 @@ class Mode1Widget(QWidget):
         if worker.is_cancelled:
             return
 
+        # --- Trim to common duration (85–98%) ---------------------------------
         worker.progress.emit(85, "Trimming to common duration …")
         min_dur = min(t.duration_sec for t in tracks)
         for i, t in enumerate(tracks):
+            if worker.is_cancelled:
+                return
             final_name = f"cam{i+1}_{t.camera_label}_final.mp4"
             final_path = str(Path(out_dir) / final_name)
+            # Source for the end-trim is trimstart if it exists, else concat
+            source = t.trimstart_path or t.concatenated_path
+
+            step_label = f"Trimming end camera {i+1}/{num} …"
+            worker.progress.emit(int(85 + i * 13 / num), step_label)
+
             if abs(t.duration_sec - min_dur) > 0.1:
+                def _trim_end_progress(cur_s, total_s, _i=i):
+                    frac = min(cur_s / total_s, 1.0) if total_s > 0 else 0
+                    worker.progress.emit(int(85 + (_i * 13 / num) + frac * 13 / num), step_label)
+
                 trim_video(
-                    t.concatenated_path, final_path,
+                    source, final_path,
                     duration_sec=min_dur, ffmpeg=ffmpeg,
                     log_callback=lambda m: worker.log_message.emit(m),
+                    progress_callback=_trim_end_progress,
+                    expected_duration_sec=min_dur,
+                    cancel_check=lambda: worker.is_cancelled,
                 )
             else:
                 import shutil
-                shutil.copy2(t.concatenated_path, final_path)
+                shutil.copy2(source, final_path)
             t.final_output_path = final_path
             vinfo3 = probe_video(final_path)
             t.duration_sec = vinfo3.get("duration", 0)
@@ -472,4 +616,4 @@ class Mode1Widget(QWidget):
             worker.log_message.emit("Warning: frame counts differ slightly after trimming.")
 
         self.state.tracks = tracks
-        worker.progress.emit(100, "Preprocessing complete.")
+        worker.progress.emit(100, "Done ✓")
