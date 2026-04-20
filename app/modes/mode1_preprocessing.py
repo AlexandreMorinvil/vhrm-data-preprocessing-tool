@@ -1,0 +1,475 @@
+from __future__ import annotations
+
+import logging
+import os
+from datetime import datetime, timezone
+from functools import partial
+from pathlib import Path
+from typing import Optional
+
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtWidgets import (
+    QAbstractItemView,
+    QComboBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSpinBox,
+    QSplitter,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from ..ffmpeg_utils import (
+    FFmpegWorker,
+    concatenate_segments,
+    find_ffmpeg,
+    find_ffprobe,
+    probe_video,
+    trim_video,
+)
+from ..state import ProjectState, VideoTrack, parse_dji_datetime, dji_datetime_str
+from ..widgets.frame_preview import MultiCameraPlayer
+
+log = logging.getLogger(__name__)
+
+_VIDEO_FILTER = "Videos (*.mp4 *.mov *.lrf *.avi *.mkv);;All files (*)"
+
+
+class _MetadataPanel(QGroupBox):
+    def __init__(self, title="Metadata", parent=None):
+        super().__init__(title, parent)
+        layout = QFormLayout(self)
+        self._rows: dict[str, QLabel] = {}
+
+    def set_info(self, info: dict) -> None:
+        for key in list(self._rows.keys()):
+            self._rows[key].setParent(None)
+            self._rows[key].deleteLater()
+        self._rows.clear()
+        layout: QFormLayout = self.layout()
+        while layout.count():
+            layout.removeRow(0)
+        for k, v in info.items():
+            lbl = QLabel(str(v))
+            lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            layout.addRow(k + ":", lbl)
+            self._rows[k] = lbl
+
+
+class _CameraGroup(QGroupBox):
+    segments_changed = pyqtSignal()
+
+    def __init__(self, index: int, parent=None):
+        super().__init__(f"Camera {index + 1}", parent)
+        self.camera_index = index
+        layout = QVBoxLayout(self)
+
+        btn_row = QHBoxLayout()
+        self._add_btn = QPushButton("Add segments …")
+        self._add_btn.clicked.connect(self._add_segments)
+        btn_row.addWidget(self._add_btn)
+
+        self._remove_btn = QPushButton("Remove selected")
+        self._remove_btn.clicked.connect(self._remove_selected)
+        btn_row.addWidget(self._remove_btn)
+
+        self._clear_btn = QPushButton("Clear")
+        self._clear_btn.clicked.connect(self._clear_all)
+        btn_row.addWidget(self._clear_btn)
+        layout.addLayout(btn_row)
+
+        self._list = QListWidget()
+        self._list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        layout.addWidget(self._list)
+
+        self._label_edit = QLineEdit()
+        self._label_edit.setPlaceholderText("Camera label (e.g. front, left)")
+        layout.addWidget(self._label_edit)
+
+    @property
+    def label(self) -> str:
+        return self._label_edit.text().strip() or f"Camera {self.camera_index + 1}"
+
+    @label.setter
+    def label(self, text: str):
+        self._label_edit.setText(text)
+
+    @property
+    def segment_paths(self) -> list[str]:
+        return [self._list.item(i).data(Qt.ItemDataRole.UserRole)
+                for i in range(self._list.count())]
+
+    @segment_paths.setter
+    def segment_paths(self, paths: list[str]):
+        self._list.clear()
+        for p in paths:
+            item = QListWidgetItem(Path(p).name)
+            item.setData(Qt.ItemDataRole.UserRole, p)
+            item.setToolTip(p)
+            self._list.addItem(item)
+
+    def _add_segments(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self, f"Select segments for Camera {self.camera_index + 1}",
+            "", _VIDEO_FILTER,
+        )
+        if files:
+            files.sort()
+            for p in files:
+                item = QListWidgetItem(Path(p).name)
+                item.setData(Qt.ItemDataRole.UserRole, p)
+                item.setToolTip(p)
+                self._list.addItem(item)
+            self.segments_changed.emit()
+
+    def _remove_selected(self):
+        for item in self._list.selectedItems():
+            self._list.takeItem(self._list.row(item))
+        self.segments_changed.emit()
+
+    def _clear_all(self):
+        self._list.clear()
+        self.segments_changed.emit()
+
+
+class Mode1Widget(QWidget):
+    def __init__(self, state: ProjectState, parent=None):
+        super().__init__(parent)
+        self.state = state
+        self._worker: Optional[FFmpegWorker] = None
+
+        root = QHBoxLayout(self)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        root.addWidget(splitter)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(4, 4, 4, 4)
+
+        setup_group = QGroupBox("Setup")
+        setup_lay = QFormLayout(setup_group)
+
+        self._ffmpeg_edit = QLineEdit(state.ffmpeg_path or find_ffmpeg())
+        browse_ff = QPushButton("…")
+        browse_ff.setFixedWidth(30)
+        browse_ff.clicked.connect(self._browse_ffmpeg)
+        ff_row = QHBoxLayout()
+        ff_row.addWidget(self._ffmpeg_edit)
+        ff_row.addWidget(browse_ff)
+        setup_lay.addRow("FFmpeg:", ff_row)
+
+        self._out_dir_edit = QLineEdit(state.output_directory)
+        browse_out = QPushButton("…")
+        browse_out.setFixedWidth(30)
+        browse_out.clicked.connect(self._browse_outdir)
+        out_row = QHBoxLayout()
+        out_row.addWidget(self._out_dir_edit)
+        out_row.addWidget(browse_out)
+        setup_lay.addRow("Output dir:", out_row)
+
+        self._num_cameras_spin = QSpinBox()
+        self._num_cameras_spin.setRange(1, 6)
+        self._num_cameras_spin.setValue(state.num_cameras)
+        self._num_cameras_spin.valueChanged.connect(self._rebuild_camera_groups)
+        setup_lay.addRow("Cameras:", self._num_cameras_spin)
+        left_layout.addWidget(setup_group)
+
+        self._camera_area = QVBoxLayout()
+        self._camera_groups: list[_CameraGroup] = []
+        left_layout.addLayout(self._camera_area)
+
+        btn_row = QHBoxLayout()
+        self._run_btn = QPushButton("Run preprocessing")
+        self._run_btn.setStyleSheet("font-weight:bold; padding:8px;")
+        self._run_btn.clicked.connect(self._run_preprocessing)
+        btn_row.addWidget(self._run_btn)
+
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.clicked.connect(self._cancel)
+        btn_row.addWidget(self._cancel_btn)
+        left_layout.addLayout(btn_row)
+
+        self._progress = QProgressBar()
+        self._progress.setTextVisible(True)
+        self._progress.setValue(0)
+        left_layout.addWidget(self._progress)
+
+        self._status_label = QLabel("")
+        left_layout.addWidget(self._status_label)
+
+        self._log_area = QTextEdit()
+        self._log_area.setReadOnly(True)
+        self._log_area.setMaximumHeight(120)
+        left_layout.addWidget(self._log_area)
+
+        left_layout.addStretch()
+        scroll.setWidget(left)
+        splitter.addWidget(scroll)
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(4, 4, 4, 4)
+
+        self._player = MultiCameraPlayer()
+        right_layout.addWidget(self._player)
+
+        self._metadata_panel = _MetadataPanel("Video metadata")
+        right_layout.addWidget(self._metadata_panel)
+        splitter.addWidget(right)
+
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+
+        self._rebuild_camera_groups()
+        self._restore_from_state()
+
+    def _browse_ffmpeg(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select ffmpeg executable")
+        if path:
+            self._ffmpeg_edit.setText(path)
+
+    def _browse_outdir(self):
+        d = QFileDialog.getExistingDirectory(self, "Select output directory")
+        if d:
+            self._out_dir_edit.setText(d)
+
+    def _rebuild_camera_groups(self):
+        old_data = [(g.label, g.segment_paths) for g in self._camera_groups]
+        for g in self._camera_groups:
+            g.setParent(None)
+            g.deleteLater()
+        self._camera_groups.clear()
+        n = self._num_cameras_spin.value()
+        for i in range(n):
+            g = _CameraGroup(i)
+            if i < len(old_data):
+                g.label = old_data[i][0]
+                g.segment_paths = old_data[i][1]
+            g.segments_changed.connect(self._preview_first_segments)
+            self._camera_area.addWidget(g)
+            self._camera_groups.append(g)
+        labels = [g.label for g in self._camera_groups]
+        self._player.set_cameras(labels)
+
+    def _restore_from_state(self):
+        for i, track in enumerate(self.state.tracks):
+            if i < len(self._camera_groups):
+                self._camera_groups[i].label = track.camera_label
+                self._camera_groups[i].segment_paths = track.segment_paths
+        if self.state.tracks:
+            paths = [t.final_output_path or t.concatenated_path for t in self.state.tracks]
+            valid = [p for p in paths if p and Path(p).exists()]
+            if valid:
+                labels = [t.camera_label for t in self.state.tracks]
+                self._player.set_cameras(labels)
+                self._player.load_videos(valid)
+
+    def _preview_first_segments(self):
+        """Load the first segment of each camera into the preview player."""
+        labels = [g.label for g in self._camera_groups]
+        self._player.set_cameras(labels)
+        paths = [g.segment_paths[0] if g.segment_paths else "" for g in self._camera_groups]
+        if any(paths):
+            self._player.load_videos(paths)
+
+    def _log(self, msg: str):
+        self._log_area.append(msg)
+        log.info(msg)
+
+    def _collect_state(self):
+        self.state.ffmpeg_path = self._ffmpeg_edit.text().strip()
+        self.state.output_directory = self._out_dir_edit.text().strip()
+        self.state.num_cameras = self._num_cameras_spin.value()
+
+    def _run_preprocessing(self):
+        self._collect_state()
+        ffmpeg = self.state.ffmpeg_path or find_ffmpeg()
+        if not ffmpeg:
+            QMessageBox.critical(self, "Error", "FFmpeg not found. Please set the path.")
+            return
+        out_dir = self.state.output_directory
+        if not out_dir:
+            QMessageBox.critical(self, "Error", "Please set an output directory.")
+            return
+        os.makedirs(out_dir, exist_ok=True)
+
+        cameras = self._camera_groups
+        for i, cam in enumerate(cameras):
+            if not cam.segment_paths:
+                QMessageBox.warning(self, "Warning", f"Camera {i+1} has no segments.")
+                return
+
+        self._run_btn.setEnabled(False)
+        self._cancel_btn.setEnabled(True)
+        self._progress.setValue(0)
+        self._log("Starting preprocessing …")
+
+        worker = FFmpegWorker(
+            self._preprocessing_pipeline,
+            ffmpeg=ffmpeg,
+            out_dir=out_dir,
+            cameras=cameras,
+        )
+        worker.log_message.connect(self._log)
+        worker.progress.connect(lambda v, m: (self._progress.setValue(v), self._status_label.setText(m)))
+        worker.finished.connect(self._on_finished)
+        self._worker = worker
+        worker.start()
+
+    def _cancel(self):
+        if self._worker:
+            self._worker.cancel()
+
+    def _on_finished(self, ok: bool, msg: str):
+        self._run_btn.setEnabled(True)
+        self._cancel_btn.setEnabled(False)
+        self._progress.setValue(100 if ok else 0)
+        self._status_label.setText(msg)
+        self._log(msg)
+        self._worker = None
+        if ok:
+            self.state.mode1_complete = True
+            paths = [t.final_output_path for t in self.state.tracks]
+            labels = [t.camera_label for t in self.state.tracks]
+            self._player.set_cameras(labels)
+            self._player.load_videos(paths)
+            self._update_metadata()
+
+    def _update_metadata(self):
+        info = {}
+        ffprobe = find_ffprobe()
+        for i, t in enumerate(self.state.tracks):
+            p = t.final_output_path
+            if p and Path(p).exists():
+                try:
+                    vi = probe_video(p, ffprobe)
+                    info[f"Cam{i+1} codec"] = vi.get("codec", "")
+                    info[f"Cam{i+1} resolution"] = f'{vi.get("width",0)}x{vi.get("height",0)}'
+                    info[f"Cam{i+1} fps"] = f'{vi.get("fps",0):.2f}'
+                    info[f"Cam{i+1} frames"] = vi.get("frame_count", 0)
+                    info[f"Cam{i+1} duration"] = f'{vi.get("duration",0):.2f}s'
+                    info[f"Cam{i+1} start"] = dji_datetime_str(t.parsed_start_datetime())
+                except Exception as exc:
+                    info[f"Cam{i+1} error"] = str(exc)
+        self._metadata_panel.set_info(info)
+
+    def _preprocessing_pipeline(self, *, ffmpeg, out_dir, cameras, worker: FFmpegWorker):
+        num = len(cameras)
+        tracks: list[VideoTrack] = []
+
+        for ci, cam in enumerate(cameras):
+            if worker.is_cancelled:
+                return
+            seg_paths = cam.segment_paths
+            label = cam.label
+
+            first_dt = parse_dji_datetime(Path(seg_paths[0]).stem)
+
+            worker.progress.emit(int(10 + ci * 30 / num), f"Concatenating camera {ci+1} …")
+            worker.log_message.emit(f"Camera {ci+1}: {len(seg_paths)} segment(s)")
+
+            concat_name = f"cam{ci+1}_{label}_concat.mp4"
+            concat_path = str(Path(out_dir) / concat_name)
+            concatenate_segments(
+                seg_paths, concat_path, ffmpeg=ffmpeg,
+                log_callback=lambda m: worker.log_message.emit(m),
+            )
+
+            vinfo = probe_video(concat_path, find_ffprobe())
+
+            track = VideoTrack(
+                camera_index=ci,
+                camera_label=label,
+                segment_paths=seg_paths,
+                concatenated_path=concat_path,
+                fps=vinfo.get("fps", 0),
+                frame_count=vinfo.get("frame_count", 0),
+                width=vinfo.get("width", 0),
+                height=vinfo.get("height", 0),
+                codec=vinfo.get("codec", ""),
+                duration_sec=vinfo.get("duration", 0),
+            )
+            track.set_start_datetime(first_dt)
+            tracks.append(track)
+
+        if worker.is_cancelled:
+            return
+
+        worker.progress.emit(60, "Computing sync offsets …")
+        first_segments = [cam.segment_paths[0] for cam in cameras]
+        from ..audio_sync import compute_all_offsets
+        offsets = compute_all_offsets(first_segments, ffmpeg=ffmpeg)
+        for i, off in enumerate(offsets):
+            tracks[i].sync_offset_sec = off
+            worker.log_message.emit(f"Camera {i+1} offset: {off:.4f}s")
+
+        if worker.is_cancelled:
+            return
+
+        worker.progress.emit(70, "Trimming starts …")
+        max_start_offset = max(t.sync_offset_sec for t in tracks)
+        for i, t in enumerate(tracks):
+            trim_start = max_start_offset - t.sync_offset_sec
+            if trim_start > 0.01:
+                trimmed_name = f"cam{i+1}_{t.camera_label}_trimstart.mp4"
+                trimmed_path = str(Path(out_dir) / trimmed_name)
+                trim_video(
+                    t.concatenated_path, trimmed_path,
+                    start_sec=trim_start, ffmpeg=ffmpeg,
+                    log_callback=lambda m: worker.log_message.emit(m),
+                )
+                t.concatenated_path = trimmed_path
+                vinfo2 = probe_video(trimmed_path)
+                t.duration_sec = vinfo2.get("duration", 0)
+                t.frame_count = vinfo2.get("frame_count", 0)
+
+        if worker.is_cancelled:
+            return
+
+        worker.progress.emit(85, "Trimming to common duration …")
+        min_dur = min(t.duration_sec for t in tracks)
+        for i, t in enumerate(tracks):
+            final_name = f"cam{i+1}_{t.camera_label}_final.mp4"
+            final_path = str(Path(out_dir) / final_name)
+            if abs(t.duration_sec - min_dur) > 0.1:
+                trim_video(
+                    t.concatenated_path, final_path,
+                    duration_sec=min_dur, ffmpeg=ffmpeg,
+                    log_callback=lambda m: worker.log_message.emit(m),
+                )
+            else:
+                import shutil
+                shutil.copy2(t.concatenated_path, final_path)
+            t.final_output_path = final_path
+            vinfo3 = probe_video(final_path)
+            t.duration_sec = vinfo3.get("duration", 0)
+            t.frame_count = vinfo3.get("frame_count", 0)
+            t.fps = vinfo3.get("fps", t.fps)
+
+        if worker.is_cancelled:
+            return
+
+        frame_counts = [t.frame_count for t in tracks]
+        worker.log_message.emit(f"Frame counts: {frame_counts}")
+        if len(set(frame_counts)) > 1:
+            worker.log_message.emit("Warning: frame counts differ slightly after trimming.")
+
+        self.state.tracks = tracks
+        worker.progress.emit(100, "Preprocessing complete.")
