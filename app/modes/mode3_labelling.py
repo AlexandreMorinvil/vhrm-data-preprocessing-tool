@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..ffmpeg_utils import trim_video, find_ffmpeg
-from ..mosaic_export import MosaicWorker
+from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_preset
 from ..signals import load_signal
 from ..state import LabelInterval, ProjectState, load_sidecar, populate_tracks_from_videos
 from ..widgets.frame_preview import MultiCameraPlayer
@@ -867,6 +867,21 @@ class Mode3Widget(QWidget):
         if not path:
             return
 
+        preset_choice, ok = QInputDialog.getItem(
+            self,
+            "Mosaic export preset",
+            "Speed vs quality:",
+            MOSAIC_PRESET_NAMES,
+            ({"speed": 0, "balanced": 1, "quality": 2}.get(
+                normalise_mosaic_preset(self.state.mosaic_preset), 1
+            )),
+            False,
+        )
+        if not ok:
+            return
+        preset_key = normalise_mosaic_preset(preset_choice)
+        self.state.mosaic_preset = preset_key
+
         t0 = self.state.tracks[0]
         fps = t0.fps or 30.0
         duration = iv.end_sec - iv.start_sec
@@ -883,13 +898,14 @@ class Mode3Widget(QWidget):
             signal_df=self._merged_df,
             start_sec=iv.start_sec,
             end_sec=iv.end_sec,
+            quality_preset=preset_key,
             ffmpeg_path=self.state.ffmpeg_path,
         )
         self._mosaic_worker.progress.connect(self._on_mosaic_progress)
         self._mosaic_worker.finished.connect(self._on_mosaic_finished)
         self._export_btn.setEnabled(False)
         self._progress.setValue(0)
-        self._status.setText(f"Exporting mosaic for '{iv.label}'\u2026")
+        self._status.setText(f"Exporting mosaic for '{iv.label}' ({preset_choice})\u2026")
         self._mosaic_worker.start()
 
     def _on_mosaic_progress(self, current: int, total: int):

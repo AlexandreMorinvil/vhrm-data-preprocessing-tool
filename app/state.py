@@ -96,6 +96,7 @@ class ProjectState:
     ffmpeg_path: str = ""
     keep_temp_files: bool = False
     synced_signal_path: str = ""
+    mosaic_preset: str = "balanced"
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

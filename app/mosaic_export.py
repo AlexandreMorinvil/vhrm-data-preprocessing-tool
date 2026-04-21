@@ -25,9 +25,51 @@ import numpy as np
 import pandas as pd
 from PyQt6.QtCore import QThread, pyqtSignal
 
+import matplotlib
+matplotlib.use("Agg")
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+
 from .ffmpeg_utils import find_ffmpeg
 
 log = logging.getLogger(__name__)
+
+MOSAIC_PRESET_NAMES = ["Speed", "Balanced", "Quality"]
+
+_MOSAIC_PRESETS: dict[str, dict[str, object]] = {
+    # Smaller frame + faster encoder for quick review exports
+    "speed": {
+        "max_cell_w": 640,
+        "max_cell_h": 360,
+        "signal_ratio": 0.24,
+        "x264_preset": "ultrafast",
+        "crf": 28,
+    },
+    # Existing default behavior
+    "balanced": {
+        "max_cell_w": 960,
+        "max_cell_h": 540,
+        "signal_ratio": 0.30,
+        "x264_preset": "fast",
+        "crf": 20,
+    },
+    # Better compression quality (slower encode)
+    "quality": {
+        "max_cell_w": 960,
+        "max_cell_h": 540,
+        "signal_ratio": 0.30,
+        "x264_preset": "medium",
+        "crf": 17,
+    },
+}
+
+
+def normalise_mosaic_preset(name: str) -> str:
+    """Normalise user-facing preset text to internal key."""
+    key = (name or "").strip().lower()
+    if key in _MOSAIC_PRESETS:
+        return key
+    return "balanced"
 
 # ---------------------------------------------------------------------------
 # Grid layout helpers
@@ -59,38 +101,29 @@ def _cell_size(n_cameras: int, max_cell_w: int = 960, max_cell_h: int = 540
     return cell_w, cell_h, grid_w, grid_h
 
 
-def _letterbox(frame: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
-    """Resize *frame* into a *target_w × target_h* black box preserving AR."""
-    h, w = frame.shape[:2]
-    if h == 0 or w == 0:
-        return np.zeros((target_h, target_w, 3), dtype=np.uint8)
-    scale = min(target_w / w, target_h / h)
-    new_w = int(w * scale)
-    new_h = int(h * scale)
-    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-    y_off = (target_h - new_h) // 2
-    x_off = (target_w - new_w) // 2
-    canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
-    return canvas
+def _fit_rect(src_w: int, src_h: int, dst_w: int, dst_h: int) -> tuple[int, int, int, int]:
+    """Return fitted rectangle (x_off, y_off, w, h) preserving aspect ratio."""
+    if src_w <= 0 or src_h <= 0:
+        return 0, 0, 0, 0
+    scale = min(dst_w / src_w, dst_h / src_h)
+    fit_w = max(1, int(src_w * scale))
+    fit_h = max(1, int(src_h * scale))
+    x_off = (dst_w - fit_w) // 2
+    y_off = (dst_h - fit_h) // 2
+    return x_off, y_off, fit_w, fit_h
 
 
 # ---------------------------------------------------------------------------
 # Signal plot renderer (matplotlib agg → numpy)
 # ---------------------------------------------------------------------------
 
-def _render_signal_strip(
+def _build_signal_strip_background(
     signal_df: Optional[pd.DataFrame],
-    current_sec: float,
     video_duration_sec: float,
     strip_w: int,
     strip_h: int,
-) -> np.ndarray:
-    """Render the signal plot for the current time and return a BGR numpy array."""
-    import matplotlib
-    matplotlib.use("Agg")
-    from matplotlib.figure import Figure
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
+) -> tuple[np.ndarray, int, int]:
+    """Render static signal background once and return (image, plot_x0, plot_x1)."""
 
     dpi = 100
     fig = Figure(figsize=(strip_w / dpi, strip_h / dpi), dpi=dpi)
@@ -122,7 +155,6 @@ def _render_signal_strip(
         if len(signal_df.columns) > 2:
             ax.legend(fontsize=7, loc="upper right")
 
-    ax.axvline(x=current_sec, color="red", linewidth=1.5)
     ax.set_xlim(0, max(video_duration_sec, 0.1))
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Value", fontsize=8)
@@ -139,9 +171,22 @@ def _render_signal_strip(
     if bgr.shape[1] != strip_w or bgr.shape[0] != strip_h:
         bgr = cv2.resize(bgr, (strip_w, strip_h), interpolation=cv2.INTER_AREA)
 
-    import matplotlib.pyplot as plt
-    plt.close(fig)
-    return bgr
+    # Compute where x=0 and x=video_duration map in pixel coordinates.
+    px0 = int(ax.transData.transform((0.0, 0.0))[0])
+    px1 = int(ax.transData.transform((max(video_duration_sec, 0.1), 0.0))[0])
+    px0 = max(0, min(strip_w - 1, px0))
+    px1 = max(px0 + 1, min(strip_w - 1, px1))
+
+    return bgr, px0, px1
+
+
+def _signal_cursor_x(current_sec: float, duration_sec: float, x0: int, x1: int) -> int:
+    """Map time in seconds to the plotted x pixel range."""
+    if duration_sec <= 0:
+        return x0
+    t = max(0.0, min(current_sec, duration_sec))
+    frac = t / duration_sec
+    return int(round(x0 + frac * (x1 - x0)))
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +253,7 @@ def export_mosaic(
     signal_df: Optional[pd.DataFrame] = None,
     start_sec: float = 0.0,
     end_sec: float = 0.0,
+    quality_preset: str = "balanced",
     ffmpeg_path: str = "",
     progress_callback: Optional[Callable[[int, int], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
@@ -253,9 +299,16 @@ def export_mosaic(
     if n_cams == 0:
         raise ValueError("No video paths provided")
 
+    preset_key = normalise_mosaic_preset(quality_preset)
+    preset = _MOSAIC_PRESETS[preset_key]
+
     # --- Compute layout ---
-    cell_w, cell_h, grid_w, grid_h = _cell_size(n_cams)
-    strip_h = int(grid_h * 0.30)          # signal strip ~30% of grid height
+    cell_w, cell_h, grid_w, grid_h = _cell_size(
+        n_cams,
+        max_cell_w=int(preset["max_cell_w"]),
+        max_cell_h=int(preset["max_cell_h"]),
+    )
+    strip_h = int(grid_h * float(preset["signal_ratio"]))
     out_w = grid_w
     out_h = grid_h + strip_h
     # Make dimensions even (required by H.264)
@@ -301,8 +354,8 @@ def export_mosaic(
         "-r", str(fps),
         "-i", "-",
         "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "20",
+        "-preset", str(preset["x264_preset"]),
+        "-crf", str(preset["crf"]),
         "-pix_fmt", "yuv420p",
         output_path,
     ]
@@ -324,7 +377,24 @@ def export_mosaic(
     drain_t = threading.Thread(target=_drain, daemon=True)
     drain_t.start()
 
-    black_cell = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
+    # Precompute fitted placement for each camera to avoid repeated math.
+    cam_layouts: list[tuple[int, int, int, int]] = []
+    for cap in caps:
+        if cap is None:
+            cam_layouts.append((0, 0, 0, 0))
+            continue
+        src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cam_layouts.append(_fit_rect(src_w, src_h, cell_w, cell_h))
+
+    # Render the expensive matplotlib plot only once.
+    signal_bg, signal_x0, signal_x1 = _build_signal_strip_background(
+        sig_clip, video_duration_sec, out_w, strip_h
+    )
+
+    # Pre-allocate destination buffers to reduce per-frame allocations.
+    grid_frame = np.zeros((grid_h, out_w, 3), dtype=np.uint8)
+    composite = np.zeros((out_h, out_w, 3), dtype=np.uint8)
 
     try:
         for frame_no in range(total_frames):
@@ -337,41 +407,39 @@ def export_mosaic(
 
             current_sec = frame_no / fps
 
-            # --- Build camera grid ---
-            grid_rows_list: list[np.ndarray] = []
+            # --- Build camera grid (in-place) ---
+            grid_frame.fill(0)
             cam_idx = 0
             for r in range(rows):
-                row_cells: list[np.ndarray] = []
                 for c in range(cols):
+                    x0 = c * cell_w
+                    y0 = r * cell_h
+                    cell_view = grid_frame[y0:y0 + cell_h, x0:x0 + cell_w]
+
                     if cam_idx < n_cams and caps[cam_idx] is not None:
                         ret, raw = caps[cam_idx].read()
                         if ret:
-                            cell = _letterbox(raw, cell_w, cell_h)
+                            lx, ly, lw, lh = cam_layouts[cam_idx]
+                            if lw > 0 and lh > 0:
+                                resized = cv2.resize(raw, (lw, lh), interpolation=cv2.INTER_AREA)
+                                cell_view[ly:ly + lh, lx:lx + lw] = resized
                             # Draw camera label at top-left
                             if cam_idx < len(camera_labels):
                                 lbl = camera_labels[cam_idx]
-                                cv2.putText(cell, lbl, (8, 24),
+                                cv2.putText(cell_view, lbl, (8, 24),
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                                             (255, 255, 255), 1, cv2.LINE_AA)
-                        else:
-                            cell = black_cell.copy()
-                    else:
-                        cell = black_cell.copy()
-                    row_cells.append(cell)
+
                     cam_idx += 1
-                grid_rows_list.append(np.hstack(row_cells))
 
-            grid_frame = np.vstack(grid_rows_list)
+            # --- Build signal strip (copy static + draw moving cursor) ---
+            sig_strip = signal_bg.copy()
+            cursor_x = _signal_cursor_x(current_sec, video_duration_sec, signal_x0, signal_x1)
+            cv2.line(sig_strip, (cursor_x, 0), (cursor_x, strip_h - 1), (0, 0, 255), 2)
 
-            # --- Render signal strip ---
-            signal_time = current_sec  # relative to the clip start
-            sig_strip = _render_signal_strip(
-                sig_clip, signal_time, video_duration_sec,
-                out_w, strip_h,
-            )
-
-            # --- Composite ---
-            composite = np.vstack([grid_frame, sig_strip])
+            # --- Composite in-place ---
+            composite[:grid_h, :out_w] = grid_frame
+            composite[grid_h:out_h, :out_w] = sig_strip
 
             # --- Text overlay ---
             _overlay_text(composite, frame_no, current_sec)
@@ -424,6 +492,7 @@ class MosaicWorker(QThread):
         signal_df: Optional[pd.DataFrame] = None,
         start_sec: float = 0.0,
         end_sec: float = 0.0,
+        quality_preset: str = "balanced",
         ffmpeg_path: str = "",
         parent=None,
     ):
@@ -437,6 +506,7 @@ class MosaicWorker(QThread):
         self._signal_df = signal_df
         self._start_sec = start_sec
         self._end_sec = end_sec
+        self._quality_preset = quality_preset
         self._ffmpeg_path = ffmpeg_path
         self._cancelled = False
 
@@ -460,6 +530,7 @@ class MosaicWorker(QThread):
                 signal_df=self._signal_df,
                 start_sec=self._start_sec,
                 end_sec=self._end_sec,
+                quality_preset=self._quality_preset,
                 ffmpeg_path=self._ffmpeg_path,
                 progress_callback=self._on_progress,
                 cancel_check=lambda: self._cancelled,

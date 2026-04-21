@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -24,7 +25,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..mosaic_export import MosaicWorker
+from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_preset
 from ..signals import get_loaders, load_signal
 from ..state import ProjectState, generate_sidecar, load_sidecar, populate_tracks_from_videos
 from ..widgets.frame_preview import MultiCameraPlayer
@@ -356,6 +357,21 @@ class Mode2Widget(QWidget):
         if not path:
             return
 
+        preset_choice, ok = QInputDialog.getItem(
+            self,
+            "Mosaic export preset",
+            "Speed vs quality:",
+            MOSAIC_PRESET_NAMES,
+            ({"speed": 0, "balanced": 1, "quality": 2}.get(
+                normalise_mosaic_preset(self.state.mosaic_preset), 1
+            )),
+            False,
+        )
+        if not ok:
+            return
+        preset_key = normalise_mosaic_preset(preset_choice)
+        self.state.mosaic_preset = preset_key
+
         t0 = self.state.tracks[0]
         fps = t0.fps or 30.0
         total_frames = t0.frame_count or int(t0.duration_sec * fps)
@@ -370,6 +386,7 @@ class Mode2Widget(QWidget):
             video_duration_sec=duration,
             output_path=path,
             signal_df=self._merged_df,
+            quality_preset=preset_key,
             ffmpeg_path=self.state.ffmpeg_path,
         )
         self._mosaic_worker.progress.connect(self._on_mosaic_progress)
@@ -377,7 +394,7 @@ class Mode2Widget(QWidget):
         self._mosaic_btn.setEnabled(False)
         self._mosaic_cancel_btn.setEnabled(True)
         self._mosaic_progress.setValue(0)
-        self._mosaic_status.setText("Exporting\u2026")
+        self._mosaic_status.setText(f"Exporting ({preset_choice})\u2026")
         self._mosaic_worker.start()
 
     def _cancel_mosaic(self):
