@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -89,6 +89,21 @@ def _dt_from_qtime(base: Optional[datetime], qtime: QTime) -> Optional[datetime]
         second=qtime.second(),
         microsecond=qtime.msec() * 1000,
     )
+
+
+def _secs_to_qtime(sec: float) -> QTime:
+    ms = int(round(max(0.0, sec) * 1000))
+    h = min(ms // 3_600_000, 23)
+    ms %= 3_600_000
+    m = ms // 60_000
+    ms %= 60_000
+    s = ms // 1000
+    ms %= 1000
+    return QTime(h, m, s, ms)
+
+
+def _qtime_to_secs(t: QTime) -> float:
+    return t.hour() * 3600 + t.minute() * 60 + t.second() + t.msec() / 1000.0
 
 
 class Mode2Widget(QWidget):
@@ -332,6 +347,7 @@ class Mode2Widget(QWidget):
             mode_combo = QComboBox()
             mode_combo.addItem("No correction", "none")
             mode_combo.addItem("Reference start time", "reference_time")
+            mode_combo.addItem("Reference point in video", "reference_video_time")
             mode_combo.addItem("Offset (seconds)", "offset")
             mode_idx = mode_combo.findData(track.time_correction_mode)
             mode_combo.setCurrentIndex(max(0, mode_idx))
@@ -347,6 +363,24 @@ class Mode2Widget(QWidget):
             offset_spin.setSingleStep(0.1)
             offset_spin.setValue(track.time_correction_offset_sec)
 
+            point_container = QWidget()
+            point_layout = QHBoxLayout(point_container)
+            point_layout.setContentsMargins(0, 0, 0, 0)
+            point_layout.addWidget(QLabel("Video:"))
+            point_video = QTimeEdit()
+            point_video.setDisplayFormat("HH:mm:ss.zzz")
+            point_video.setTime(_secs_to_qtime(track.reference_video_time_sec))
+            point_layout.addWidget(point_video)
+            use_playhead_btn = QPushButton("Use playhead")
+            use_playhead_btn.setToolTip("Use the current synced-video playhead time")
+            point_layout.addWidget(use_playhead_btn)
+            point_layout.addWidget(QLabel("Ref:"))
+            point_ref = QTimeEdit()
+            point_ref.setDisplayFormat("HH:mm:ss.zzz")
+            point_ref_dt = track.parsed_video_reference_datetime() or track.corrected_start_datetime() or track.parsed_start_datetime()
+            point_ref.setTime(_qtime_from_dt(point_ref_dt))
+            point_layout.addWidget(point_ref)
+
             none_label = QLabel(f"Filename time {_fmt_time(track.parsed_start_datetime())}")
             input_container = QWidget()
             input_layout = QHBoxLayout(input_container)
@@ -354,6 +388,7 @@ class Mode2Widget(QWidget):
             input_layout.addWidget(none_label)
             input_layout.addWidget(ref_edit)
             input_layout.addWidget(offset_spin)
+            input_layout.addWidget(point_container)
 
             corrected_label = QLabel("")
             corrected_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -364,6 +399,10 @@ class Mode2Widget(QWidget):
                 "none": none_label,
                 "ref": ref_edit,
                 "offset": offset_spin,
+                "point_container": point_container,
+                "point_video": point_video,
+                "point_ref": point_ref,
+                "point_use_playhead": use_playhead_btn,
                 "corrected": corrected_label,
             }
             self._time_rows.append(row)
@@ -371,6 +410,9 @@ class Mode2Widget(QWidget):
             mode_combo.currentIndexChanged.connect(lambda _=0, i=row_idx - 1: self._on_time_row_changed(i))
             ref_edit.timeChanged.connect(lambda _=None, i=row_idx - 1: self._on_time_row_changed(i))
             offset_spin.valueChanged.connect(lambda _=0.0, i=row_idx - 1: self._on_time_row_changed(i))
+            point_video.timeChanged.connect(lambda _=None, i=row_idx - 1: self._on_time_row_changed(i))
+            point_ref.timeChanged.connect(lambda _=None, i=row_idx - 1: self._on_time_row_changed(i))
+            use_playhead_btn.clicked.connect(lambda _=False, i=row_idx - 1: self._use_playhead_for_time_row(i))
 
             self._time_grid.addWidget(camera_label, row_idx, 0)
             self._time_grid.addWidget(mode_combo, row_idx, 1)
@@ -391,21 +433,39 @@ class Mode2Widget(QWidget):
         row["none"].setVisible(mode == "none")
         row["ref"].setVisible(mode == "reference_time")
         row["offset"].setVisible(mode == "offset")
+        row["point_container"].setVisible(mode == "reference_video_time")
 
         if write_state:
             base = track.parsed_start_datetime()
             track.time_correction_mode = mode
             if mode == "none":
                 track.true_start_datetime = None
+                track.reference_video_time_sec = 0.0
+                track.video_reference_datetime = None
                 track.time_correction_offset_sec = 0.0
             elif mode == "reference_time":
                 true_start = _dt_from_qtime(base, row["ref"].time())
                 track.true_start_datetime = true_start.isoformat(timespec="milliseconds") if true_start else None
+                track.reference_video_time_sec = 0.0
+                track.video_reference_datetime = None
                 track.time_correction_offset_sec = (
                     (true_start - base).total_seconds() if base is not None else 0.0
                 )
+            elif mode == "reference_video_time":
+                reference_dt = _dt_from_qtime(base, row["point_ref"].time())
+                video_time_sec = _qtime_to_secs(row["point_video"].time())
+                track.true_start_datetime = None
+                track.reference_video_time_sec = video_time_sec
+                track.video_reference_datetime = reference_dt.isoformat(timespec="milliseconds") if reference_dt else None
+                if base is not None and reference_dt is not None:
+                    corrected_start = reference_dt - timedelta(seconds=video_time_sec)
+                    track.time_correction_offset_sec = (corrected_start - base).total_seconds()
+                else:
+                    track.time_correction_offset_sec = 0.0
             else:
                 track.true_start_datetime = None
+                track.reference_video_time_sec = 0.0
+                track.video_reference_datetime = None
                 track.time_correction_offset_sec = row["offset"].value()
 
         if mode != "offset":
@@ -416,6 +476,15 @@ class Mode2Widget(QWidget):
         row["corrected"].setText(
             f"{track.time_correction_offset_sec:+.3f} -> {_fmt_time(track.corrected_start_datetime())}"
         )
+
+    def _use_playhead_for_time_row(self, idx: int):
+        if idx < 0 or idx >= len(self._time_rows):
+            return
+        fps = self._player.get_fps() or 30.0
+        sec = self._player.current_frame / fps if fps > 0 else 0.0
+        row = self._time_rows[idx]
+        row["point_video"].setTime(_secs_to_qtime(sec))
+        self._update_time_row(idx, write_state=True)
 
     def _apply_time_correction_ui(self):
         for idx in range(len(self._time_rows)):

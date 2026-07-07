@@ -48,6 +48,8 @@ class VideoTrack:
     sync_offset_sec: float = 0.0
     time_correction_mode: str = "none"
     true_start_datetime: Optional[str] = None
+    reference_video_time_sec: float = 0.0
+    video_reference_datetime: Optional[str] = None
     time_correction_offset_sec: float = 0.0
 
     def parsed_start_datetime(self) -> Optional[datetime]:
@@ -59,6 +61,11 @@ class VideoTrack:
         if self.true_start_datetime is None:
             return None
         return datetime.fromisoformat(self.true_start_datetime)
+
+    def parsed_video_reference_datetime(self) -> Optional[datetime]:
+        if self.video_reference_datetime is None:
+            return None
+        return datetime.fromisoformat(self.video_reference_datetime)
 
     def corrected_start_datetime(self) -> Optional[datetime]:
         base = self.parsed_start_datetime()
@@ -245,6 +252,8 @@ def generate_sidecar(state: ProjectState) -> str:
             "time_correction_mode": t.time_correction_mode,
             "time_correction_offset_sec": t.time_correction_offset_sec,
             "true_start_datetime_utc": t.true_start_datetime,
+            "reference_video_time_sec": t.reference_video_time_sec,
+            "video_reference_datetime_utc": t.video_reference_datetime,
             "corrected_start_datetime_utc": corrected.isoformat() if corrected else None,
         })
 
@@ -302,6 +311,8 @@ def load_sidecar(path: str, state: ProjectState) -> None:
             sync_offset_sec=cam.get("sync_offset_sec", 0.0),
             time_correction_mode=cam.get("time_correction_mode", "none"),
             true_start_datetime=cam.get("true_start_datetime_utc") or None,
+            reference_video_time_sec=cam.get("reference_video_time_sec", 0.0),
+            video_reference_datetime=cam.get("video_reference_datetime_utc") or None,
             time_correction_offset_sec=cam.get("time_correction_offset_sec", 0.0),
         )
         state.tracks.append(track)

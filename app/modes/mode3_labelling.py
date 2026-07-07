@@ -438,19 +438,27 @@ class Mode3Widget(QWidget):
 
     def _refresh_time_summary(self):
         self._clear_time_summary()
-        headers = ["Camera", "Mode", "Filename start", "Offset (s)", "Corrected start"]
+        headers = ["Camera", "Mode", "Filename start", "Reference point", "Offset (s)", "Corrected start"]
         for col, text in enumerate(headers):
             label = QLabel(text)
             label.setStyleSheet("font-weight:bold;")
             self._time_summary_grid.addWidget(label, 0, col)
         if not self.state.tracks:
-            self._time_summary_grid.addWidget(QLabel("No videos loaded."), 1, 0, 1, 5)
+            self._time_summary_grid.addWidget(QLabel("No videos loaded."), 1, 0, 1, 6)
             return
         for row, track in enumerate(self.state.tracks, start=1):
+            ref_dt = track.parsed_video_reference_datetime()
+            reference_point = ""
+            if track.time_correction_mode == "reference_video_time":
+                reference_point = (
+                    f"video {track.reference_video_time_sec:.3f}s -> "
+                    f"{_format_dt(ref_dt)}"
+                )
             values = [
                 track.camera_label or f"Camera {row}",
                 track.time_correction_mode,
                 _format_dt(track.parsed_start_datetime()),
+                reference_point,
                 f"{track.time_correction_offset_sec:+.3f}",
                 _format_dt(track.corrected_start_datetime()),
             ]
@@ -870,6 +878,8 @@ class Mode3Widget(QWidget):
                     "time_correction_mode": track.time_correction_mode,
                     "time_correction_offset_sec": track.time_correction_offset_sec,
                     "true_start_datetime_utc": track.true_start_datetime,
+                    "reference_video_time_sec": track.reference_video_time_sec,
+                    "video_reference_datetime_utc": track.video_reference_datetime,
                     "corrected_start_datetime_utc": corrected_start.isoformat() if corrected_start else None,
                 })
 
