@@ -6,7 +6,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QSize, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QHBoxLayout, QLabel, QSizePolicy, QSlider,
@@ -14,6 +14,11 @@ from PyQt6.QtWidgets import (
 )
 
 log = logging.getLogger(__name__)
+
+_DISPLAY_MIN_SIZE = QSize(320, 180)
+_DISPLAY_MAX_HEIGHT = 360
+_DISPLAY_RESIZE_STEP = 48
+_PREVIEW_SIZE_HINT = QSize(480, 350)
 
 
 class FramePreview(QWidget):
@@ -26,6 +31,10 @@ class FramePreview(QWidget):
         self._frame_count: int = 0
         self._current_frame: int = 0
         self._video_path: str = ""
+        self._source_pixmap: Optional[QPixmap] = None
+        self._scaled_size_bucket: Optional[tuple[int, int]] = None
+
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -37,8 +46,9 @@ class FramePreview(QWidget):
 
         self._display = QLabel()
         self._display.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._display.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._display.setMinimumSize(320, 180)
+        self._display.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._display.setMinimumSize(_DISPLAY_MIN_SIZE)
+        self._display.setMaximumHeight(_DISPLAY_MAX_HEIGHT)
         self._display.setStyleSheet("background: #222; border: 1px solid #555;")
         layout.addWidget(self._display)
 
@@ -71,6 +81,8 @@ class FramePreview(QWidget):
             self._cap = None
         self._frame_count = 0
         self._current_frame = 0
+        self._source_pixmap = None
+        self._scaled_size_bucket = None
 
     def seek_frame(self, frame_no: int) -> None:
         if self._cap is None:
@@ -112,12 +124,39 @@ class FramePreview(QWidget):
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
         qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-        pixmap = QPixmap.fromImage(qimg).scaled(
-            self._display.size(),
+        self._source_pixmap = QPixmap.fromImage(qimg.copy())
+        self._render_cached_frame(force=True)
+
+    def _display_size_bucket(self) -> tuple[int, int]:
+        size = self._display.size()
+        width = max(1, size.width())
+        height = max(1, min(size.height(), _DISPLAY_MAX_HEIGHT))
+        bucket_width = max(
+            _DISPLAY_MIN_SIZE.width(),
+            (width // _DISPLAY_RESIZE_STEP) * _DISPLAY_RESIZE_STEP,
+        )
+        bucket_height = max(
+            _DISPLAY_MIN_SIZE.height(),
+            (height // _DISPLAY_RESIZE_STEP) * _DISPLAY_RESIZE_STEP,
+        )
+        return bucket_width, bucket_height
+
+    def _render_cached_frame(self, force: bool = False) -> None:
+        if self._source_pixmap is None:
+            return
+        bucket = self._display_size_bucket()
+        if not force and bucket == self._scaled_size_bucket:
+            return
+        self._scaled_size_bucket = bucket
+        pixmap = self._source_pixmap.scaled(
+            QSize(*bucket),
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
         self._display.setPixmap(pixmap)
+
+    def sizeHint(self) -> QSize:
+        return _PREVIEW_SIZE_HINT
 
     def mousePressEvent(self, event):
         self.clicked.emit()
@@ -125,8 +164,7 @@ class FramePreview(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self._cap is not None:
-            self._show_frame(self._current_frame)
+        self._render_cached_frame()
 
 
 class MultiCameraPlayer(QWidget):
