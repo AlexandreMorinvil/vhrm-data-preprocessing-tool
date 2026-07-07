@@ -13,6 +13,7 @@ log = logging.getLogger(__name__)
 
 class PolarSensorLoader(SignalLoader):
     display_name = "Polar Sensor"
+    sensor_type = "Polar"
 
     def can_load(self, path: str) -> bool:
         try:

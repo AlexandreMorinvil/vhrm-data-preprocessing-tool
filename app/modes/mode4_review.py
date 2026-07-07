@@ -262,9 +262,8 @@ class Mode4Widget(QWidget):
         signal_csv = seg_dir / signal_file if signal_file else seg_dir / "signal.csv"
         if signal_csv.exists():
             try:
-                df = pd.read_csv(signal_csv, parse_dates=["timestamp_utc"])
-                if "sensor_id" not in df.columns:
-                    df["sensor_id"] = "signal"
+                df = pd.read_csv(signal_csv)
+                df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
                 self._plot.set_data(df, video_duration_sec=seg.duration_sec)
                 signal_loaded = True
             except Exception as exc:

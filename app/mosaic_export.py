@@ -31,6 +31,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
 from .ffmpeg_utils import find_ffmpeg
+from .signals import is_aux_signal_column
 
 log = logging.getLogger(__name__)
 
@@ -147,7 +148,10 @@ def _build_signal_strip_background(
                 style = ("--" if sid == "averaged" else "-")
                 ax.plot(rs, sub["value"], label=str(sid), linewidth=0.8, linestyle=style)
         else:
-            value_cols = [c for c in signal_df.columns if c != "timestamp_utc"]
+            value_cols = [
+                c for c in signal_df.columns
+                if c != "timestamp_utc" and not is_aux_signal_column(str(c))
+            ]
             for col in value_cols:
                 style = ("--" if col == "averaged" else "-")
                 ax.plot(rel_sec, signal_df[col], label=col, linewidth=0.8, linestyle=style)

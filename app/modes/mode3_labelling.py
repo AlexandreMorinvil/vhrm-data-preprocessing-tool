@@ -38,7 +38,7 @@ from PyQt6.QtWidgets import (
 
 from ..ffmpeg_utils import trim_video, find_ffmpeg
 from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_preset
-from ..signals import load_signal
+from ..signals import load_signal_files, signal_file_type_name, signal_long_to_wide
 from ..state import (
     LabelInterval,
     ProjectState,
@@ -311,11 +311,9 @@ class Mode3Widget(QWidget):
     def _load_signals(self):
         if not self.state.signal_paths:
             return
-        dfs = []
-        for p in self.state.signal_paths:
-            df = load_signal(p)
-            if df is not None:
-                dfs.append(df)
+        dfs, _display_type_by_path, failed_paths = load_signal_files(self.state.signal_paths)
+        for p in failed_paths:
+            log.warning("Failed to load signal: %s", p)
         if dfs:
             merged = pd.concat(dfs, ignore_index=True)
 
@@ -346,17 +344,10 @@ class Mode3Widget(QWidget):
             if merged.empty:
                 return
 
-            # Pivot to wide format
-            wide = merged.pivot_table(
-                index="timestamp_utc", columns="sensor_id", values="value", aggfunc="first"
+            self._merged_df = signal_long_to_wide(
+                merged,
+                include_average=self.state.include_signal_average,
             )
-            wide.columns.name = None
-            wide = wide.sort_index().ffill().bfill()
-
-            if self.state.include_signal_average:
-                wide["averaged"] = wide.mean(axis=1)
-
-            self._merged_df = wide.reset_index()
             dur = self.state.tracks[0].duration_sec if self.state.tracks else 0
             self._plot.set_data(self._merged_df, video_duration_sec=dur)
 
@@ -420,8 +411,9 @@ class Mode3Widget(QWidget):
             if p not in self.state.signal_paths:
                 self.state.signal_paths.append(p)
         self._load_signals()
+        type_names = [signal_file_type_name(p) for p in files]
         self._load_status.setText(
-            f"Loaded {len(self.state.signal_paths)} signal file(s)."
+            f"Loaded {len(self.state.signal_paths)} signal file(s): {', '.join(type_names)}."
         )
 
     def _refresh_from_tracks(self):

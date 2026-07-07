@@ -9,6 +9,8 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
+from ..signals import is_aux_signal_column
+
 log = logging.getLogger(__name__)
 
 
@@ -65,7 +67,10 @@ class SignalPlot(QWidget):
                 self._ax.plot(rel_sec, sub["value"], label=str(sid), linewidth=0.8)
         else:
             # Wide format: each column except timestamp_utc is a series
-            value_cols = [c for c in self._df.columns if c != "timestamp_utc"]
+            value_cols = [
+                c for c in self._df.columns
+                if c != "timestamp_utc" and not is_aux_signal_column(str(c))
+            ]
             self._sensor_ids = value_cols
             t0 = self._df["timestamp_utc"].iloc[0]
             rel_sec = (self._df["timestamp_utc"] - t0).dt.total_seconds() + self._video_start_sec

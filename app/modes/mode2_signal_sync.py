@@ -30,7 +30,12 @@ from PyQt6.QtWidgets import (
 )
 
 from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_preset
-from ..signals import get_loaders, load_signal
+from ..signals import (
+    get_loaders,
+    load_signal_files,
+    signal_file_type_name,
+    signal_long_to_wide,
+)
 from ..state import (
     ProjectState,
     compute_signal_anchor,
@@ -204,10 +209,7 @@ class Mode2Widget(QWidget):
 
     def _restore_from_state(self):
         for p in self.state.signal_paths:
-            item = QListWidgetItem(Path(p).name)
-            item.setData(Qt.ItemDataRole.UserRole, p)
-            item.setToolTip(p)
-            self._file_list.addItem(item)
+            self._file_list.addItem(self._make_signal_item(p))
 
         if self.state.tracks:
             labels = [t.camera_label for t in self.state.tracks]
@@ -217,6 +219,13 @@ class Mode2Widget(QWidget):
             if valid:
                 self._player.load_videos(valid)
         self._refresh_time_correction_ui()
+
+    def _make_signal_item(self, path: str) -> QListWidgetItem:
+        sensor_type = signal_file_type_name(path)
+        item = QListWidgetItem(f"{Path(path).name} — {sensor_type}")
+        item.setData(Qt.ItemDataRole.UserRole, path)
+        item.setToolTip(f"{path}\nDetected type: {sensor_type}")
+        return item
 
     def _load_from_meta(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -281,10 +290,7 @@ class Mode2Widget(QWidget):
             self, "Select signal files", "", _SIGNAL_FILTER,
         )
         for p in files:
-            item = QListWidgetItem(Path(p).name)
-            item.setData(Qt.ItemDataRole.UserRole, p)
-            item.setToolTip(p)
-            self._file_list.addItem(item)
+            self._file_list.addItem(self._make_signal_item(p))
 
     def _remove_signal(self):
         for item in self._file_list.selectedItems():
@@ -456,14 +462,11 @@ class Mode2Widget(QWidget):
             return
 
         self.state.signal_paths = paths
-        self._signal_dfs.clear()
-        for p in paths:
-            df = load_signal(p)
-            if df is not None:
-                self._signal_dfs.append(df)
-            else:
-                self._status.setText(f"Warning: could not load {Path(p).name}")
-                log.warning("Failed to load signal: %s", p)
+        self._signal_dfs, display_type_by_path, failed_paths = load_signal_files(paths)
+        self._refresh_signal_file_labels(display_type_by_path)
+        for p in failed_paths:
+            self._status.setText(f"Warning: could not load {Path(p).name}")
+            log.warning("Failed to load signal: %s", p)
 
         if not self._signal_dfs:
             QMessageBox.warning(self, "Warning", "No signals could be loaded.")
@@ -507,17 +510,10 @@ class Mode2Widget(QWidget):
             QMessageBox.warning(self, "Warning", "No signal data within the video time range.")
             return
 
-        # Pivot from long to wide format
-        wide = merged.pivot_table(
-            index="timestamp_utc", columns="sensor_id", values="value", aggfunc="first"
+        wide = signal_long_to_wide(
+            merged,
+            include_average=self.state.include_signal_average,
         )
-        wide.columns.name = None  # remove the "sensor_id" label from columns
-        wide = wide.sort_index().ffill().bfill()
-
-        if self.state.include_signal_average:
-            wide["averaged"] = wide.mean(axis=1)
-
-        wide = wide.reset_index()
 
         self._merged_df = wide
 
@@ -547,6 +543,14 @@ class Mode2Widget(QWidget):
             status_parts.append(f"Exported: {csv_name}")
         self._status.setText(" — ".join(status_parts))
         self.state.mode2_complete = True
+
+    def _refresh_signal_file_labels(self, display_type_by_path: dict[str, str]):
+        for i in range(self._file_list.count()):
+            item = self._file_list.item(i)
+            path = item.data(Qt.ItemDataRole.UserRole)
+            sensor_type = display_type_by_path.get(path, signal_file_type_name(path))
+            item.setText(f"{Path(path).name} — {sensor_type}")
+            item.setToolTip(f"{path}\nDetected type: {sensor_type}")
 
     def _skip(self):
         self.state.mode2_complete = True

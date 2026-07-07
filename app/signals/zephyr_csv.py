@@ -12,6 +12,7 @@ log = logging.getLogger(__name__)
 
 class ZephyrSensorLoader(SignalLoader):
     display_name = "Zephyr Sensor"
+    sensor_type = "Zephyr"
 
     def can_load(self, path: str) -> bool:
         try:
@@ -39,12 +40,19 @@ class ZephyrSensorLoader(SignalLoader):
             utc=True,
         )
         values = pd.to_numeric(samples["HR"], errors="coerce")
+        aux_cols = [c for c in samples.columns if c not in {"Time", "HR"}]
 
         df = pd.DataFrame({
             "timestamp_utc": timestamps,
             "value": values,
             "sensor_id": Path(path).stem,
         })
+        for col in aux_cols:
+            converted = pd.to_numeric(samples[col], errors="coerce")
+            df[col] = converted if converted.notna().any() else samples[col]
         df = df.dropna(subset=["timestamp_utc", "value"]).reset_index(drop=True)
-        log.info("Loaded %d Zephyr HR samples from %s", len(df), path)
+        log.info(
+            "Loaded %d Zephyr HR samples with %d auxiliary column(s) from %s",
+            len(df), len(aux_cols), path,
+        )
         return df
