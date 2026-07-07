@@ -7,10 +7,13 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTime
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
@@ -21,13 +24,21 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSplitter,
+    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_preset
 from ..signals import get_loaders, load_signal
-from ..state import ProjectState, generate_sidecar, load_sidecar, populate_tracks_from_videos
+from ..state import (
+    ProjectState,
+    compute_signal_anchor,
+    format_time_coherence_warnings,
+    generate_sidecar,
+    load_sidecar,
+    populate_tracks_from_videos,
+)
 from ..widgets.frame_preview import MultiCameraPlayer
 from ..widgets.signal_plot import SignalPlot
 
@@ -38,12 +49,50 @@ _META_FILTER = "Metadata sidecar (*.json);;All files (*)"
 _VIDEO_FILTER = "Videos (*.mp4 *.mov *.lrf *.avi *.mkv);;All files (*)"
 
 
+def _normalise_dt(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _fmt_dt(dt: Optional[datetime]) -> str:
+    if dt is None:
+        return "unknown"
+    return _normalise_dt(dt).isoformat(timespec="milliseconds")
+
+
+def _fmt_time(dt: Optional[datetime]) -> str:
+    if dt is None:
+        return "unknown"
+    return _normalise_dt(dt).strftime("%H:%M:%S.%f")[:-3]
+
+
+def _qtime_from_dt(dt: Optional[datetime]) -> QTime:
+    if dt is None:
+        return QTime.currentTime()
+    dt = _normalise_dt(dt)
+    return QTime(dt.hour, dt.minute, dt.second, dt.microsecond // 1000)
+
+
+def _dt_from_qtime(base: Optional[datetime], qtime: QTime) -> Optional[datetime]:
+    if base is None:
+        return None
+    base = _normalise_dt(base)
+    return base.replace(
+        hour=qtime.hour(),
+        minute=qtime.minute(),
+        second=qtime.second(),
+        microsecond=qtime.msec() * 1000,
+    )
+
+
 class Mode2Widget(QWidget):
     def __init__(self, state: ProjectState, parent=None):
         super().__init__(parent)
         self.state = state
         self._signal_dfs: list[pd.DataFrame] = []
         self._merged_df: Optional[pd.DataFrame] = None
+        self._time_rows: list[dict] = []
 
         root = QHBoxLayout(self)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -67,7 +116,19 @@ class Mode2Widget(QWidget):
         load_lay.addWidget(self._load_status)
         ll.addWidget(load_grp)
 
-        loader_names = [type(l).__name__ for l in get_loaders()]
+        time_grp = QGroupBox("Camera time correction")
+        time_lay = QVBoxLayout(time_grp)
+        self._time_grid = QGridLayout()
+        time_lay.addLayout(self._time_grid)
+        self._check_time_btn = QPushButton("Check coherence")
+        self._check_time_btn.clicked.connect(self._check_time_coherence)
+        time_lay.addWidget(self._check_time_btn)
+        self._time_status = QLabel("")
+        self._time_status.setWordWrap(True)
+        time_lay.addWidget(self._time_status)
+        ll.addWidget(time_grp)
+
+        loader_names = [getattr(l, "display_name", type(l).__name__) for l in get_loaders()]
         info = QLabel(f"Available loaders: {', '.join(loader_names) or 'none'}")
         info.setWordWrap(True)
         ll.addWidget(info)
@@ -155,6 +216,7 @@ class Mode2Widget(QWidget):
             valid = [p for p in paths if p and Path(p).exists()]
             if valid:
                 self._player.load_videos(valid)
+        self._refresh_time_correction_ui()
 
     def _load_from_meta(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -169,6 +231,7 @@ class Mode2Widget(QWidget):
             return
         self._refresh_player()
         self._load_synced_signal()
+        self._refresh_time_correction_ui()
         n = len(self.state.tracks)
         self._load_status.setText(f"Loaded {n} camera(s) from sidecar.")
 
@@ -184,6 +247,7 @@ class Mode2Widget(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to probe videos:\n{exc}")
             return
         self._refresh_player()
+        self._refresh_time_correction_ui()
         n = len(self.state.tracks)
         self._load_status.setText(f"Loaded {n} video(s) directly.")
 
@@ -229,6 +293,160 @@ class Mode2Widget(QWidget):
     def _on_avg_toggled(self, checked):
         self.state.include_signal_average = checked
 
+    # ------------------------------------------------------------------
+    # Camera time correction
+    # ------------------------------------------------------------------
+
+    def _clear_time_grid(self):
+        while self._time_grid.count():
+            item = self._time_grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+
+    def _refresh_time_correction_ui(self):
+        self._clear_time_grid()
+        self._time_rows.clear()
+        headers = ["Camera", "Mode", "Input", "Corrected start"]
+        for col, text in enumerate(headers):
+            label = QLabel(text)
+            label.setStyleSheet("font-weight:bold;")
+            self._time_grid.addWidget(label, 0, col)
+
+        if not self.state.tracks:
+            self._time_grid.addWidget(QLabel("Load videos to edit time corrections."), 1, 0, 1, 4)
+            self._time_status.setText("")
+            return
+
+        for row_idx, track in enumerate(self.state.tracks, start=1):
+            camera_label = QLabel(track.camera_label or f"Camera {row_idx}")
+            camera_label.setToolTip(f"Filename time: {_fmt_time(track.parsed_start_datetime())}")
+
+            mode_combo = QComboBox()
+            mode_combo.addItem("No correction", "none")
+            mode_combo.addItem("Reference start time", "reference_time")
+            mode_combo.addItem("Offset (seconds)", "offset")
+            mode_idx = mode_combo.findData(track.time_correction_mode)
+            mode_combo.setCurrentIndex(max(0, mode_idx))
+
+            ref_edit = QTimeEdit()
+            ref_edit.setDisplayFormat("HH:mm:ss.zzz")
+            ref_dt = track.parsed_true_start_datetime() or track.corrected_start_datetime() or track.parsed_start_datetime()
+            ref_edit.setTime(_qtime_from_dt(ref_dt))
+
+            offset_spin = QDoubleSpinBox()
+            offset_spin.setRange(-86400.0, 86400.0)
+            offset_spin.setDecimals(3)
+            offset_spin.setSingleStep(0.1)
+            offset_spin.setValue(track.time_correction_offset_sec)
+
+            none_label = QLabel(f"Filename time {_fmt_time(track.parsed_start_datetime())}")
+            input_container = QWidget()
+            input_layout = QHBoxLayout(input_container)
+            input_layout.setContentsMargins(0, 0, 0, 0)
+            input_layout.addWidget(none_label)
+            input_layout.addWidget(ref_edit)
+            input_layout.addWidget(offset_spin)
+
+            corrected_label = QLabel("")
+            corrected_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+            row = {
+                "track_index": row_idx - 1,
+                "mode": mode_combo,
+                "none": none_label,
+                "ref": ref_edit,
+                "offset": offset_spin,
+                "corrected": corrected_label,
+            }
+            self._time_rows.append(row)
+
+            mode_combo.currentIndexChanged.connect(lambda _=0, i=row_idx - 1: self._on_time_row_changed(i))
+            ref_edit.timeChanged.connect(lambda _=None, i=row_idx - 1: self._on_time_row_changed(i))
+            offset_spin.valueChanged.connect(lambda _=0.0, i=row_idx - 1: self._on_time_row_changed(i))
+
+            self._time_grid.addWidget(camera_label, row_idx, 0)
+            self._time_grid.addWidget(mode_combo, row_idx, 1)
+            self._time_grid.addWidget(input_container, row_idx, 2)
+            self._time_grid.addWidget(corrected_label, row_idx, 3)
+            self._update_time_row(row_idx - 1, write_state=False)
+
+    def _on_time_row_changed(self, idx: int):
+        self._update_time_row(idx, write_state=True)
+
+    def _update_time_row(self, idx: int, write_state: bool):
+        if idx < 0 or idx >= len(self._time_rows) or idx >= len(self.state.tracks):
+            return
+        row = self._time_rows[idx]
+        track = self.state.tracks[idx]
+        mode = row["mode"].currentData() or "none"
+
+        row["none"].setVisible(mode == "none")
+        row["ref"].setVisible(mode == "reference_time")
+        row["offset"].setVisible(mode == "offset")
+
+        if write_state:
+            base = track.parsed_start_datetime()
+            track.time_correction_mode = mode
+            if mode == "none":
+                track.true_start_datetime = None
+                track.time_correction_offset_sec = 0.0
+            elif mode == "reference_time":
+                true_start = _dt_from_qtime(base, row["ref"].time())
+                track.true_start_datetime = true_start.isoformat(timespec="milliseconds") if true_start else None
+                track.time_correction_offset_sec = (
+                    (true_start - base).total_seconds() if base is not None else 0.0
+                )
+            else:
+                track.true_start_datetime = None
+                track.time_correction_offset_sec = row["offset"].value()
+
+        if mode != "offset":
+            row["offset"].blockSignals(True)
+            row["offset"].setValue(track.time_correction_offset_sec)
+            row["offset"].blockSignals(False)
+
+        row["corrected"].setText(
+            f"{track.time_correction_offset_sec:+.3f} -> {_fmt_time(track.corrected_start_datetime())}"
+        )
+
+    def _apply_time_correction_ui(self):
+        for idx in range(len(self._time_rows)):
+            self._update_time_row(idx, write_state=True)
+
+    def _time_anchor_and_warnings(self):
+        self._apply_time_correction_ui()
+        anchor, warnings = compute_signal_anchor(
+            self.state.tracks,
+            self.state.time_coherence_tolerance_sec,
+        )
+        return anchor, warnings
+
+    def _check_time_coherence(self):
+        anchor, warnings = self._time_anchor_and_warnings()
+        anchor_text = _fmt_dt(anchor)
+        if warnings:
+            msg = format_time_coherence_warnings(warnings)
+            self._time_status.setText(f"Warnings. Anchor: {anchor_text}")
+            QMessageBox.warning(self, "Camera time correction", f"{msg}\n\nAnchor that would be used:\n{anchor_text}")
+        else:
+            self._time_status.setText(f"Coherent. Anchor: {anchor_text}")
+            QMessageBox.information(self, "Camera time correction", f"No coherence warnings.\n\nAnchor:\n{anchor_text}")
+
+    def _confirm_time_warnings(self, warnings: list[str], anchor: Optional[datetime]) -> bool:
+        if not warnings:
+            return True
+        msg = format_time_coherence_warnings(warnings)
+        reply = QMessageBox.question(
+            self,
+            "Camera time correction warning",
+            f"{msg}\n\nSignal anchor to use:\n{_fmt_dt(anchor)}\n\nContinue signal synchronisation?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
     def _load_and_sync(self):
         paths = []
         for i in range(self._file_list.count()):
@@ -257,9 +475,13 @@ class Mode2Widget(QWidget):
         all_sensors = set(merged["sensor_id"].unique())
 
         if self.state.tracks:
-            t0_track = self.state.tracks[0]
-            dt_start = t0_track.parsed_start_datetime()
-            dur = t0_track.duration_sec
+            dt_start, coherence_warnings = self._time_anchor_and_warnings()
+            if not self._confirm_time_warnings(coherence_warnings, dt_start):
+                self._status.setText("Signal synchronisation cancelled after time warning.")
+                return
+            self.state.last_signal_anchor_datetime = dt_start.isoformat() if dt_start else None
+            self.state.last_time_coherence_warnings = coherence_warnings
+            dur = self.state.tracks[0].duration_sec
             if dt_start is not None:
                 from datetime import timedelta
                 dt_end = dt_start + timedelta(seconds=dur)

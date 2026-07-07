@@ -13,6 +13,8 @@ log = logging.getLogger(__name__)
 
 
 class SignalLoader(abc.ABC):
+    display_name: str = "Signal Loader"
+
     @abc.abstractmethod
     def can_load(self, path: str) -> bool: ...
 

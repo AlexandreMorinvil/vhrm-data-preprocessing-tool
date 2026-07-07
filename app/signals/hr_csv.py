@@ -11,7 +11,9 @@ from . import SignalLoader
 log = logging.getLogger(__name__)
 
 
-class HRCsvLoader(SignalLoader):
+class PolarSensorLoader(SignalLoader):
+    display_name = "Polar Sensor"
+
     def can_load(self, path: str) -> bool:
         try:
             p = Path(path)

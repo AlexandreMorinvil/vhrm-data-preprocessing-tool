@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
@@ -38,7 +39,14 @@ from PyQt6.QtWidgets import (
 from ..ffmpeg_utils import trim_video, find_ffmpeg
 from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_preset
 from ..signals import load_signal
-from ..state import LabelInterval, ProjectState, load_sidecar, populate_tracks_from_videos
+from ..state import (
+    LabelInterval,
+    ProjectState,
+    compute_signal_anchor,
+    format_time_coherence_warnings,
+    load_sidecar,
+    populate_tracks_from_videos,
+)
 from ..widgets.frame_preview import MultiCameraPlayer
 from ..widgets.signal_plot import SignalPlot
 from ..widgets.subdivide_dialog import SubdivideDialog
@@ -71,6 +79,16 @@ def _format_duration(sec: float) -> str:
     m = int((sec % 3600) // 60)
     s = sec % 60
     return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+
+def _format_dt(dt: Optional[datetime]) -> str:
+    if dt is None:
+        return "unknown"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat(timespec="milliseconds")
 
 
 def _subdivide_interval(iv: LabelInterval, mode: str, value: float, color: str) -> list[LabelInterval]:
@@ -134,6 +152,12 @@ class Mode3Widget(QWidget):
         self._load_status.setWordWrap(True)
         load_lay.addWidget(self._load_status)
         ll.addWidget(load_grp)
+
+        time_grp = QGroupBox("Camera time correction")
+        time_lay = QVBoxLayout(time_grp)
+        self._time_summary_grid = QGridLayout()
+        time_lay.addLayout(self._time_summary_grid)
+        ll.addWidget(time_grp)
 
         lib_grp = QGroupBox("Label library")
         lib_lay = QVBoxLayout(lib_grp)
@@ -282,6 +306,7 @@ class Mode3Widget(QWidget):
         self._timeline.set_intervals(items)
 
         self._load_signals()
+        self._refresh_time_summary()
 
     def _load_signals(self):
         if not self.state.signal_paths:
@@ -296,12 +321,21 @@ class Mode3Widget(QWidget):
 
             # Clip to video time range if tracks are available
             if self.state.tracks:
-                t0_track = self.state.tracks[0]
-                dt_start = t0_track.parsed_start_datetime()
-                dur = t0_track.duration_sec
+                dt_start, coherence_warnings = compute_signal_anchor(
+                    self.state.tracks,
+                    self.state.time_coherence_tolerance_sec,
+                )
+                if coherence_warnings:
+                    QMessageBox.warning(
+                        self,
+                        "Camera time correction warning",
+                        format_time_coherence_warnings(coherence_warnings),
+                    )
+                self.state.last_signal_anchor_datetime = dt_start.isoformat() if dt_start else None
+                self.state.last_time_coherence_warnings = coherence_warnings
+                dur = self.state.tracks[0].duration_sec
                 if dt_start is not None:
-                    from datetime import timedelta as _td
-                    dt_end = dt_start + _td(seconds=dur)
+                    dt_end = dt_start + timedelta(seconds=dur)
                     start_ts = pd.Timestamp(dt_start)
                     end_ts = pd.Timestamp(dt_end)
                     merged = merged[
@@ -354,6 +388,7 @@ class Mode3Widget(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to load metadata:\n{exc}")
             return
         self._refresh_from_tracks()
+        self._refresh_time_summary()
         if not self._load_synced_signal():
             self._load_signals()
         n = len(self.state.tracks)
@@ -371,6 +406,7 @@ class Mode3Widget(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to probe videos:\n{exc}")
             return
         self._refresh_from_tracks()
+        self._refresh_time_summary()
         n = len(self.state.tracks)
         self._load_status.setText(f"Loaded {n} video(s) directly.")
 
@@ -399,6 +435,37 @@ class Mode3Widget(QWidget):
                 self._player.load_videos(valid)
             dur = self.state.tracks[0].duration_sec if self.state.tracks else 0
             self._timeline.set_duration(dur)
+
+    def _clear_time_summary(self):
+        while self._time_summary_grid.count():
+            item = self._time_summary_grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+
+    def _refresh_time_summary(self):
+        self._clear_time_summary()
+        headers = ["Camera", "Mode", "Filename start", "Offset (s)", "Corrected start"]
+        for col, text in enumerate(headers):
+            label = QLabel(text)
+            label.setStyleSheet("font-weight:bold;")
+            self._time_summary_grid.addWidget(label, 0, col)
+        if not self.state.tracks:
+            self._time_summary_grid.addWidget(QLabel("No videos loaded."), 1, 0, 1, 5)
+            return
+        for row, track in enumerate(self.state.tracks, start=1):
+            values = [
+                track.camera_label or f"Camera {row}",
+                track.time_correction_mode,
+                _format_dt(track.parsed_start_datetime()),
+                f"{track.time_correction_offset_sec:+.3f}",
+                _format_dt(track.corrected_start_datetime()),
+            ]
+            for col, value in enumerate(values):
+                label = QLabel(value)
+                label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                self._time_summary_grid.addWidget(label, row, col)
 
     def _add_label(self):
         text, ok = QInputDialog.getText(self, "New label", "Label name:")
@@ -734,6 +801,26 @@ class Mode3Widget(QWidget):
         segments_dir = Path(out_dir) / "labelled_segments"
         segments_dir.mkdir(parents=True, exist_ok=True)
 
+        signal_anchor = None
+        coherence_warnings: list[str] = []
+        if self.state.last_signal_anchor_datetime:
+            try:
+                signal_anchor = datetime.fromisoformat(self.state.last_signal_anchor_datetime)
+                coherence_warnings = list(self.state.last_time_coherence_warnings)
+            except ValueError:
+                signal_anchor = None
+        if signal_anchor is None:
+            signal_anchor, coherence_warnings = compute_signal_anchor(
+                self.state.tracks,
+                self.state.time_coherence_tolerance_sec,
+            )
+        if coherence_warnings:
+            QMessageBox.warning(
+                self,
+                "Camera time correction warning",
+                format_time_coherence_warnings(coherence_warnings),
+            )
+
         manifest_rows = []
         total = len(intervals)
 
@@ -762,11 +849,9 @@ class Mode3Widget(QWidget):
             signal_exported = False
             if self._merged_df is not None and not self._merged_df.empty:
                 try:
-                    t0 = self.state.tracks[0]
-                    dt_start = t0.parsed_start_datetime()
-                    if dt_start is not None:
-                        seg_start = dt_start + timedelta(seconds=iv.start_sec)
-                        seg_end = dt_start + timedelta(seconds=iv.end_sec)
+                    if signal_anchor is not None:
+                        seg_start = signal_anchor + timedelta(seconds=iv.start_sec)
+                        seg_end = signal_anchor + timedelta(seconds=iv.end_sec)
                         start_ts = pd.Timestamp(seg_start)
                         end_ts = pd.Timestamp(seg_end)
                         sub = self._merged_df[
@@ -783,12 +868,17 @@ class Mode3Widget(QWidget):
             cameras_meta = []
             for ti, track in enumerate(self.state.tracks):
                 cam_file = f"cam{ti+1}_{track.camera_label}.mp4"
+                corrected_start = track.corrected_start_datetime()
                 cameras_meta.append({
                     "label": track.camera_label,
                     "video_file": cam_file,
                     "fps": track.fps,
                     "dimensions": [track.width, track.height],
                     "codec": track.codec,
+                    "time_correction_mode": track.time_correction_mode,
+                    "time_correction_offset_sec": track.time_correction_offset_sec,
+                    "true_start_datetime_utc": track.true_start_datetime,
+                    "corrected_start_datetime_utc": corrected_start.isoformat() if corrected_start else None,
                 })
 
             # Resolve synced_signal_path relative to the segment folder
@@ -811,6 +901,17 @@ class Mode3Widget(QWidget):
                 "cameras": cameras_meta,
                 "signal_file": "signal.csv" if signal_exported else None,
                 "synced_signal_path": synced_rel,
+                "signal_anchor_datetime_utc": signal_anchor.isoformat() if signal_anchor else None,
+                "segment_start_datetime_utc": (
+                    (signal_anchor + timedelta(seconds=iv.start_sec)).isoformat()
+                    if signal_anchor else None
+                ),
+                "segment_end_datetime_utc": (
+                    (signal_anchor + timedelta(seconds=iv.end_sec)).isoformat()
+                    if signal_anchor else None
+                ),
+                "time_coherence_tolerance_sec": self.state.time_coherence_tolerance_sec,
+                "time_coherence_warnings": coherence_warnings,
             }
             (seg_dir / "meta.json").write_text(
                 json.dumps(meta, indent=2), encoding="utf-8"

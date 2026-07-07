@@ -5,7 +5,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -46,11 +46,25 @@ class VideoTrack:
     duration_sec: float = 0.0
     start_datetime: Optional[str] = None
     sync_offset_sec: float = 0.0
+    time_correction_mode: str = "none"
+    true_start_datetime: Optional[str] = None
+    time_correction_offset_sec: float = 0.0
 
     def parsed_start_datetime(self) -> Optional[datetime]:
         if self.start_datetime is None:
             return None
         return datetime.fromisoformat(self.start_datetime)
+
+    def parsed_true_start_datetime(self) -> Optional[datetime]:
+        if self.true_start_datetime is None:
+            return None
+        return datetime.fromisoformat(self.true_start_datetime)
+
+    def corrected_start_datetime(self) -> Optional[datetime]:
+        base = self.parsed_start_datetime()
+        if base is None:
+            return None
+        return base + timedelta(seconds=self.time_correction_offset_sec)
 
     def set_start_datetime(self, dt: Optional[datetime]) -> None:
         self.start_datetime = dt.isoformat() if dt else None
@@ -97,6 +111,9 @@ class ProjectState:
     keep_temp_files: bool = False
     synced_signal_path: str = ""
     mosaic_preset: str = "balanced"
+    time_coherence_tolerance_sec: float = 1.0
+    last_signal_anchor_datetime: Optional[str] = None
+    last_time_coherence_warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -214,6 +231,7 @@ def generate_sidecar(state: ProjectState) -> str:
 
     cameras = []
     for t in state.tracks:
+        corrected = t.corrected_start_datetime()
         cameras.append({
             "label": t.camera_label,
             "final_video_path": Path(t.final_output_path).name if t.final_output_path else "",
@@ -224,12 +242,21 @@ def generate_sidecar(state: ProjectState) -> str:
             "codec": t.codec,
             "start_datetime_utc": t.start_datetime or "",
             "sync_offset_sec": t.sync_offset_sec,
+            "time_correction_mode": t.time_correction_mode,
+            "time_correction_offset_sec": t.time_correction_offset_sec,
+            "true_start_datetime_utc": t.true_start_datetime,
+            "corrected_start_datetime_utc": corrected.isoformat() if corrected else None,
         })
 
     common_dur = min((t.duration_sec for t in state.tracks), default=0.0)
 
     synced_name = Path(state.synced_signal_path).name if state.synced_signal_path else None
     sig_range = [0.0, common_dur] if state.synced_signal_path else None
+    anchor_dt, warnings = compute_signal_anchor(
+        state.tracks, state.time_coherence_tolerance_sec
+    )
+    anchor_iso = state.last_signal_anchor_datetime or (anchor_dt.isoformat() if anchor_dt else None)
+    coherence_warnings = state.last_time_coherence_warnings or warnings
 
     data = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -238,6 +265,9 @@ def generate_sidecar(state: ProjectState) -> str:
         "signal_paths": [Path(p).name for p in state.signal_paths],
         "synced_signal_path": synced_name,
         "signal_time_range_sec": sig_range,
+        "signal_anchor_datetime_utc": anchor_iso,
+        "time_coherence_tolerance_sec": state.time_coherence_tolerance_sec,
+        "time_coherence_warnings": coherence_warnings,
     }
 
     Path(sidecar_path).write_text(
@@ -270,6 +300,9 @@ def load_sidecar(path: str, state: ProjectState) -> None:
             duration_sec=cam.get("duration_sec", 0.0),
             start_datetime=cam.get("start_datetime_utc") or None,
             sync_offset_sec=cam.get("sync_offset_sec", 0.0),
+            time_correction_mode=cam.get("time_correction_mode", "none"),
+            true_start_datetime=cam.get("true_start_datetime_utc") or None,
+            time_correction_offset_sec=cam.get("time_correction_offset_sec", 0.0),
         )
         state.tracks.append(track)
 
@@ -285,6 +318,11 @@ def load_sidecar(path: str, state: ProjectState) -> None:
 
     state.output_directory = str(base_dir)
     state.mode1_complete = True
+    state.time_coherence_tolerance_sec = raw.get(
+        "time_coherence_tolerance_sec", state.time_coherence_tolerance_sec
+    )
+    state.last_signal_anchor_datetime = raw.get("signal_anchor_datetime_utc")
+    state.last_time_coherence_warnings = raw.get("time_coherence_warnings", [])
 
     # Load synced signal path if present
     synced_name = raw.get("synced_signal_path")
@@ -331,3 +369,74 @@ def populate_tracks_from_videos(
     state.num_cameras = len(state.tracks)
     state.mode1_complete = True
     log.info("Populated %d track(s) from video files", len(state.tracks))
+
+
+# ---------------------------------------------------------------------------
+# Signal wall-clock anchor helpers
+# ---------------------------------------------------------------------------
+
+def track_effective_start_datetime(track: VideoTrack) -> Optional[datetime]:
+    """Return the start datetime to use for signal alignment for one track."""
+    if track.time_correction_mode != "none":
+        return track.corrected_start_datetime()
+    return track.parsed_start_datetime()
+
+
+def compute_signal_anchor(
+    tracks: list[VideoTrack],
+    tolerance_sec: float = 1.0,
+) -> tuple[Optional[datetime], list[str]]:
+    """Return the common wall-clock signal anchor and coherence warnings.
+
+    The returned anchor is the absolute datetime corresponding to video time 0.
+    Corrections never alter video-to-video alignment; they only change the signal
+    clipping/alignment window.
+    """
+    if not tracks:
+        return None, []
+
+    corrected: list[tuple[int, VideoTrack, datetime]] = []
+    for idx, track in enumerate(tracks):
+        if track.time_correction_mode == "none":
+            continue
+        effective = track_effective_start_datetime(track)
+        if effective is not None:
+            corrected.append((idx, track, effective))
+
+    if not corrected:
+        return tracks[0].parsed_start_datetime(), []
+
+    # Current final outputs and direct-load previews both use video time 0 as
+    # the common timeline start. Do not reinterpret sync_offset_sec here.
+    implied = corrected
+    timestamps = [dt.timestamp() for _, _, dt in implied]
+    spread = max(timestamps) - min(timestamps) if timestamps else 0.0
+
+    anchor = None
+    for idx, _track, dt in implied:
+        if idx == 0:
+            anchor = dt
+            break
+    if anchor is None:
+        anchor = implied[0][2]
+
+    warnings: list[str] = []
+    if spread > tolerance_sec:
+        earliest_ts = min(timestamps)
+        latest_ts = max(timestamps)
+        names = []
+        for idx, track, dt in implied:
+            ts = dt.timestamp()
+            if abs(ts - earliest_ts) <= 1e-6 or abs(ts - latest_ts) <= 1e-6:
+                names.append(track.camera_label or f"Camera {idx + 1}")
+        warnings.append(
+            "Camera time corrections disagree by "
+            f"{spread:.3f}s, exceeding the {tolerance_sec:.3f}s tolerance. "
+            "Check: " + ", ".join(names) + "."
+        )
+
+    return anchor, warnings
+
+
+def format_time_coherence_warnings(warnings: list[str]) -> str:
+    return "\n".join(f"- {w}" for w in warnings)
