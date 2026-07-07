@@ -25,10 +25,12 @@ class SignalPlot(QWidget):
         layout.addWidget(self._canvas)
 
         self._cursor_line = None
+        self._cursor_sec: Optional[float] = None
         self._df: Optional[pd.DataFrame] = None
         self._video_start_sec: float = 0.0
         self._video_duration_sec: float = 0.0
         self._sensor_ids: list[str] = []
+        self._intervals: list[tuple[float, float, str]] = []
 
     def set_data(self, df, video_start_sec=0.0, video_duration_sec=0.0):
         self._df = df
@@ -41,20 +43,53 @@ class SignalPlot(QWidget):
         self._ax.clear()
         self._ax.set_xlabel("Time (s from video start)")
         self._ax.set_ylabel("Value")
+        self._cursor_line = None
+        self._cursor_sec = None
         self._canvas.draw_idle()
 
+    def set_intervals(self, intervals) -> None:
+        self._intervals = []
+        for interval in intervals:
+            start_sec = getattr(interval, "start_sec", None)
+            end_sec = getattr(interval, "end_sec", None)
+            color = getattr(interval, "color", "#4488cc")
+            if start_sec is None or end_sec is None:
+                continue
+            start_sec = float(start_sec)
+            end_sec = float(end_sec)
+            if end_sec <= start_sec:
+                continue
+            self._intervals.append((start_sec, end_sec, str(color)))
+        self._redraw()
+
     def set_cursor(self, time_sec: float) -> None:
+        self._cursor_sec = time_sec
         if self._cursor_line is not None:
             self._cursor_line.set_xdata([time_sec, time_sec])
         else:
             self._cursor_line = self._ax.axvline(x=time_sec, color="red", linewidth=1.2)
         self._canvas.draw_idle()
 
+    def _draw_interval_highlights(self) -> None:
+        for start_sec, end_sec, color in self._intervals:
+            self._ax.axvspan(
+                start_sec,
+                end_sec,
+                color=color,
+                alpha=0.18,
+                linewidth=0,
+                zorder=0,
+            )
+
     def _redraw(self) -> None:
         self._ax.clear()
         if self._df is None or self._df.empty:
+            self._ax.set_xlabel("Time (s from video start)")
+            self._ax.set_ylabel("Value")
             self._canvas.draw_idle()
             return
+
+        self._draw_interval_highlights()
 
         # Detect format: wide (no sensor_id column) vs legacy long
         if "sensor_id" in self._df.columns:
@@ -88,4 +123,10 @@ class SignalPlot(QWidget):
         self._ax.grid(True, alpha=0.3)
         self._fig.tight_layout()
         self._cursor_line = None
+        if self._cursor_sec is not None:
+            self._cursor_line = self._ax.axvline(
+                x=self._cursor_sec,
+                color="red",
+                linewidth=1.2,
+            )
         self._canvas.draw_idle()

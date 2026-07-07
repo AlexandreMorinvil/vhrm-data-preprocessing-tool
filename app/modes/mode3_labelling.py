@@ -304,6 +304,7 @@ class Mode3Widget(QWidget):
         for iv in self.state.intervals:
             items.append(IntervalItem(iv.label, iv.start_sec, iv.end_sec, iv.color))
         self._timeline.set_intervals(items)
+        self._plot.set_intervals(self.state.intervals)
 
         self._load_signals()
         self._refresh_time_summary()
@@ -754,12 +755,13 @@ class Mode3Widget(QWidget):
     # ------------------------------------------------------------------
 
     def _sync_timeline(self):
-        """Push current state.intervals to the timeline widget."""
+        """Push current state.intervals to the timeline and signal plot."""
         items = [
             IntervalItem(i.label, i.start_sec, i.end_sec, i.color)
             for i in self.state.intervals
         ]
         self._timeline.set_intervals(items)
+        self._plot.set_intervals(self.state.intervals)
 
     def _on_playhead(self, sec):
         if not self.state.tracks:
