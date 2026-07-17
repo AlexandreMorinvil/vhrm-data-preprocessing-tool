@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_preset
+from ..frame_export import export_player_frames
 from ..state import ProjectState
 from ..widgets.frame_preview import MultiCameraPlayer
 from ..widgets.signal_plot import SignalPlot
@@ -122,6 +123,7 @@ class Mode4Widget(QWidget):
 
         self._timeline.playhead_moved.connect(self._on_playhead)
         self._player.frame_changed.connect(self._on_frame_changed)
+        self._player.export_frames_requested.connect(self._export_current_frames)
 
     def _load_manifest(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -335,6 +337,25 @@ class Mode4Widget(QWidget):
                 cumulative += seg.end_sec - seg.start_sec
             self._timeline.set_playhead(cumulative + sec)
         self._plot.set_cursor(sec)
+
+    def _export_current_frames(self):
+        seg = self._current_seg
+        if seg is None:
+            QMessageBox.information(self, "Info", "Select a segment first.")
+            return
+        if not seg.dir_path.exists():
+            QMessageBox.warning(self, "Warning", f"Folder not found: {seg.dir_path}")
+            return
+
+        try:
+            written = export_player_frames(self._player, seg.dir_path, prefix=f"segment_{seg.index:04d}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Synchronized capture", f"Capture export failed:\n{exc}")
+            self._mosaic_status.setText(f"Capture export failed: {exc}")
+            return
+
+        capture_dir = written[0].parent
+        self._mosaic_status.setText(f"Exported {len(written)} capture frame(s) to {capture_dir}")
 
     # ------------------------------------------------------------------
     # Mosaic export

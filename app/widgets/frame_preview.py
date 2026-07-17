@@ -169,6 +169,7 @@ class FramePreview(QWidget):
 
 class MultiCameraPlayer(QWidget):
     frame_changed = pyqtSignal(int)
+    export_frames_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -197,6 +198,11 @@ class MultiCameraPlayer(QWidget):
         self._frame_label = QLabel("0 / 0")
         self._frame_label.setFixedWidth(140)
         ctrl_row.addWidget(self._frame_label)
+
+        self._export_frames_btn = QPushButton("Export frames")
+        self._export_frames_btn.setToolTip("Export the current frame from each loaded camera")
+        self._export_frames_btn.clicked.connect(self.export_frames_requested.emit)
+        ctrl_row.addWidget(self._export_frames_btn)
 
         self._vlayout.addLayout(ctrl_row)
 

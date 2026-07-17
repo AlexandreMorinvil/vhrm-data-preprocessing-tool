@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_preset
+from ..frame_export import export_player_frames
 from ..signals import (
     get_loaders,
     load_signal_files,
@@ -43,6 +44,7 @@ from ..state import (
     generate_sidecar,
     load_sidecar,
     populate_tracks_from_videos,
+    video_timeline_duration_sec,
 )
 from ..widgets.frame_preview import MultiCameraPlayer
 from ..widgets.signal_plot import SignalPlot
@@ -219,6 +221,7 @@ class Mode2Widget(QWidget):
         splitter.setStretchFactor(1, 3)
 
         self._player.frame_changed.connect(self._on_frame_changed)
+        self._player.export_frames_requested.connect(self._export_current_frames)
 
         self._restore_from_state()
 
@@ -294,7 +297,7 @@ class Mode2Widget(QWidget):
             df = pd.read_csv(sp)
             df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
             self._merged_df = df
-            video_dur = self.state.tracks[0].duration_sec if self.state.tracks else 0.0
+            video_dur = video_timeline_duration_sec(self.state.tracks)
             self._plot.set_data(self._merged_df, video_duration_sec=video_dur)
             self._status.setText(f"Signal loaded from {Path(sp).name}")
         except Exception as exc:
@@ -329,14 +332,14 @@ class Mode2Widget(QWidget):
     def _refresh_time_correction_ui(self):
         self._clear_time_grid()
         self._time_rows.clear()
-        headers = ["Camera", "Mode", "Input", "Corrected start"]
+        headers = ["Camera", "Mode", "Input", "Corrected start", "Not limiting size"]
         for col, text in enumerate(headers):
             label = QLabel(text)
             label.setStyleSheet("font-weight:bold;")
             self._time_grid.addWidget(label, 0, col)
 
         if not self.state.tracks:
-            self._time_grid.addWidget(QLabel("Load videos to edit time corrections."), 1, 0, 1, 4)
+            self._time_grid.addWidget(QLabel("Load videos to edit time corrections."), 1, 0, 1, 5)
             self._time_status.setText("")
             return
 
@@ -393,6 +396,12 @@ class Mode2Widget(QWidget):
             corrected_label = QLabel("")
             corrected_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
+            not_limiting_cb = QCheckBox()
+            not_limiting_cb.setChecked(not track.limits_common_duration)
+            not_limiting_cb.setToolTip(
+                "Exclude this camera when choosing the shared video duration for signal clipping, plotting, and mosaic export."
+            )
+
             row = {
                 "track_index": row_idx - 1,
                 "mode": mode_combo,
@@ -404,6 +413,7 @@ class Mode2Widget(QWidget):
                 "point_ref": point_ref,
                 "point_use_playhead": use_playhead_btn,
                 "corrected": corrected_label,
+                "not_limiting": not_limiting_cb,
             }
             self._time_rows.append(row)
 
@@ -413,11 +423,13 @@ class Mode2Widget(QWidget):
             point_video.timeChanged.connect(lambda _=None, i=row_idx - 1: self._on_time_row_changed(i))
             point_ref.timeChanged.connect(lambda _=None, i=row_idx - 1: self._on_time_row_changed(i))
             use_playhead_btn.clicked.connect(lambda _=False, i=row_idx - 1: self._use_playhead_for_time_row(i))
+            not_limiting_cb.toggled.connect(lambda _=False, i=row_idx - 1: self._on_time_row_changed(i))
 
             self._time_grid.addWidget(camera_label, row_idx, 0)
             self._time_grid.addWidget(mode_combo, row_idx, 1)
             self._time_grid.addWidget(input_container, row_idx, 2)
             self._time_grid.addWidget(corrected_label, row_idx, 3)
+            self._time_grid.addWidget(not_limiting_cb, row_idx, 4)
             self._update_time_row(row_idx - 1, write_state=False)
 
     def _on_time_row_changed(self, idx: int):
@@ -438,6 +450,7 @@ class Mode2Widget(QWidget):
         if write_state:
             base = track.parsed_start_datetime()
             track.time_correction_mode = mode
+            track.limits_common_duration = not row["not_limiting"].isChecked()
             if mode == "none":
                 track.true_start_datetime = None
                 track.reference_video_time_sec = 0.0
@@ -553,7 +566,7 @@ class Mode2Widget(QWidget):
                 return
             self.state.last_signal_anchor_datetime = dt_start.isoformat() if dt_start else None
             self.state.last_time_coherence_warnings = coherence_warnings
-            dur = self.state.tracks[0].duration_sec
+            dur = video_timeline_duration_sec(self.state.tracks)
             if dt_start is not None:
                 from datetime import timedelta
                 dt_end = dt_start + timedelta(seconds=dur)
@@ -588,7 +601,7 @@ class Mode2Widget(QWidget):
 
         video_dur = 0.0
         if self.state.tracks:
-            video_dur = self.state.tracks[0].duration_sec
+            video_dur = video_timeline_duration_sec(self.state.tracks)
         self._plot.set_data(self._merged_df, video_duration_sec=video_dur)
 
         # Export clipped signal CSV
@@ -669,9 +682,9 @@ class Mode2Widget(QWidget):
 
         t0 = self.state.tracks[0]
         fps = t0.fps or 30.0
-        total_frames = t0.frame_count or int(t0.duration_sec * fps)
+        duration = video_timeline_duration_sec(self.state.tracks)
+        total_frames = int(duration * fps) if duration > 0 else (t0.frame_count or 0)
         labels = [t.camera_label for t in self.state.tracks]
-        duration = t0.duration_sec
 
         self._mosaic_worker = MosaicWorker(
             video_paths=valid,
@@ -720,3 +733,28 @@ class Mode2Widget(QWidget):
         fps = self.state.tracks[0].fps or 30.0
         time_sec = frame_no / fps
         self._plot.set_cursor(time_sec)
+
+    def _export_current_frames(self):
+        if not self.state.tracks:
+            QMessageBox.warning(self, "Warning", "No videos loaded.")
+            return
+
+        out_dir = self.state.output_directory
+        if not out_dir:
+            paths = [t.final_output_path for t in self.state.tracks]
+            valid = [p for p in paths if p and Path(p).exists()]
+            out_dir = str(Path(valid[0]).parent) if valid else ""
+        if not out_dir:
+            out_dir = QFileDialog.getExistingDirectory(self, "Select capture output folder")
+            if not out_dir:
+                return
+
+        try:
+            written = export_player_frames(self._player, out_dir)
+        except Exception as exc:
+            QMessageBox.critical(self, "Synchronized capture", f"Capture export failed:\n{exc}")
+            self._status.setText(f"Capture export failed: {exc}")
+            return
+
+        capture_dir = written[0].parent
+        self._status.setText(f"Exported {len(written)} capture frame(s) to {capture_dir}")

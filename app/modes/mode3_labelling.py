@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..ffmpeg_utils import trim_video, find_ffmpeg
+from ..frame_export import export_player_frames
 from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_preset
 from ..signals import load_signal_files, signal_file_type_name, signal_long_to_wide
 from ..state import (
@@ -46,6 +47,7 @@ from ..state import (
     format_time_coherence_warnings,
     load_sidecar,
     populate_tracks_from_videos,
+    video_timeline_duration_sec,
 )
 from ..widgets.frame_preview import MultiCameraPlayer
 from ..widgets.signal_plot import SignalPlot
@@ -278,6 +280,7 @@ class Mode3Widget(QWidget):
         self._timeline.mosaic_requested.connect(self._on_mosaic_interval)
         self._timeline.playhead_moved.connect(self._on_playhead)
         self._player.frame_changed.connect(self._on_frame_changed)
+        self._player.export_frames_requested.connect(self._export_current_frames)
 
         self._ed_start.timeChanged.connect(self._update_editor_duration)
         self._ed_end.timeChanged.connect(self._update_editor_duration)
@@ -297,7 +300,7 @@ class Mode3Widget(QWidget):
             if valid:
                 self._player.load_videos(valid)
 
-            dur = self.state.tracks[0].duration_sec if self.state.tracks else 0
+            dur = video_timeline_duration_sec(self.state.tracks)
             self._timeline.set_duration(dur)
 
         items = []
@@ -332,7 +335,7 @@ class Mode3Widget(QWidget):
                     )
                 self.state.last_signal_anchor_datetime = dt_start.isoformat() if dt_start else None
                 self.state.last_time_coherence_warnings = coherence_warnings
-                dur = self.state.tracks[0].duration_sec
+                dur = video_timeline_duration_sec(self.state.tracks)
                 if dt_start is not None:
                     dt_end = dt_start + timedelta(seconds=dur)
                     start_ts = pd.Timestamp(dt_start)
@@ -349,7 +352,7 @@ class Mode3Widget(QWidget):
                 merged,
                 include_average=self.state.include_signal_average,
             )
-            dur = self.state.tracks[0].duration_sec if self.state.tracks else 0
+            dur = video_timeline_duration_sec(self.state.tracks)
             self._plot.set_data(self._merged_df, video_duration_sec=dur)
 
     def _load_synced_signal(self) -> bool:
@@ -361,7 +364,7 @@ class Mode3Widget(QWidget):
             df = pd.read_csv(sp)
             df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
             self._merged_df = df
-            dur = self.state.tracks[0].duration_sec if self.state.tracks else 0
+            dur = video_timeline_duration_sec(self.state.tracks)
             self._plot.set_data(self._merged_df, video_duration_sec=dur)
             return True
         except Exception as exc:
@@ -426,7 +429,7 @@ class Mode3Widget(QWidget):
             valid = [p for p in paths if p and Path(p).exists()]
             if valid:
                 self._player.load_videos(valid)
-            dur = self.state.tracks[0].duration_sec if self.state.tracks else 0
+            dur = video_timeline_duration_sec(self.state.tracks)
             self._timeline.set_duration(dur)
 
     def _clear_time_summary(self):
@@ -777,6 +780,31 @@ class Mode3Widget(QWidget):
         sec = frame_no / fps
         self._timeline.set_playhead(sec)
         self._plot.set_cursor(sec)
+
+    def _export_current_frames(self):
+        if not self.state.tracks:
+            QMessageBox.warning(self, "Warning", "No videos loaded.")
+            return
+
+        out_dir = self.state.output_directory
+        if not out_dir:
+            paths = [t.final_output_path for t in self.state.tracks]
+            valid = [p for p in paths if p and Path(p).exists()]
+            out_dir = str(Path(valid[0]).parent) if valid else ""
+        if not out_dir:
+            out_dir = QFileDialog.getExistingDirectory(self, "Select capture output folder")
+            if not out_dir:
+                return
+
+        try:
+            written = export_player_frames(self._player, out_dir)
+        except Exception as exc:
+            QMessageBox.critical(self, "Synchronized capture", f"Capture export failed:\n{exc}")
+            self._status.setText(f"Capture export failed: {exc}")
+            return
+
+        capture_dir = written[0].parent
+        self._status.setText(f"Exported {len(written)} capture frame(s) to {capture_dir}")
 
     def _export(self):
         out_dir = self.state.output_directory
