@@ -212,6 +212,14 @@ class Mode1Widget(QWidget):
         sync_row.addWidget(self._sync_duration_spin)
         left_layout.addLayout(sync_row)
 
+        self._sync_pairwise_refinement_cb = QCheckBox("Refine audio sync with pairwise camera checks")
+        self._sync_pairwise_refinement_cb.setChecked(False)
+        self._sync_pairwise_refinement_cb.setToolTip(
+            "Optional slower check for difficult recordings. It compares all camera pairs\n"
+            "and keeps the offset set with the best overall consistency."
+        )
+        left_layout.addWidget(self._sync_pairwise_refinement_cb)
+
         self._delete_intermediates_cb = QCheckBox("Delete intermediate files automatically")
         self._delete_intermediates_cb.setChecked(True)
         self._delete_intermediates_cb.setToolTip(
@@ -354,6 +362,7 @@ class Mode1Widget(QWidget):
             cameras=cameras,
             delete_intermediates=self._delete_intermediates_cb.isChecked(),
             sync_audio_duration=self._sync_duration_spin.value() or None,
+            sync_pairwise_refinement=self._sync_pairwise_refinement_cb.isChecked(),
         )
         worker.log_message.connect(self._log)
         worker.progress.connect(lambda v, m: (self._progress.setValue(v), self._status_label.setText(m)))
@@ -404,7 +413,7 @@ class Mode1Widget(QWidget):
                     info[f"Cam{i+1} error"] = str(exc)
         self._metadata_panel.set_info(info)
 
-    def _preprocessing_pipeline(self, *, ffmpeg, out_dir, cameras, delete_intermediates, sync_audio_duration, worker: FFmpegWorker):
+    def _preprocessing_pipeline(self, *, ffmpeg, out_dir, cameras, delete_intermediates, sync_audio_duration, sync_pairwise_refinement, worker: FFmpegWorker):
         import shutil as _shutil
         num = len(cameras)
         tracks: list[VideoTrack] = []
@@ -514,7 +523,9 @@ class Mode1Widget(QWidget):
         first_segments = [cam.segment_paths[0] for cam in cameras]
         from ..audio_sync import compute_all_offsets
         offsets = compute_all_offsets(first_segments, ffmpeg=ffmpeg,
-                                        audio_duration_sec=sync_audio_duration)
+                                        audio_duration_sec=sync_audio_duration,
+                                        pairwise_refinement=sync_pairwise_refinement,
+                                        log_callback=lambda m: worker.log_message.emit(m))
         for i, off in enumerate(offsets):
             tracks[i].sync_offset_sec = off
             worker.log_message.emit(f"Camera {i+1} offset: {off:.4f}s")

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import tempfile
+from collections import deque
+from itertools import combinations
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
@@ -63,14 +64,113 @@ def compute_sync_offset(
     return offset_sec
 
 
+def _offsets_from_tree(
+    tree_edges: tuple[tuple[int, int, float], ...],
+    num_cameras: int,
+) -> list[float] | None:
+    adjacency: list[list[tuple[int, float]]] = [[] for _ in range(num_cameras)]
+    for left, right, offset in tree_edges:
+        adjacency[left].append((right, offset))
+        adjacency[right].append((left, -offset))
+
+    offsets: list[float | None] = [None] * num_cameras
+    offsets[0] = 0.0
+    pending: deque[int] = deque([0])
+    while pending:
+        current = pending.popleft()
+        current_offset = offsets[current]
+        if current_offset is None:
+            continue
+        for neighbor, relation in adjacency[current]:
+            if offsets[neighbor] is None:
+                offsets[neighbor] = current_offset + relation
+                pending.append(neighbor)
+
+    if any(offset is None for offset in offsets):
+        return None
+    return [float(offset) for offset in offsets]
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _best_pairwise_offsets(
+    relations: list[tuple[int, int, float]],
+    num_cameras: int,
+) -> tuple[list[float], tuple[float, float, float]]:
+    if num_cameras <= 1:
+        return [0.0] if num_cameras == 1 else [], (0.0, 0.0, 0.0)
+    if num_cameras == 2:
+        return [0.0, relations[0][2]], (0.0, 0.0, 0.0)
+
+    best_offsets: list[float] | None = None
+    best_score: tuple[float, float, float] | None = None
+    for tree_edges in combinations(relations, num_cameras - 1):
+        offsets = _offsets_from_tree(tree_edges, num_cameras)
+        if offsets is None:
+            continue
+
+        residuals = [
+            abs((offsets[right] - offsets[left]) - offset)
+            for left, right, offset in relations
+        ]
+        score = (_median(residuals), float(np.mean(residuals)), max(residuals))
+        if best_score is None or score < best_score:
+            best_score = score
+            best_offsets = offsets
+
+    if best_offsets is None or best_score is None:
+        raise RuntimeError("Could not derive a connected pairwise audio-sync solution.")
+    return best_offsets, best_score
+
+
 def compute_all_offsets(
     segment_first_per_camera: list[str],
     ffmpeg: str = "",
     max_offset_sec: float = 60.0,
     audio_duration_sec: float | None = 60.0,
+    pairwise_refinement: bool = False,
+    log_callback=None,
 ) -> list[float]:
     if not segment_first_per_camera:
         return []
+    if len(segment_first_per_camera) == 1:
+        return [0.0]
+    if pairwise_refinement:
+        relations: list[tuple[int, int, float]] = []
+        total = len(segment_first_per_camera)
+        for left in range(total):
+            for right in range(left + 1, total):
+                off = compute_sync_offset(
+                    segment_first_per_camera[left],
+                    segment_first_per_camera[right],
+                    ffmpeg=ffmpeg,
+                    max_offset_sec=max_offset_sec,
+                    audio_duration_sec=audio_duration_sec,
+                )
+                relations.append((left, right, off))
+                msg = f"Pairwise audio offset camera {left + 1}->{right + 1}: {off:.4f}s"
+                log.info(msg)
+                if log_callback is not None:
+                    log_callback(msg)
+
+        offsets, score = _best_pairwise_offsets(relations, total)
+        msg = (
+            "Pairwise audio refinement residuals "
+            f"median={score[0]:.4f}s mean={score[1]:.4f}s max={score[2]:.4f}s"
+        )
+        log.info(msg)
+        if log_callback is not None:
+            log_callback(msg)
+        return offsets
+
     offsets = [0.0]
     for i in range(1, len(segment_first_per_camera)):
         off = compute_sync_offset(
