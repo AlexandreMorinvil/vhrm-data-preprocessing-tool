@@ -44,6 +44,7 @@ from ..ffmpeg_utils import (
 from ..state import ProjectState, VideoTrack, parse_dji_datetime, dji_datetime_str
 from ..state import generate_sidecar
 from ..widgets.frame_preview import MultiCameraPlayer
+from ..widgets.layout import configure_main_splitter
 
 log = logging.getLogger(__name__)
 
@@ -102,6 +103,13 @@ class _CameraGroup(QGroupBox):
         self._label_edit.setPlaceholderText("Camera label (e.g. front, left)")
         layout.addWidget(self._label_edit)
 
+        self._not_limiting_cb = QCheckBox("Not limiting size")
+        self._not_limiting_cb.setToolTip(
+            "Exclude this camera when choosing the common final duration. "
+            "Useful when this camera ends earlier than the rest."
+        )
+        layout.addWidget(self._not_limiting_cb)
+
     @property
     def label(self) -> str:
         return self._label_edit.text().strip() or f"Camera {self.camera_index + 1}"
@@ -123,6 +131,14 @@ class _CameraGroup(QGroupBox):
             item.setData(Qt.ItemDataRole.UserRole, p)
             item.setToolTip(p)
             self._list.addItem(item)
+
+    @property
+    def limits_common_duration(self) -> bool:
+        return not self._not_limiting_cb.isChecked()
+
+    @limits_common_duration.setter
+    def limits_common_duration(self, value: bool):
+        self._not_limiting_cb.setChecked(not value)
 
     def _add_segments(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -268,8 +284,7 @@ class Mode1Widget(QWidget):
         right_layout.addWidget(self._metadata_panel)
         splitter.addWidget(right)
 
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
+        configure_main_splitter(splitter, scroll, right, 2, 3)
 
         self._rebuild_camera_groups()
         self._restore_from_state()
@@ -285,7 +300,7 @@ class Mode1Widget(QWidget):
             self._out_dir_edit.setText(d)
 
     def _rebuild_camera_groups(self):
-        old_data = [(g.label, g.segment_paths) for g in self._camera_groups]
+        old_data = [(g.label, g.segment_paths, g.limits_common_duration) for g in self._camera_groups]
         for g in self._camera_groups:
             g.setParent(None)
             g.deleteLater()
@@ -296,6 +311,7 @@ class Mode1Widget(QWidget):
             if i < len(old_data):
                 g.label = old_data[i][0]
                 g.segment_paths = old_data[i][1]
+                g.limits_common_duration = old_data[i][2]
             g.segments_changed.connect(self._preview_first_segments)
             self._camera_area.addWidget(g)
             self._camera_groups.append(g)
@@ -307,6 +323,7 @@ class Mode1Widget(QWidget):
             if i < len(self._camera_groups):
                 self._camera_groups[i].label = track.camera_label
                 self._camera_groups[i].segment_paths = track.segment_paths
+                self._camera_groups[i].limits_common_duration = track.limits_common_duration
         if self.state.tracks:
             paths = [t.final_output_path or t.concatenated_path for t in self.state.tracks]
             valid = [p for p in paths if p and Path(p).exists()]
@@ -450,6 +467,7 @@ class Mode1Widget(QWidget):
                     height=vinfo.get("height", 0),
                     codec=vinfo.get("codec", ""),
                     duration_sec=vinfo.get("duration", 0),
+                    limits_common_duration=cam.limits_common_duration,
                 )
                 track.set_start_datetime(first_dt)
                 tracks.append(track)
@@ -485,6 +503,7 @@ class Mode1Widget(QWidget):
                 height=vinfo.get("height", 0),
                 codec=vinfo.get("codec", ""),
                 duration_sec=vinfo.get("duration", 0),
+                limits_common_duration=cam.limits_common_duration,
             )
             track.set_start_datetime(first_dt)
             tracks.append(track)
@@ -579,7 +598,20 @@ class Mode1Widget(QWidget):
 
         # --- Trim to common duration (85–98%) ---------------------------------
         worker.progress.emit(85, "Trimming to common duration …")
-        min_dur = min(t.duration_sec for t in tracks)
+        limiting_tracks = [t for t in tracks if t.limits_common_duration and t.duration_sec > 0]
+        if limiting_tracks:
+            target_dur = min(t.duration_sec for t in limiting_tracks)
+            excluded = [t.camera_label or f"Camera {i + 1}" for i, t in enumerate(tracks) if not t.limits_common_duration]
+            worker.log_message.emit(
+                f"Common duration from limiting cameras: {target_dur:.3f}s"
+            )
+            if excluded:
+                worker.log_message.emit("Not limiting size: " + ", ".join(excluded))
+        else:
+            target_dur = max((t.duration_sec for t in tracks), default=0.0)
+            worker.log_message.emit(
+                "All cameras are marked not limiting size; keeping each available duration."
+            )
         for i, t in enumerate(tracks):
             if worker.is_cancelled:
                 return
@@ -591,17 +623,17 @@ class Mode1Widget(QWidget):
             step_label = f"Trimming end camera {i+1}/{num} …"
             worker.progress.emit(int(85 + i * 13 / num), step_label)
 
-            if abs(t.duration_sec - min_dur) > 0.1:
+            if target_dur > 0 and t.duration_sec - target_dur > 0.1:
                 def _trim_end_progress(cur_s, total_s, _i=i):
                     frac = min(cur_s / total_s, 1.0) if total_s > 0 else 0
                     worker.progress.emit(int(85 + (_i * 13 / num) + frac * 13 / num), step_label)
 
                 trim_video(
                     source, final_path,
-                    duration_sec=min_dur, ffmpeg=ffmpeg,
+                    duration_sec=target_dur, ffmpeg=ffmpeg,
                     log_callback=lambda m: worker.log_message.emit(m),
                     progress_callback=_trim_end_progress,
-                    expected_duration_sec=min_dur,
+                    expected_duration_sec=target_dur,
                     cancel_check=lambda: worker.is_cancelled,
                 )
             else:
@@ -637,7 +669,9 @@ class Mode1Widget(QWidget):
         frame_counts = [t.frame_count for t in tracks]
         worker.log_message.emit(f"Frame counts: {frame_counts}")
         if len(set(frame_counts)) > 1:
-            worker.log_message.emit("Warning: frame counts differ slightly after trimming.")
+            worker.log_message.emit(
+                "Warning: frame counts differ after trimming. This is expected when a shorter camera is marked not limiting size."
+            )
 
         self.state.tracks = tracks
         worker.progress.emit(100, "Done ✓")

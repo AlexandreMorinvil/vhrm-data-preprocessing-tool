@@ -135,6 +135,20 @@ def is_aux_signal_column(column: str) -> bool:
     return str(column).startswith(SIGNAL_AUX_PREFIX)
 
 
+def read_synced_signal_csv(path: str | Path) -> pd.DataFrame:
+    """Read an exported signal CSV and normalize mixed-precision UTC timestamps."""
+    df = pd.read_csv(path)
+    if "timestamp_utc" not in df.columns:
+        raise ValueError(f"Synchronized signal CSV has no timestamp_utc column: {path}")
+    df["timestamp_utc"] = pd.to_datetime(
+        df["timestamp_utc"],
+        format="mixed",
+        utc=True,
+        errors="raise",
+    )
+    return df
+
+
 def signal_long_to_wide(df: pd.DataFrame, include_average: bool = False) -> pd.DataFrame:
     """Pivot loader output to the wide CSV format used by the app.
 

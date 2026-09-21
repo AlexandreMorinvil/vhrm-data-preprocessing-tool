@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTimeEdit,
     QVBoxLayout,
@@ -37,9 +38,9 @@ from PyQt6.QtWidgets import (
 )
 
 from ..ffmpeg_utils import trim_video, find_ffmpeg
-from ..frame_export import export_player_frames
 from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_preset
-from ..signals import load_signal_files, signal_file_type_name, signal_long_to_wide
+from ..signals import load_signal_files, read_synced_signal_csv, signal_file_type_name, signal_long_to_wide
+from ..widgets.layout import configure_main_splitter
 from ..state import (
     LabelInterval,
     ProjectState,
@@ -126,7 +127,8 @@ class Mode3Widget(QWidget):
     def __init__(self, state: ProjectState, parent=None):
         super().__init__(parent)
         self.state = state
-        self._merged_df: Optional[pd.DataFrame] = None
+        self._hr_merged_df: Optional[pd.DataFrame] = None
+        self._ecg_merged_df: Optional[pd.DataFrame] = None
         self._has_exported: bool = False
         self._mosaic_worker: MosaicWorker | None = None
 
@@ -144,12 +146,18 @@ class Mode3Widget(QWidget):
         meta_btn = QPushButton("Load from metadata file …")
         meta_btn.clicked.connect(self._load_from_meta)
         load_lay.addWidget(meta_btn)
+        manifest_btn = QPushButton("Import labelled segments manifest …")
+        manifest_btn.clicked.connect(self._import_segments_manifest)
+        load_lay.addWidget(manifest_btn)
         vids_btn = QPushButton("Select video files directly …")
         vids_btn.clicked.connect(self._load_from_videos)
         load_lay.addWidget(vids_btn)
-        sig_btn = QPushButton("Add signal file …")
-        sig_btn.clicked.connect(self._add_signal_inline)
-        load_lay.addWidget(sig_btn)
+        hr_btn = QPushButton("Add HR file …")
+        hr_btn.clicked.connect(lambda: self._add_signal_inline("HR"))
+        load_lay.addWidget(hr_btn)
+        ecg_btn = QPushButton("Add ECG file …")
+        ecg_btn.clicked.connect(lambda: self._add_signal_inline("ECG"))
+        load_lay.addWidget(ecg_btn)
         self._load_status = QLabel("")
         self._load_status.setWordWrap(True)
         load_lay.addWidget(self._load_status)
@@ -222,6 +230,12 @@ class Mode3Widget(QWidget):
         self._export_btn.setStyleSheet("font-weight:bold; padding:8px;")
         self._export_btn.clicked.connect(self._export)
         ll.addWidget(self._export_btn)
+        self._export_ecg_btn = QPushButton("Export ECG to existing segments")
+        self._export_ecg_btn.clicked.connect(self._export_ecg_to_existing_segments)
+        ll.addWidget(self._export_ecg_btn)
+        self._export_hr_btn = QPushButton("Export HR to existing segments")
+        self._export_hr_btn.clicked.connect(self._export_hr_to_existing_segments)
+        ll.addWidget(self._export_hr_btn)
 
         self._progress = QProgressBar()
         self._progress.setTextVisible(True)
@@ -230,7 +244,10 @@ class Mode3Widget(QWidget):
         self._status = QLabel("")
         ll.addWidget(self._status)
         ll.addStretch()
-        splitter.addWidget(left)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setWidget(left)
+        splitter.addWidget(left_scroll)
 
         right = QWidget()
         rl = QVBoxLayout(right)
@@ -239,6 +256,10 @@ class Mode3Widget(QWidget):
         self._player = MultiCameraPlayer()
         rl.addWidget(self._player)
 
+        self._plot_type = QComboBox()
+        self._plot_type.addItems(["Heart rate", "ECG"])
+        self._plot_type.currentIndexChanged.connect(self._show_selected_plot)
+        rl.addWidget(self._plot_type)
         self._plot = SignalPlot()
         rl.addWidget(self._plot)
 
@@ -268,8 +289,7 @@ class Mode3Widget(QWidget):
 
         splitter.addWidget(right)
 
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 3)
+        configure_main_splitter(splitter, left_scroll, right)
 
         self._timeline.interval_created.connect(self._on_interval_created)
         self._timeline.interval_deleted.connect(self._on_interval_deleted)
@@ -280,7 +300,6 @@ class Mode3Widget(QWidget):
         self._timeline.mosaic_requested.connect(self._on_mosaic_interval)
         self._timeline.playhead_moved.connect(self._on_playhead)
         self._player.frame_changed.connect(self._on_frame_changed)
-        self._player.export_frames_requested.connect(self._export_current_frames)
 
         self._ed_start.timeChanged.connect(self._update_editor_duration)
         self._ed_end.timeChanged.connect(self._update_editor_duration)
@@ -309,13 +328,15 @@ class Mode3Widget(QWidget):
         self._timeline.set_intervals(items)
         self._plot.set_intervals(self.state.intervals)
 
-        self._load_signals()
+        if not self._load_synced_signal():
+            self._load_signals()
         self._refresh_time_summary()
 
     def _load_signals(self):
-        if not self.state.signal_paths:
+        paths = self.state.hr_signal_paths or self.state.signal_paths
+        if not paths:
             return
-        dfs, _display_type_by_path, failed_paths = load_signal_files(self.state.signal_paths)
+        dfs, _display_type_by_path, failed_paths = load_signal_files(paths)
         for p in failed_paths:
             log.warning("Failed to load signal: %s", p)
         if dfs:
@@ -348,28 +369,35 @@ class Mode3Widget(QWidget):
             if merged.empty:
                 return
 
-            self._merged_df = signal_long_to_wide(
+            self._hr_merged_df = signal_long_to_wide(
                 merged,
                 include_average=self.state.include_signal_average,
             )
             dur = video_timeline_duration_sec(self.state.tracks)
-            self._plot.set_data(self._merged_df, video_duration_sec=dur)
+            self._show_selected_plot()
 
     def _load_synced_signal(self) -> bool:
         """Load pre-synced signal CSV from state. Returns True if loaded."""
-        sp = self.state.synced_signal_path
-        if not sp or not Path(sp).exists():
+        hr_path = self.state.synced_hr_path or self.state.synced_signal_path
+        ecg_path = self.state.synced_ecg_path
+        if not (hr_path and Path(hr_path).exists()) and not (ecg_path and Path(ecg_path).exists()):
             return False
-        try:
-            df = pd.read_csv(sp)
-            df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
-            self._merged_df = df
-            dur = video_timeline_duration_sec(self.state.tracks)
-            self._plot.set_data(self._merged_df, video_duration_sec=dur)
-            return True
-        except Exception as exc:
-            log.warning("Could not load synced signal CSV: %s", exc)
-            return False
+        loaded = False
+        if hr_path and Path(hr_path).exists():
+            try:
+                self._hr_merged_df = read_synced_signal_csv(hr_path)
+                loaded = True
+            except Exception as exc:
+                log.warning("Could not load synchronized HR CSV %s: %s", hr_path, exc)
+        if ecg_path and Path(ecg_path).exists():
+            try:
+                self._ecg_merged_df = read_synced_signal_csv(ecg_path)
+                loaded = True
+            except Exception as exc:
+                log.warning("Could not load synchronized ECG CSV %s: %s", ecg_path, exc)
+        if loaded:
+            self._show_selected_plot()
+        return loaded
 
     def _load_from_meta(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -389,6 +417,56 @@ class Mode3Widget(QWidget):
         n = len(self.state.tracks)
         self._load_status.setText(f"Loaded {n} camera(s) from sidecar.")
 
+    def _import_segments_manifest(self):
+        default_path = str(Path(self.state.output_directory) / "labelled_segments" / "manifest.csv")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select labelled-segments manifest", default_path,
+            "CSV (*.csv);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            intervals = self._read_manifest_intervals(path)
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            QMessageBox.critical(self, "Invalid manifest", f"Failed to import labelled segments:\n{exc}")
+            return
+        self.state.intervals = intervals
+        for interval in intervals:
+            if interval.label and interval.label not in self.state.labels_library:
+                self.state.labels_library.append(interval.label)
+                self._lib_list.addItem(interval.label)
+                self._label_combo.addItem(interval.label)
+            interval.color = colour_for_label(interval.label, self.state.labels_library)
+        self._sync_timeline()
+        self._editor_grp.setVisible(False)
+        self._load_status.setText(f"Imported {len(intervals)} labelled segment(s) from {Path(path).name}.")
+
+    def _read_manifest_intervals(self, path: str) -> list[LabelInterval]:
+        intervals = []
+        with open(path, newline="", encoding="utf-8") as file:
+            for row in csv.DictReader(file):
+                label = (row.get("label") or "").strip()
+                start_sec = float(row["start_sec"])
+                end_sec = float(row["end_sec"])
+                folder = (row.get("folder") or "").strip()
+                if not label:
+                    raise ValueError("A segment has no label.")
+                if start_sec >= end_sec:
+                    raise ValueError(f"Segment '{label}' must end after it starts.")
+                if not folder:
+                    raise ValueError(f"Segment '{label}' has no folder.")
+                intervals.append(LabelInterval(
+                    label=label,
+                    start_sec=start_sec,
+                    end_sec=end_sec,
+                    color=colour_for_label(label, self.state.labels_library),
+                    folder=str(Path(path).parent / folder),
+                ))
+        if not intervals:
+            raise ValueError("The manifest contains no segments.")
+        intervals.sort(key=lambda interval: interval.start_sec)
+        return intervals
+
     def _load_from_videos(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, "Select video files", "", _VIDEO_FILTER,
@@ -405,20 +483,65 @@ class Mode3Widget(QWidget):
         n = len(self.state.tracks)
         self._load_status.setText(f"Loaded {n} video(s) directly.")
 
-    def _add_signal_inline(self):
+    def _add_signal_inline(self, signal_kind: str):
         files, _ = QFileDialog.getOpenFileNames(
             self, "Select signal files", "", _SIGNAL_FILTER,
         )
         if not files:
             return
+        target = self.state.ecg_signal_paths if signal_kind == "ECG" else self.state.hr_signal_paths
         for p in files:
-            if p not in self.state.signal_paths:
-                self.state.signal_paths.append(p)
-        self._load_signals()
+            is_ecg = signal_file_type_name(p) == "ECG waveform"
+            if is_ecg != (signal_kind == "ECG"):
+                QMessageBox.warning(self, "Wrong signal type", f"{Path(p).name} is not an {signal_kind} file.")
+                continue
+            if p not in target:
+                target.append(p)
+        self.state.signal_paths = list(self.state.hr_signal_paths)
+        if signal_kind == "ECG":
+            self._ecg_merged_df = self._load_and_clip_paths(self.state.ecg_signal_paths, False)
+        else:
+            self._load_signals()
+        self._show_selected_plot()
         type_names = [signal_file_type_name(p) for p in files]
         self._load_status.setText(
-            f"Loaded {len(self.state.signal_paths)} signal file(s): {', '.join(type_names)}."
+            f"Loaded {len(target)} {signal_kind} file(s): {', '.join(type_names)}."
         )
+
+    def _load_and_clip_paths(self, paths: list[str], include_average: bool) -> Optional[pd.DataFrame]:
+        if not paths:
+            return None
+        dfs, _types, failed_paths = load_signal_files(paths)
+        for path in failed_paths:
+            log.warning("Failed to load signal: %s", path)
+        if not dfs:
+            return None
+        merged = pd.concat(dfs, ignore_index=True)
+        anchor = self._signal_anchor()
+        if anchor is not None and self.state.tracks:
+            end = pd.Timestamp(anchor + timedelta(seconds=video_timeline_duration_sec(self.state.tracks)))
+            merged = merged[(merged["timestamp_utc"] >= pd.Timestamp(anchor)) & (merged["timestamp_utc"] <= end)]
+        if merged.empty:
+            return None
+        return signal_long_to_wide(merged, include_average=include_average)
+
+    def _signal_anchor(self) -> Optional[datetime]:
+        if self.state.last_signal_anchor_datetime:
+            try:
+                return datetime.fromisoformat(self.state.last_signal_anchor_datetime)
+            except ValueError:
+                pass
+        anchor, _warnings = compute_signal_anchor(self.state.tracks, self.state.time_coherence_tolerance_sec)
+        return anchor
+
+    def _show_selected_plot(self):
+        df = self._hr_merged_df if self._plot_type.currentIndex() == 0 else self._ecg_merged_df
+        if df is None:
+            self._plot.clear()
+            self._plot.set_intervals(self.state.intervals)
+            return
+        self._plot.set_data(df, video_duration_sec=video_timeline_duration_sec(self.state.tracks))
+        self._plot.set_intervals(self.state.intervals)
 
     def _refresh_from_tracks(self):
         """Reload player and timeline from the current state.tracks."""
@@ -781,31 +904,6 @@ class Mode3Widget(QWidget):
         self._timeline.set_playhead(sec)
         self._plot.set_cursor(sec)
 
-    def _export_current_frames(self):
-        if not self.state.tracks:
-            QMessageBox.warning(self, "Warning", "No videos loaded.")
-            return
-
-        out_dir = self.state.output_directory
-        if not out_dir:
-            paths = [t.final_output_path for t in self.state.tracks]
-            valid = [p for p in paths if p and Path(p).exists()]
-            out_dir = str(Path(valid[0]).parent) if valid else ""
-        if not out_dir:
-            out_dir = QFileDialog.getExistingDirectory(self, "Select capture output folder")
-            if not out_dir:
-                return
-
-        try:
-            written = export_player_frames(self._player, out_dir)
-        except Exception as exc:
-            QMessageBox.critical(self, "Synchronized capture", f"Capture export failed:\n{exc}")
-            self._status.setText(f"Capture export failed: {exc}")
-            return
-
-        capture_dir = written[0].parent
-        self._status.setText(f"Exported {len(written)} capture frame(s) to {capture_dir}")
-
     def _export(self):
         out_dir = self.state.output_directory
         if not out_dir:
@@ -859,6 +957,7 @@ class Mode3Widget(QWidget):
             seg_name = f"{idx:04d}_{iv.label.replace(' ', '_')}"
             seg_dir = segments_dir / seg_name
             seg_dir.mkdir(parents=True, exist_ok=True)
+            iv.folder = str(seg_dir)
 
             for ti, track in enumerate(self.state.tracks):
                 src = track.final_output_path
@@ -876,23 +975,8 @@ class Mode3Widget(QWidget):
                 except Exception as exc:
                     log.error("Trim failed for %s: %s", dst, exc)
 
-            signal_exported = False
-            if self._merged_df is not None and not self._merged_df.empty:
-                try:
-                    if signal_anchor is not None:
-                        seg_start = signal_anchor + timedelta(seconds=iv.start_sec)
-                        seg_end = signal_anchor + timedelta(seconds=iv.end_sec)
-                        start_ts = pd.Timestamp(seg_start)
-                        end_ts = pd.Timestamp(seg_end)
-                        sub = self._merged_df[
-                            (self._merged_df["timestamp_utc"] >= start_ts)
-                            & (self._merged_df["timestamp_utc"] <= end_ts)
-                        ]
-                        if not sub.empty:
-                            sub.to_csv(seg_dir / "signal.csv", index=False)
-                            signal_exported = True
-                except Exception as exc:
-                    log.error("Signal export error for segment %d: %s", idx, exc)
+            hr_exported = self._export_signal_slice(self._hr_merged_df, signal_anchor, iv, seg_dir / "hr.csv")
+            ecg_exported = self._export_signal_slice(self._ecg_merged_df, signal_anchor, iv, seg_dir / "ecg.csv")
 
             # Build enriched meta.json (aligned with project_meta.json)
             cameras_meta = []
@@ -913,14 +997,8 @@ class Mode3Widget(QWidget):
                     "corrected_start_datetime_utc": corrected_start.isoformat() if corrected_start else None,
                 })
 
-            # Resolve synced_signal_path relative to the segment folder
-            synced_rel = None
-            sp = self.state.synced_signal_path
-            if sp and Path(sp).exists():
-                try:
-                    synced_rel = os.path.relpath(sp, seg_dir)
-                except ValueError:
-                    synced_rel = sp
+            synced_hr_rel = self._relative_signal_path(self.state.synced_hr_path or self.state.synced_signal_path, seg_dir)
+            synced_ecg_rel = self._relative_signal_path(self.state.synced_ecg_path, seg_dir)
 
             meta = {
                 "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -931,8 +1009,12 @@ class Mode3Widget(QWidget):
                 "duration_sec": iv.end_sec - iv.start_sec,
                 "folder": seg_name,
                 "cameras": cameras_meta,
-                "signal_file": "signal.csv" if signal_exported else None,
-                "synced_signal_path": synced_rel,
+                "hr_file": "hr.csv" if hr_exported else None,
+                "ecg_file": "ecg.csv" if ecg_exported else None,
+                "synced_hr_path": synced_hr_rel,
+                "synced_ecg_path": synced_ecg_rel,
+                "signal_file": "hr.csv" if hr_exported else None,
+                "synced_signal_path": synced_hr_rel,
                 "signal_anchor_datetime_utc": signal_anchor.isoformat() if signal_anchor else None,
                 "segment_start_datetime_utc": (
                     (signal_anchor + timedelta(seconds=iv.start_sec)).isoformat()
@@ -967,6 +1049,66 @@ class Mode3Widget(QWidget):
         self._has_exported = True
         self._status.setText(f"Exported {len(manifest_rows)} segments to {segments_dir}")
         log.info("Exported %d segments to %s", len(manifest_rows), segments_dir)
+
+    @staticmethod
+    def _relative_signal_path(path: str, seg_dir: Path) -> Optional[str]:
+        if not path or not Path(path).exists():
+            return None
+        try:
+            return os.path.relpath(path, seg_dir)
+        except ValueError:
+            return path
+
+    @staticmethod
+    def _export_signal_slice(df, anchor, interval, destination: Path) -> bool:
+        if df is None or df.empty or anchor is None:
+            return False
+        start = pd.Timestamp(anchor + timedelta(seconds=interval.start_sec))
+        end = pd.Timestamp(anchor + timedelta(seconds=interval.end_sec))
+        sub = df[(df["timestamp_utc"] >= start) & (df["timestamp_utc"] <= end)]
+        if sub.empty:
+            return False
+        sub.to_csv(destination, index=False)
+        return True
+
+    def _export_ecg_to_existing_segments(self):
+        self._export_signal_to_existing_segments("ECG", "ecg", "synced_ecg_path")
+
+    def _export_hr_to_existing_segments(self):
+        self._export_signal_to_existing_segments("HR", "hr", "synced_hr_path")
+
+    def _export_signal_to_existing_segments(self, display_name: str, file_stem: str, state_path_name: str):
+        df = self._ecg_merged_df if file_stem == "ecg" else self._hr_merged_df
+        if df is None and not self._load_synced_signal():
+            QMessageBox.warning(self, f"{display_name} unavailable", f"Load a project metadata file with a synchronized {display_name} CSV first.")
+            return
+        df = self._ecg_merged_df if file_stem == "ecg" else self._hr_merged_df
+        if df is None:
+            QMessageBox.warning(self, f"{display_name} unavailable", f"No synchronized {display_name} CSV is available.")
+            return
+        intervals = [interval for interval in self.state.intervals if interval.folder]
+        if not intervals:
+            QMessageBox.information(
+                self, "No existing segments",
+                "Import a labelled-segments manifest or export labelled segments first.",
+            )
+            return
+        anchor = self._signal_anchor()
+        if anchor is None:
+            QMessageBox.warning(self, f"{display_name} unavailable", "Video time anchor is unavailable.")
+            return
+        count = 0
+        for interval in intervals:
+            seg_dir = Path(interval.folder)
+            if not seg_dir.exists() or not self._export_signal_slice(df, anchor, interval, seg_dir / f"{file_stem}.csv"):
+                continue
+            meta_path = seg_dir / "meta.json"
+            meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+            meta[f"{file_stem}_file"] = f"{file_stem}.csv"
+            meta[state_path_name] = self._relative_signal_path(getattr(self.state, state_path_name), seg_dir)
+            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            count += 1
+        self._status.setText(f"Exported {display_name} to {count} existing segment(s).")
 
     # ------------------------------------------------------------------
     # Mosaic export for selected interval
@@ -1028,7 +1170,7 @@ class Mode3Widget(QWidget):
             total_frames=total_frames,
             video_duration_sec=duration,
             output_path=path,
-            signal_df=self._merged_df,
+            signal_df=self._hr_merged_df,
             start_sec=iv.start_sec,
             end_sec=iv.end_sec,
             quality_preset=preset_key,

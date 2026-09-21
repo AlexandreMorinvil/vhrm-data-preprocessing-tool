@@ -51,6 +51,7 @@ class VideoTrack:
     reference_video_time_sec: float = 0.0
     video_reference_datetime: Optional[str] = None
     time_correction_offset_sec: float = 0.0
+    limits_common_duration: bool = True
 
     def parsed_start_datetime(self) -> Optional[datetime]:
         if self.start_datetime is None:
@@ -90,6 +91,7 @@ class LabelInterval:
     start_sec: float = 0.0
     end_sec: float = 0.0
     color: str = "#4488cc"
+    folder: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -106,6 +108,8 @@ class ProjectState:
     num_cameras: int = 2
     tracks: list[VideoTrack] = field(default_factory=list)
     signal_paths: list[str] = field(default_factory=list)
+    hr_signal_paths: list[str] = field(default_factory=list)
+    ecg_signal_paths: list[str] = field(default_factory=list)
     include_signal_average: bool = False
     labels_library: list[str] = field(default_factory=lambda: [
         "Baseline", "Resting", "Resistance exercise", "Cardio exercise"
@@ -117,6 +121,8 @@ class ProjectState:
     ffmpeg_path: str = ""
     keep_temp_files: bool = False
     synced_signal_path: str = ""
+    synced_hr_path: str = ""
+    synced_ecg_path: str = ""
     mosaic_preset: str = "balanced"
     time_coherence_tolerance_sec: float = 1.0
     last_signal_anchor_datetime: Optional[str] = None
@@ -130,12 +136,18 @@ class ProjectState:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> ProjectState:
+        d = dict(d)
         tracks = [VideoTrack.from_dict(t) for t in d.pop("tracks", [])]
         intervals = [LabelInterval.from_dict(i) for i in d.pop("intervals", [])]
         # Backward compat: old "signal_mode" → new "include_signal_average"
         old_mode = d.pop("signal_mode", None)
         if old_mode is not None and "include_signal_average" not in d:
             d["include_signal_average"] = (old_mode == "average")
+        # Projects created before ECG support stored HR in generic signal fields.
+        if "hr_signal_paths" not in d:
+            d["hr_signal_paths"] = list(d.get("signal_paths", []))
+        if "synced_hr_path" not in d:
+            d["synced_hr_path"] = d.get("synced_signal_path", "")
         valid = {k for k in cls.__dataclass_fields__}
         filtered = {k: v for k, v in d.items() if k in valid}
         state = cls(**filtered)
@@ -165,9 +177,9 @@ class ProjectState:
 _PATH_KEYS = {
     "project_path", "output_directory", "concatenated_path",
     "trimstart_path", "final_output_path", "ffmpeg_path",
-    "synced_signal_path",
+    "synced_signal_path", "synced_hr_path", "synced_ecg_path", "folder",
 }
-_PATH_LIST_KEYS = {"segment_paths", "signal_paths"}
+_PATH_LIST_KEYS = {"segment_paths", "signal_paths", "hr_signal_paths", "ecg_signal_paths"}
 
 
 def _try_relative(p: str, base: Path) -> str:
@@ -255,12 +267,13 @@ def generate_sidecar(state: ProjectState) -> str:
             "reference_video_time_sec": t.reference_video_time_sec,
             "video_reference_datetime_utc": t.video_reference_datetime,
             "corrected_start_datetime_utc": corrected.isoformat() if corrected else None,
+            "limits_common_duration": t.limits_common_duration,
         })
 
-    common_dur = min((t.duration_sec for t in state.tracks), default=0.0)
+    common_dur = video_timeline_duration_sec(state.tracks)
 
-    synced_name = Path(state.synced_signal_path).name if state.synced_signal_path else None
-    sig_range = [0.0, common_dur] if state.synced_signal_path else None
+    hr_synced_name = Path(state.synced_hr_path).name if state.synced_hr_path else None
+    ecg_synced_name = Path(state.synced_ecg_path).name if state.synced_ecg_path else None
     anchor_dt, warnings = compute_signal_anchor(
         state.tracks, state.time_coherence_tolerance_sec
     )
@@ -271,9 +284,14 @@ def generate_sidecar(state: ProjectState) -> str:
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "cameras": cameras,
         "common_duration_sec": common_dur,
-        "signal_paths": [Path(p).name for p in state.signal_paths],
-        "synced_signal_path": synced_name,
-        "signal_time_range_sec": sig_range,
+        "hr_signal_paths": [Path(p).name for p in state.hr_signal_paths],
+        "ecg_signal_paths": [Path(p).name for p in state.ecg_signal_paths],
+        "synced_hr_path": hr_synced_name,
+        "synced_ecg_path": ecg_synced_name,
+        "hr_time_range_sec": [0.0, common_dur] if hr_synced_name else None,
+        "ecg_time_range_sec": [0.0, common_dur] if ecg_synced_name else None,
+        "signal_paths": [Path(p).name for p in state.hr_signal_paths],
+        "synced_signal_path": hr_synced_name,
         "signal_anchor_datetime_utc": anchor_iso,
         "time_coherence_tolerance_sec": state.time_coherence_tolerance_sec,
         "time_coherence_warnings": coherence_warnings,
@@ -293,6 +311,12 @@ def load_sidecar(path: str, state: ProjectState) -> None:
     base_dir = p.parent
 
     state.tracks.clear()
+    state.signal_paths.clear()
+    state.hr_signal_paths.clear()
+    state.ecg_signal_paths.clear()
+    state.synced_signal_path = ""
+    state.synced_hr_path = ""
+    state.synced_ecg_path = ""
     for i, cam in enumerate(raw.get("cameras", [])):
         video_file = cam.get("final_video_path", "")
         abs_video = str(base_dir / video_file) if video_file else ""
@@ -314,18 +338,33 @@ def load_sidecar(path: str, state: ProjectState) -> None:
             reference_video_time_sec=cam.get("reference_video_time_sec", 0.0),
             video_reference_datetime=cam.get("video_reference_datetime_utc") or None,
             time_correction_offset_sec=cam.get("time_correction_offset_sec", 0.0),
+            limits_common_duration=cam.get("limits_common_duration", True),
         )
         state.tracks.append(track)
 
     state.num_cameras = len(state.tracks)
 
     # Load signal paths relative to sidecar directory
-    sig_names = raw.get("signal_paths", [])
-    for name in sig_names:
+    hr_names = raw.get("hr_signal_paths", raw.get("signal_paths", []))
+    for name in hr_names:
         if name:
             abs_sig = str(base_dir / name)
-            if abs_sig not in state.signal_paths:
-                state.signal_paths.append(abs_sig)
+            if abs_sig not in state.hr_signal_paths:
+                state.hr_signal_paths.append(abs_sig)
+    ecg_names = raw.get("ecg_signal_paths", [])
+    for name in ecg_names:
+        if name:
+            abs_sig = str(base_dir / name)
+            if abs_sig not in state.ecg_signal_paths:
+                state.ecg_signal_paths.append(abs_sig)
+    state.signal_paths = list(state.hr_signal_paths)
+    hr_synced = raw.get("synced_hr_path", raw.get("synced_signal_path"))
+    if hr_synced:
+        state.synced_hr_path = str(base_dir / hr_synced)
+        state.synced_signal_path = state.synced_hr_path
+    ecg_synced = raw.get("synced_ecg_path")
+    if ecg_synced:
+        state.synced_ecg_path = str(base_dir / ecg_synced)
 
     state.output_directory = str(base_dir)
     state.mode1_complete = True
@@ -335,13 +374,10 @@ def load_sidecar(path: str, state: ProjectState) -> None:
     state.last_signal_anchor_datetime = raw.get("signal_anchor_datetime_utc")
     state.last_time_coherence_warnings = raw.get("time_coherence_warnings", [])
 
-    # Load synced signal path if present
-    synced_name = raw.get("synced_signal_path")
-    if synced_name:
-        abs_synced = str(base_dir / synced_name)
-        if Path(abs_synced).exists():
-            state.synced_signal_path = abs_synced
-            state.mode2_complete = True
+    state.mode2_complete = bool(
+        (state.synced_hr_path and Path(state.synced_hr_path).exists())
+        or (state.synced_ecg_path and Path(state.synced_ecg_path).exists())
+    )
 
     log.info("Loaded sidecar with %d camera(s) from %s", len(state.tracks), path)
 
@@ -380,6 +416,26 @@ def populate_tracks_from_videos(
     state.num_cameras = len(state.tracks)
     state.mode1_complete = True
     log.info("Populated %d track(s) from video files", len(state.tracks))
+
+
+def video_timeline_duration_sec(tracks: list[VideoTrack]) -> float:
+    """Return the duration used for shared signal and timeline views.
+
+    Cameras marked as not limiting size are ignored when at least one camera is
+    still allowed to limit the shared duration. If every camera is non-limiting,
+    use the longest available duration so no camera shortens the session.
+    """
+    positive_durations = [t.duration_sec for t in tracks if t.duration_sec > 0]
+    if not positive_durations:
+        return 0.0
+
+    limiting_durations = [
+        t.duration_sec for t in tracks
+        if t.duration_sec > 0 and t.limits_common_duration
+    ]
+    if limiting_durations:
+        return min(limiting_durations)
+    return max(positive_durations)
 
 
 # ---------------------------------------------------------------------------

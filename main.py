@@ -31,7 +31,15 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Video Research Tool")
-        self.resize(1400, 900)
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            self.resize(
+                min(1400, int(available.width() * 0.9)),
+                min(900, int(available.height() * 0.9)),
+            )
+        else:
+            self.resize(1400, 900)
 
         self.state = ProjectState()
         self._settings = QSettings("VideoResearchTool", "VRT")

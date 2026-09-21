@@ -26,8 +26,10 @@ from PyQt6.QtWidgets import (
 
 from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_preset
 from ..frame_export import export_player_frames
+from ..signals import read_synced_signal_csv
 from ..state import ProjectState
 from ..widgets.frame_preview import MultiCameraPlayer
+from ..widgets.layout import configure_main_splitter
 from ..widgets.signal_plot import SignalPlot
 from ..widgets.timeline import IntervalItem, TimelineWidget
 
@@ -118,8 +120,7 @@ class Mode4Widget(QWidget):
         rl.addWidget(self._plot)
         splitter.addWidget(right)
 
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 3)
+        configure_main_splitter(splitter, left, right)
 
         self._timeline.playhead_moved.connect(self._on_playhead)
         self._player.frame_changed.connect(self._on_frame_changed)
@@ -187,9 +188,7 @@ class Mode4Widget(QWidget):
                 log.warning("Synced signal not found: %s", synced_path)
                 continue
             try:
-                df = pd.read_csv(synced_path)
-                df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
-                self._synced_signal_df = df
+                self._synced_signal_df = read_synced_signal_csv(synced_path)
                 log.info("Loaded synced signal from %s", synced_path)
             except Exception as exc:
                 log.error("Error loading synced signal: %s", exc)
@@ -264,8 +263,7 @@ class Mode4Widget(QWidget):
         signal_csv = seg_dir / signal_file if signal_file else seg_dir / "signal.csv"
         if signal_csv.exists():
             try:
-                df = pd.read_csv(signal_csv)
-                df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
+                df = read_synced_signal_csv(signal_csv)
                 self._plot.set_data(df, video_duration_sec=seg.duration_sec)
                 signal_loaded = True
             except Exception as exc:

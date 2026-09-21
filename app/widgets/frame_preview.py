@@ -9,16 +9,17 @@ import numpy as np
 from PyQt6.QtCore import Qt, QTimer, QSize, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
-    QHBoxLayout, QLabel, QSizePolicy, QSlider,
+    QGridLayout, QHBoxLayout, QLabel, QSizePolicy, QSlider,
     QPushButton, QVBoxLayout, QWidget,
 )
 
 log = logging.getLogger(__name__)
 
-_DISPLAY_MIN_SIZE = QSize(320, 180)
+_DISPLAY_MIN_SIZE = QSize(240, 135)
 _DISPLAY_MAX_HEIGHT = 360
 _DISPLAY_RESIZE_STEP = 48
 _PREVIEW_SIZE_HINT = QSize(480, 350)
+_PREVIEW_COLUMNS = 2
 
 
 class FramePreview(QWidget):
@@ -180,7 +181,7 @@ class MultiCameraPlayer(QWidget):
         self._total_frames = 0
 
         self._vlayout = QVBoxLayout(self)
-        self._preview_layout = QHBoxLayout()
+        self._preview_layout = QGridLayout()
         self._vlayout.addLayout(self._preview_layout)
 
         ctrl_row = QHBoxLayout()
@@ -213,9 +214,10 @@ class MultiCameraPlayer(QWidget):
             pw.setParent(None)
             pw.deleteLater()
         self._previews.clear()
-        for lbl in labels:
+        for index, lbl in enumerate(labels):
             pw = FramePreview(label=lbl)
-            self._preview_layout.addWidget(pw)
+            row, column = divmod(index, _PREVIEW_COLUMNS)
+            self._preview_layout.addWidget(pw, row, column)
             self._previews.append(pw)
 
     def load_videos(self, paths: list[str]) -> None:

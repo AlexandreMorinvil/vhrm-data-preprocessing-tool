@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTimeEdit,
     QVBoxLayout,
@@ -30,10 +31,10 @@ from PyQt6.QtWidgets import (
 )
 
 from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_preset
-from ..frame_export import export_player_frames
 from ..signals import (
     get_loaders,
     load_signal_files,
+    read_synced_signal_csv,
     signal_file_type_name,
     signal_long_to_wide,
 )
@@ -46,6 +47,7 @@ from ..state import (
     populate_tracks_from_videos,
     video_timeline_duration_sec,
 )
+from ..widgets.layout import configure_main_splitter
 from ..widgets.frame_preview import MultiCameraPlayer
 from ..widgets.signal_plot import SignalPlot
 
@@ -112,8 +114,8 @@ class Mode2Widget(QWidget):
     def __init__(self, state: ProjectState, parent=None):
         super().__init__(parent)
         self.state = state
-        self._signal_dfs: list[pd.DataFrame] = []
-        self._merged_df: Optional[pd.DataFrame] = None
+        self._hr_merged_df: Optional[pd.DataFrame] = None
+        self._ecg_merged_df: Optional[pd.DataFrame] = None
         self._time_rows: list[dict] = []
 
         root = QHBoxLayout(self)
@@ -155,24 +157,30 @@ class Mode2Widget(QWidget):
         info.setWordWrap(True)
         ll.addWidget(info)
 
-        self._file_list = QListWidget()
-        ll.addWidget(self._file_list)
+        hr_grp = QGroupBox("Heart-rate signals")
+        hr_lay = QVBoxLayout(hr_grp)
+        self._hr_file_list = QListWidget()
+        hr_lay.addWidget(self._hr_file_list)
+        hr_btn = QPushButton("Add HR file …")
+        hr_btn.clicked.connect(lambda: self._add_signal(self._hr_file_list, "HR"))
+        hr_lay.addWidget(hr_btn)
+        ll.addWidget(hr_grp)
 
-        btn_row = QHBoxLayout()
-        add_btn = QPushButton("Add signal file …")
-        add_btn.clicked.connect(self._add_signal)
-        btn_row.addWidget(add_btn)
-        remove_btn = QPushButton("Remove selected")
-        remove_btn.clicked.connect(self._remove_signal)
-        btn_row.addWidget(remove_btn)
-        ll.addLayout(btn_row)
+        ecg_grp = QGroupBox("ECG signals")
+        ecg_lay = QVBoxLayout(ecg_grp)
+        self._ecg_file_list = QListWidget()
+        ecg_lay.addWidget(self._ecg_file_list)
+        ecg_btn = QPushButton("Add ECG file …")
+        ecg_btn.clicked.connect(lambda: self._add_signal(self._ecg_file_list, "ECG"))
+        ecg_lay.addWidget(ecg_btn)
+        ll.addWidget(ecg_grp)
 
         self._avg_checkbox = QCheckBox("Include average column")
         self._avg_checkbox.setChecked(state.include_signal_average)
         self._avg_checkbox.toggled.connect(self._on_avg_toggled)
         ll.addWidget(self._avg_checkbox)
 
-        self._load_btn = QPushButton("Load && synchronise signals")
+        self._load_btn = QPushButton("Load && synchronise HR / ECG")
         self._load_btn.setStyleSheet("font-weight:bold; padding:8px;")
         self._load_btn.clicked.connect(self._load_and_sync)
         ll.addWidget(self._load_btn)
@@ -204,7 +212,10 @@ class Mode2Widget(QWidget):
         self._mosaic_worker: MosaicWorker | None = None
 
         ll.addStretch()
-        splitter.addWidget(left)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setWidget(left)
+        splitter.addWidget(left_scroll)
 
         right = QWidget()
         rl = QVBoxLayout(right)
@@ -213,21 +224,22 @@ class Mode2Widget(QWidget):
         self._player = MultiCameraPlayer()
         rl.addWidget(self._player)
 
+        self._plot_type = QComboBox()
+        self._plot_type.addItems(["Heart rate", "ECG"])
+        self._plot_type.currentIndexChanged.connect(self._show_selected_plot)
+        rl.addWidget(self._plot_type)
         self._plot = SignalPlot()
         rl.addWidget(self._plot)
         splitter.addWidget(right)
 
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 3)
+        configure_main_splitter(splitter, left_scroll, right)
 
         self._player.frame_changed.connect(self._on_frame_changed)
-        self._player.export_frames_requested.connect(self._export_current_frames)
 
         self._restore_from_state()
 
     def _restore_from_state(self):
-        for p in self.state.signal_paths:
-            self._file_list.addItem(self._make_signal_item(p))
+        self._refresh_signal_file_lists()
 
         if self.state.tracks:
             labels = [t.camera_label for t in self.state.tracks]
@@ -238,11 +250,31 @@ class Mode2Widget(QWidget):
                 self._player.load_videos(valid)
         self._refresh_time_correction_ui()
 
-    def _make_signal_item(self, path: str) -> QListWidgetItem:
-        sensor_type = signal_file_type_name(path)
+    def _refresh_signal_file_lists(self):
+        self._hr_file_list.clear()
+        self._ecg_file_list.clear()
+        for p in self.state.hr_signal_paths or self.state.signal_paths:
+            self._hr_file_list.addItem(self._make_signal_item(p, "HR"))
+        if self.state.synced_hr_path:
+            self._hr_file_list.addItem(self._make_synced_item(self.state.synced_hr_path, "HR"))
+        for p in self.state.ecg_signal_paths:
+            self._ecg_file_list.addItem(self._make_signal_item(p, "ECG"))
+        if self.state.synced_ecg_path:
+            self._ecg_file_list.addItem(self._make_synced_item(self.state.synced_ecg_path, "ECG"))
+
+    def _make_signal_item(self, path: str, signal_kind: str = "signal") -> QListWidgetItem:
+        sensor_type = signal_file_type_name(path) if Path(path).exists() else f"{signal_kind} source (file unavailable)"
         item = QListWidgetItem(f"{Path(path).name} — {sensor_type}")
         item.setData(Qt.ItemDataRole.UserRole, path)
         item.setToolTip(f"{path}\nDetected type: {sensor_type}")
+        return item
+
+    @staticmethod
+    def _make_synced_item(path: str, signal_kind: str) -> QListWidgetItem:
+        availability = "Synchronized" if Path(path).exists() else "Synchronized file unavailable"
+        item = QListWidgetItem(f"{Path(path).name} — {availability} {signal_kind}")
+        item.setToolTip(path)
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
         return item
 
     def _load_from_meta(self):
@@ -259,6 +291,7 @@ class Mode2Widget(QWidget):
         self._refresh_player()
         self._load_synced_signal()
         self._refresh_time_correction_ui()
+        self._refresh_signal_file_lists()
         n = len(self.state.tracks)
         self._load_status.setText(f"Loaded {n} camera(s) from sidecar.")
 
@@ -290,29 +323,39 @@ class Mode2Widget(QWidget):
 
     def _load_synced_signal(self):
         """Load synced signal CSV from state if available."""
-        sp = self.state.synced_signal_path
-        if not sp or not Path(sp).exists():
-            return
-        try:
-            df = pd.read_csv(sp)
-            df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
-            self._merged_df = df
-            video_dur = video_timeline_duration_sec(self.state.tracks)
-            self._plot.set_data(self._merged_df, video_duration_sec=video_dur)
-            self._status.setText(f"Signal loaded from {Path(sp).name}")
-        except Exception as exc:
-            log.warning("Could not load synced signal CSV: %s", exc)
+        self._hr_merged_df = None
+        self._ecg_merged_df = None
+        hr_path = self.state.synced_hr_path or self.state.synced_signal_path
+        if hr_path and Path(hr_path).exists():
+            try:
+                self._hr_merged_df = read_synced_signal_csv(hr_path)
+            except Exception as exc:
+                log.warning("Could not load synchronized HR CSV %s: %s", hr_path, exc)
+        ecg_path = self.state.synced_ecg_path
+        if ecg_path and Path(ecg_path).exists():
+            try:
+                self._ecg_merged_df = read_synced_signal_csv(ecg_path)
+            except Exception as exc:
+                log.warning("Could not load synchronized ECG CSV %s: %s", ecg_path, exc)
+        self._show_selected_plot()
+        if self._hr_merged_df is not None or self._ecg_merged_df is not None:
+            self._status.setText("Synchronized HR/ECG data loaded")
 
-    def _add_signal(self):
+    def _add_signal(self, target: QListWidget, signal_kind: str):
         files, _ = QFileDialog.getOpenFileNames(
             self, "Select signal files", "", _SIGNAL_FILTER,
         )
         for p in files:
-            self._file_list.addItem(self._make_signal_item(p))
-
-    def _remove_signal(self):
-        for item in self._file_list.selectedItems():
-            self._file_list.takeItem(self._file_list.row(item))
+            loader = signal_file_type_name(p)
+            if signal_kind == "ECG" and loader != "ECG waveform":
+                QMessageBox.warning(self, "Not an ECG file", f"{Path(p).name} is detected as {loader}.")
+                continue
+            if signal_kind == "HR" and loader == "ECG waveform":
+                QMessageBox.warning(self, "Not an HR file", f"{Path(p).name} is an ECG waveform file.")
+                continue
+            existing = self._paths_from_list(target)
+            if p not in existing:
+                target.addItem(self._make_signal_item(p))
 
     def _on_avg_toggled(self, checked):
         self.state.include_signal_average = checked
@@ -536,103 +579,89 @@ class Mode2Widget(QWidget):
         return reply == QMessageBox.StandardButton.Yes
 
     def _load_and_sync(self):
-        paths = []
-        for i in range(self._file_list.count()):
-            paths.append(self._file_list.item(i).data(Qt.ItemDataRole.UserRole))
-        if not paths:
-            QMessageBox.information(self, "Info", "No signal files selected.")
+        hr_paths = self._paths_from_list(self._hr_file_list)
+        ecg_paths = self._paths_from_list(self._ecg_file_list)
+        if not hr_paths and not ecg_paths:
+            QMessageBox.information(self, "Info", "No HR or ECG files selected.")
             return
 
-        self.state.signal_paths = paths
-        self._signal_dfs, display_type_by_path, failed_paths = load_signal_files(paths)
-        self._refresh_signal_file_labels(display_type_by_path)
-        for p in failed_paths:
-            self._status.setText(f"Warning: could not load {Path(p).name}")
-            log.warning("Failed to load signal: %s", p)
-
-        if not self._signal_dfs:
-            QMessageBox.warning(self, "Warning", "No signals could be loaded.")
-            return
-
-        merged = pd.concat(self._signal_dfs, ignore_index=True)
-
-        # Track which sensors exist before clipping
-        all_sensors = set(merged["sensor_id"].unique())
-
+        self.state.hr_signal_paths = hr_paths
+        self.state.signal_paths = list(hr_paths)
+        self.state.ecg_signal_paths = ecg_paths
+        anchor = None
+        duration = 0.0
         if self.state.tracks:
-            dt_start, coherence_warnings = self._time_anchor_and_warnings()
-            if not self._confirm_time_warnings(coherence_warnings, dt_start):
+            anchor, coherence_warnings = self._time_anchor_and_warnings()
+            if not self._confirm_time_warnings(coherence_warnings, anchor):
                 self._status.setText("Signal synchronisation cancelled after time warning.")
                 return
-            self.state.last_signal_anchor_datetime = dt_start.isoformat() if dt_start else None
+            self.state.last_signal_anchor_datetime = anchor.isoformat() if anchor else None
             self.state.last_time_coherence_warnings = coherence_warnings
-            dur = video_timeline_duration_sec(self.state.tracks)
-            if dt_start is not None:
-                from datetime import timedelta
-                dt_end = dt_start + timedelta(seconds=dur)
-                start_ts = pd.Timestamp(dt_start)
-                end_ts = pd.Timestamp(dt_end)
-                merged = merged[
-                    (merged["timestamp_utc"] >= start_ts)
-                    & (merged["timestamp_utc"] <= end_ts)
-                ]
+            duration = video_timeline_duration_sec(self.state.tracks)
 
-                # Warn about sensors that were completely filtered out
-                surviving_sensors = set(merged["sensor_id"].unique())
-                lost = all_sensors - surviving_sensors
-                if lost:
-                    QMessageBox.warning(
-                        self, "Sensors outside video range",
-                        f"The following sensor(s) had no data within the video "
-                        f"time range and were excluded:\n\n"
-                        + "\n".join(f"  • {s}" for s in sorted(lost))
-                    )
-
-        if merged.empty:
+        loaded_hr = self._load_clip_and_pivot(hr_paths, anchor, duration, self.state.include_signal_average)
+        loaded_ecg = self._load_clip_and_pivot(ecg_paths, anchor, duration, False)
+        if loaded_hr is not None:
+            self._hr_merged_df = loaded_hr
+        if loaded_ecg is not None:
+            self._ecg_merged_df = loaded_ecg
+        if self._hr_merged_df is None and self._ecg_merged_df is None:
             QMessageBox.warning(self, "Warning", "No signal data within the video time range.")
             return
 
-        wide = signal_long_to_wide(
-            merged,
-            include_average=self.state.include_signal_average,
-        )
-
-        self._merged_df = wide
-
-        video_dur = 0.0
-        if self.state.tracks:
-            video_dur = video_timeline_duration_sec(self.state.tracks)
-        self._plot.set_data(self._merged_df, video_duration_sec=video_dur)
-
-        # Export clipped signal CSV
-        csv_name = "signal_synced.csv"
         out_dir = self.state.output_directory
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
-            csv_path = str(Path(out_dir) / csv_name)
-            self._merged_df.to_csv(csv_path, index=False)
-            self.state.synced_signal_path = csv_path
-            log.info("Exported synced signal: %s", csv_path)
-
-            # Re-generate sidecar with signal info
+            if self._hr_merged_df is not None:
+                self.state.synced_hr_path = str(Path(out_dir) / "hr_synced.csv")
+                self.state.synced_signal_path = self.state.synced_hr_path
+                self._hr_merged_df.to_csv(self.state.synced_hr_path, index=False)
+            if self._ecg_merged_df is not None:
+                self.state.synced_ecg_path = str(Path(out_dir) / "ecg_synced.csv")
+                self._ecg_merged_df.to_csv(self.state.synced_ecg_path, index=False)
             try:
                 generate_sidecar(self.state)
             except Exception as exc:
                 log.warning("Could not update sidecar: %s", exc)
 
-        status_parts = [f"Loaded {len(self._merged_df)} samples from {len(self._signal_dfs)} file(s)"]
-        if self.state.synced_signal_path:
-            status_parts.append(f"Exported: {csv_name}")
-        self._status.setText(" — ".join(status_parts))
+        self._show_selected_plot()
+        status_parts = []
+        if self._hr_merged_df is not None:
+            status_parts.append(f"HR: {len(self._hr_merged_df)} samples")
+        if self._ecg_merged_df is not None:
+            status_parts.append(f"ECG: {len(self._ecg_merged_df)} samples")
+        self._status.setText("; ".join(status_parts) + ".")
         self.state.mode2_complete = True
 
-    def _refresh_signal_file_labels(self, display_type_by_path: dict[str, str]):
-        for i in range(self._file_list.count()):
-            item = self._file_list.item(i)
-            path = item.data(Qt.ItemDataRole.UserRole)
-            sensor_type = display_type_by_path.get(path, signal_file_type_name(path))
-            item.setText(f"{Path(path).name} — {sensor_type}")
-            item.setToolTip(f"{path}\nDetected type: {sensor_type}")
+    @staticmethod
+    def _paths_from_list(file_list: QListWidget) -> list[str]:
+        return [
+            path for i in range(file_list.count())
+            if (path := file_list.item(i).data(Qt.ItemDataRole.UserRole))
+        ]
+
+    def _load_clip_and_pivot(self, paths, anchor, duration, include_average):
+        if not paths:
+            return None
+        dfs, _types, failed_paths = load_signal_files(paths)
+        for path in failed_paths:
+            log.warning("Failed to load signal: %s", path)
+        if not dfs:
+            return None
+        merged = pd.concat(dfs, ignore_index=True)
+        if anchor is not None:
+            end = pd.Timestamp(anchor + timedelta(seconds=duration))
+            merged = merged[(merged["timestamp_utc"] >= pd.Timestamp(anchor)) & (merged["timestamp_utc"] <= end)]
+        if merged.empty:
+            return None
+        return signal_long_to_wide(merged, include_average=include_average)
+
+    def _show_selected_plot(self):
+        df = self._hr_merged_df if self._plot_type.currentIndex() == 0 else self._ecg_merged_df
+        if df is None:
+            self._plot.clear()
+            return
+        self._plot.set_data(df, video_duration_sec=video_timeline_duration_sec(self.state.tracks))
 
     def _skip(self):
         self.state.mode2_complete = True
@@ -693,7 +722,7 @@ class Mode2Widget(QWidget):
             total_frames=total_frames,
             video_duration_sec=duration,
             output_path=path,
-            signal_df=self._merged_df,
+            signal_df=self._hr_merged_df,
             quality_preset=preset_key,
             ffmpeg_path=self.state.ffmpeg_path,
         )
@@ -733,28 +762,3 @@ class Mode2Widget(QWidget):
         fps = self.state.tracks[0].fps or 30.0
         time_sec = frame_no / fps
         self._plot.set_cursor(time_sec)
-
-    def _export_current_frames(self):
-        if not self.state.tracks:
-            QMessageBox.warning(self, "Warning", "No videos loaded.")
-            return
-
-        out_dir = self.state.output_directory
-        if not out_dir:
-            paths = [t.final_output_path for t in self.state.tracks]
-            valid = [p for p in paths if p and Path(p).exists()]
-            out_dir = str(Path(valid[0]).parent) if valid else ""
-        if not out_dir:
-            out_dir = QFileDialog.getExistingDirectory(self, "Select capture output folder")
-            if not out_dir:
-                return
-
-        try:
-            written = export_player_frames(self._player, out_dir)
-        except Exception as exc:
-            QMessageBox.critical(self, "Synchronized capture", f"Capture export failed:\n{exc}")
-            self._status.setText(f"Capture export failed: {exc}")
-            return
-
-        capture_dir = written[0].parent
-        self._status.setText(f"Exported {len(written)} capture frame(s) to {capture_dir}")
