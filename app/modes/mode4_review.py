@@ -13,10 +13,12 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLayout,
     QListWidget,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -24,7 +26,7 @@ from PyQt6.QtWidgets import (
 
 from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_preset
 from ..frame_export import export_player_frames
-from ..signals import read_synced_signal_csv
+from ..signals import read_synced_signal_csvs
 from ..state import (
     LabelInterval,
     ProjectState,
@@ -110,22 +112,35 @@ class Mode4Widget(QWidget):
         ll.addStretch()
         splitter.addWidget(left)
 
-        right = QWidget()
-        rl = QVBoxLayout(right)
+        self._right_content = QWidget()
+        rl = QVBoxLayout(self._right_content)
         rl.setContentsMargins(4, 4, 4, 4)
+        rl.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
         self._timeline = TimelineWidget()
         self._timeline.setFixedHeight(50)
         rl.addWidget(self._timeline)
 
         self._player = MultiCameraPlayer()
+        self._player.setMinimumHeight(300)
         rl.addWidget(self._player)
 
         self._plot = SignalPlot()
+        self._plot.setFixedHeight(420)
         rl.addWidget(self._plot)
-        splitter.addWidget(right)
+        self._right_content.setMinimumHeight(850)
 
-        configure_main_splitter(splitter, left, right)
+        self._right_scroll = QScrollArea()
+        self._right_scroll.setWidgetResizable(True)
+        self._right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self._right_scroll.verticalScrollBar().setSingleStep(40)
+        self._right_scroll.verticalScrollBar().setPageStep(280)
+        self._right_scroll.setStyleSheet("QScrollBar:vertical { width: 18px; }")
+        self._right_scroll.setWidget(self._right_content)
+        splitter.addWidget(self._right_scroll)
+
+        configure_main_splitter(splitter, left, self._right_scroll)
 
         self._timeline.playhead_moved.connect(self._on_playhead)
         self._player.frame_changed.connect(self._on_frame_changed)
@@ -198,12 +213,12 @@ class Mode4Widget(QWidget):
         self.refresh_from_state()
 
     def _load_synced_signal_from_segments(self):
-        """Read first segment's meta.json to find synced_signal_path and load it."""
+        """Load shared synchronized HR files from state or segment metadata."""
         self._synced_signal_df = None
-        synced_path = self.state.synced_hr_path or self.state.synced_signal_path
-        if synced_path and Path(synced_path).exists():
+        synced_paths = [path for path in self.state.synced_hr_paths if Path(path).exists()]
+        if synced_paths:
             try:
-                self._synced_signal_df = read_synced_signal_csv(synced_path)
+                self._synced_signal_df = read_synced_signal_csvs(synced_paths)
                 return
             except Exception as exc:
                 log.error("Error loading shared synced signal: %s", exc)
@@ -217,16 +232,17 @@ class Mode4Widget(QWidget):
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
             except Exception:
                 continue
-            rel = meta.get("synced_signal_path")
-            if not rel:
-                continue
-            synced_path = (seg.dir_path / rel).resolve()
-            if not synced_path.exists():
-                log.warning("Synced signal not found: %s", synced_path)
+            relative_paths = meta.get("synced_hr_paths")
+            if relative_paths is None:
+                legacy_path = meta.get("synced_signal_path")
+                relative_paths = [legacy_path] if legacy_path else []
+            synced_paths = [(seg.dir_path / path).resolve() for path in relative_paths]
+            synced_paths = [path for path in synced_paths if path.exists()]
+            if not synced_paths:
                 continue
             try:
-                self._synced_signal_df = read_synced_signal_csv(synced_path)
-                log.info("Loaded synced signal from %s", synced_path)
+                self._synced_signal_df = read_synced_signal_csvs(synced_paths)
+                log.info("Loaded synced signals from %s", synced_paths)
             except Exception as exc:
                 log.error("Error loading synced signal: %s", exc)
             break  # only need the first valid one
@@ -292,15 +308,24 @@ class Mode4Widget(QWidget):
             self._player.set_cameras(labels)
             self._player.load_videos([str(f) for f in video_files])
         else:
+            labels = []
             self._player.set_cameras([])
+        camera_rows = max(1, (len(labels) + 1) // 2)
+        player_height = camera_rows * 190 + 70
+        self._player.setMinimumHeight(player_height)
+        self._right_content.setMinimumHeight(player_height + self._plot.height() + 140)
 
         # --- Load signal: prefer per-segment, fallback to synced slice ---
         signal_loaded = False
-        signal_file = meta.get("signal_file", "signal.csv")
-        signal_csv = seg_dir / signal_file if signal_file else seg_dir / "signal.csv"
-        if signal_csv.exists():
+        signal_files = meta.get("hr_files")
+        if signal_files is None:
+            legacy_file = meta.get("signal_file", "signal.csv")
+            signal_files = [legacy_file] if legacy_file else []
+        signal_paths = [seg_dir / file_name for file_name in signal_files]
+        signal_paths = [path for path in signal_paths if path.exists()]
+        if signal_paths:
             try:
-                df = read_synced_signal_csv(signal_csv)
+                df = read_synced_signal_csvs(signal_paths)
                 self._plot.set_data(df, video_duration_sec=seg.duration_sec)
                 signal_loaded = True
             except Exception as exc:
@@ -335,7 +360,8 @@ class Mode4Widget(QWidget):
         ]
         if meta:
             skip = {"index", "label", "start_sec", "end_sec", "duration_sec", "folder",
-                    "cameras", "signal_file", "synced_signal_path", "generated_at"}
+                "cameras", "signal_file", "hr_files", "synced_signal_path",
+                "synced_hr_paths", "generated_at"}
             for k, v in meta.items():
                 if k not in skip:
                     info_lines.append(f"{k}: {v}")

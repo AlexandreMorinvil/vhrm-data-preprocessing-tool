@@ -4,6 +4,7 @@ import abc
 import importlib
 import logging
 import pkgutil
+import re
 from collections import Counter
 from pathlib import Path
 from typing import Optional
@@ -14,6 +15,7 @@ log = logging.getLogger(__name__)
 
 SIGNAL_CORE_COLUMNS = {"timestamp_utc", "value", "sensor_id"}
 SIGNAL_AUX_PREFIX = "aux__"
+SYNCED_PRIMARY_COLUMNS = ("heart_rate_bpm", "ecg_waveform")
 
 
 class SignalLoader(abc.ABC):
@@ -89,7 +91,7 @@ def load_signal(path: str) -> Optional[pd.DataFrame]:
     loader = get_signal_loader(path)
     if loader is not None:
         log.info("Loading %s with %s", path, type(loader).__name__)
-        return _with_sensor_id(loader.load(path), _sensor_type(loader))
+        return _with_sensor_id(loader.load(path), f"{_sensor_type(loader)}_1")
     log.warning("No loader found for %s", path)
     return None
 
@@ -97,9 +99,9 @@ def load_signal(path: str) -> Optional[pd.DataFrame]:
 def load_signal_files(paths: list[str]) -> tuple[list[pd.DataFrame], dict[str, str], list[str]]:
     """Load signal files and assign type-based sensor IDs.
 
-    A single file of a type is named ``Polar``/``Zephyr``. Multiple files of the
-    same type are named ``Polar_1``, ``Polar_2`` or ``Zephyr_1``, ``Zephyr_2`` in
-    selection order. Returns ``(dataframes, display_type_by_path, failed_paths)``.
+    Files are named ``Polar_1``, ``Polar_2`` or ``Zephyr_1``, ``Zephyr_2`` in
+    selection order, including the ``_1`` suffix when only one sensor of a type
+    is loaded. Returns ``(dataframes, display_type_by_path, failed_paths)``.
     """
     entries: list[tuple[str, SignalLoader, pd.DataFrame]] = []
     display_type_by_path: dict[str, str] = {}
@@ -116,16 +118,12 @@ def load_signal_files(paths: list[str]) -> tuple[list[pd.DataFrame], dict[str, s
         log.info("Loading %s with %s", path, type(loader).__name__)
         entries.append((path, loader, loader.load(path)))
 
-    type_counts = Counter(_sensor_type(loader) for _path, loader, _df in entries)
     type_seen: Counter[str] = Counter()
     dfs: list[pd.DataFrame] = []
     for _path, loader, df in entries:
         sensor_type = _sensor_type(loader)
-        if type_counts[sensor_type] == 1:
-            sensor_id = sensor_type
-        else:
-            type_seen[sensor_type] += 1
-            sensor_id = f"{sensor_type}_{type_seen[sensor_type]}"
+        type_seen[sensor_type] += 1
+        sensor_id = f"{sensor_type}_{type_seen[sensor_type]}"
         dfs.append(_with_sensor_id(df, sensor_id))
 
     return dfs, display_type_by_path, failed_paths
@@ -147,6 +145,100 @@ def read_synced_signal_csv(path: str | Path) -> pd.DataFrame:
         errors="raise",
     )
     return df
+
+
+def _sensor_name_from_path(path: str | Path) -> str:
+    parts = Path(path).stem.split("_")
+    return "_".join(part.upper() if part.lower() == "ecg" else part.capitalize() for part in parts)
+
+
+def read_synced_signal_csvs(paths: list[str] | list[Path]) -> Optional[pd.DataFrame]:
+    """Load separated sensor CSVs, while accepting the legacy combined format."""
+    if not paths:
+        return None
+
+    frames = [read_synced_signal_csv(path) for path in paths]
+    if len(frames) == 1 and not any(
+        column in frames[0].columns for column in SYNCED_PRIMARY_COLUMNS
+    ):
+        return frames[0]
+
+    combined: Optional[pd.DataFrame] = None
+    for path, frame in zip(paths, frames):
+        primary = next(
+            (column for column in SYNCED_PRIMARY_COLUMNS if column in frame.columns),
+            None,
+        )
+        if primary is None:
+            raise ValueError(f"Separated signal CSV has no primary value column: {path}")
+        sensor = _sensor_name_from_path(path)
+        renamed = frame.rename(columns={primary: sensor}).copy()
+        renamed = renamed.rename(columns={
+            column: f"{SIGNAL_AUX_PREFIX}{sensor}__{column}"
+            for column in renamed.columns
+            if column not in {"timestamp_utc", sensor}
+        })
+        combined = renamed if combined is None else combined.merge(
+            renamed, on="timestamp_utc", how="outer"
+        )
+
+    return combined.sort_values("timestamp_utc").reset_index(drop=True) if combined is not None else None
+
+
+def signal_wide_to_device_frames(
+    frame: pd.DataFrame,
+    primary_column: str,
+) -> dict[str, pd.DataFrame]:
+    """Convert the app's wide synchronized frame to one native-rate frame per sensor."""
+    if "timestamp_utc" not in frame.columns:
+        raise ValueError("Signal data missing required column: timestamp_utc")
+
+    sensors = [
+        str(column) for column in frame.columns
+        if column != "timestamp_utc"
+        and column != "averaged"
+        and not is_aux_signal_column(str(column))
+    ]
+    all_auxiliary = [
+        str(column) for column in frame.columns if is_aux_signal_column(str(column))
+    ]
+    outputs: dict[str, pd.DataFrame] = {}
+    for sensor in sensors:
+        prefix = f"{SIGNAL_AUX_PREFIX}{sensor}__"
+        own_auxiliary = [column for column in all_auxiliary if column.startswith(prefix)]
+        if own_auxiliary:
+            native_rows = frame[own_auxiliary].notna().any(axis=1)
+        elif all_auxiliary:
+            native_rows = frame[sensor].notna() & ~frame[all_auxiliary].notna().any(axis=1)
+        else:
+            native_rows = frame[sensor].notna()
+        if not native_rows.any():
+            native_rows = frame[sensor].notna()
+
+        device = frame.loc[native_rows, ["timestamp_utc", sensor, *own_auxiliary]].copy()
+        device = device.rename(columns={sensor: primary_column})
+        device = device.rename(columns={
+            column: column.removeprefix(prefix) for column in own_auxiliary
+        })
+        outputs[sensor] = device.reset_index(drop=True)
+    return outputs
+
+
+def write_synced_signal_csvs(
+    frame: pd.DataFrame,
+    output_directory: str | Path,
+    primary_column: str,
+) -> list[str]:
+    """Write one synchronized CSV per sensor directly in the output directory."""
+    output = Path(output_directory)
+    output.mkdir(parents=True, exist_ok=True)
+    paths: list[str] = []
+    for sensor, device in signal_wide_to_device_frames(frame, primary_column).items():
+        numbered_sensor = sensor if re.search(r"_\d+$", sensor) else f"{sensor}_1"
+        path = output / f"{numbered_sensor.lower()}.csv"
+        device.to_csv(path, index=False)
+        paths.append(str(path))
+    return paths
 
 
 def signal_long_to_wide(df: pd.DataFrame, include_average: bool = False) -> pd.DataFrame:

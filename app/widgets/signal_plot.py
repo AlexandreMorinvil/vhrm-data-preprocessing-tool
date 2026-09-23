@@ -108,13 +108,19 @@ class SignalPlot(QWidget):
             ]
             self._sensor_ids = value_cols
             t0 = self._df["timestamp_utc"].iloc[0]
-            rel_sec = (self._df["timestamp_utc"] - t0).dt.total_seconds() + self._video_start_sec
             for col in value_cols:
+                valid = self._df[col].notna()
+                if not valid.any():
+                    continue
+                rel_sec = (
+                    self._df.loc[valid, "timestamp_utc"] - t0
+                ).dt.total_seconds() + self._video_start_sec
+                values = self._df.loc[valid, col]
                 if col == "averaged":
-                    self._ax.plot(rel_sec, self._df[col], label=col,
+                    self._ax.plot(rel_sec, values, label=col,
                                   linewidth=1.2, linestyle="--")
                 else:
-                    self._ax.plot(rel_sec, self._df[col], label=col, linewidth=0.8)
+                    self._ax.plot(rel_sec, values, label=col, linewidth=0.8)
 
         self._ax.set_xlabel("Time (s from video start)")
         self._ax.set_ylabel("Value")

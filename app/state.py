@@ -124,6 +124,8 @@ class ProjectState:
     synced_signal_path: str = ""
     synced_hr_path: str = ""
     synced_ecg_path: str = ""
+    synced_hr_paths: list[str] = field(default_factory=list)
+    synced_ecg_paths: list[str] = field(default_factory=list)
     segments_manifest_path: str = ""
     mosaic_preset: str = "balanced"
     time_coherence_tolerance_sec: float = 1.0
@@ -150,6 +152,12 @@ class ProjectState:
             d["hr_signal_paths"] = list(d.get("signal_paths", []))
         if "synced_hr_path" not in d:
             d["synced_hr_path"] = d.get("synced_signal_path", "")
+        if "synced_hr_paths" not in d:
+            legacy_hr = d.get("synced_hr_path") or d.get("synced_signal_path")
+            d["synced_hr_paths"] = [legacy_hr] if legacy_hr else []
+        if "synced_ecg_paths" not in d:
+            legacy_ecg = d.get("synced_ecg_path")
+            d["synced_ecg_paths"] = [legacy_ecg] if legacy_ecg else []
         valid = {k for k in cls.__dataclass_fields__}
         filtered = {k: v for k, v in d.items() if k in valid}
         state = cls(**filtered)
@@ -182,7 +190,10 @@ _PATH_KEYS = {
     "synced_signal_path", "synced_hr_path", "synced_ecg_path",
     "segments_manifest_path", "folder",
 }
-_PATH_LIST_KEYS = {"segment_paths", "signal_paths", "hr_signal_paths", "ecg_signal_paths"}
+_PATH_LIST_KEYS = {
+    "segment_paths", "signal_paths", "hr_signal_paths", "ecg_signal_paths",
+    "synced_hr_paths", "synced_ecg_paths",
+}
 
 
 def _try_relative(p: str, base: Path) -> str:
@@ -308,8 +319,8 @@ def generate_sidecar(state: ProjectState) -> str:
 
     common_dur = video_timeline_duration_sec(state.tracks)
 
-    hr_synced_name = Path(state.synced_hr_path).name if state.synced_hr_path else None
-    ecg_synced_name = Path(state.synced_ecg_path).name if state.synced_ecg_path else None
+    hr_synced_names = [Path(path).name for path in state.synced_hr_paths]
+    ecg_synced_names = [Path(path).name for path in state.synced_ecg_paths]
     anchor_dt, warnings = compute_signal_anchor(
         state.tracks, state.time_coherence_tolerance_sec
     )
@@ -322,12 +333,11 @@ def generate_sidecar(state: ProjectState) -> str:
         "common_duration_sec": common_dur,
         "hr_signal_paths": [Path(p).name for p in state.hr_signal_paths],
         "ecg_signal_paths": [Path(p).name for p in state.ecg_signal_paths],
-        "synced_hr_path": hr_synced_name,
-        "synced_ecg_path": ecg_synced_name,
-        "hr_time_range_sec": [0.0, common_dur] if hr_synced_name else None,
-        "ecg_time_range_sec": [0.0, common_dur] if ecg_synced_name else None,
+        "synced_hr_paths": hr_synced_names,
+        "synced_ecg_paths": ecg_synced_names,
+        "hr_time_range_sec": [0.0, common_dur] if hr_synced_names else None,
+        "ecg_time_range_sec": [0.0, common_dur] if ecg_synced_names else None,
         "signal_paths": [Path(p).name for p in state.hr_signal_paths],
-        "synced_signal_path": hr_synced_name,
         "signal_anchor_datetime_utc": anchor_iso,
         "time_coherence_tolerance_sec": state.time_coherence_tolerance_sec,
         "time_coherence_warnings": coherence_warnings,
@@ -353,6 +363,8 @@ def load_sidecar(path: str, state: ProjectState) -> None:
     state.synced_signal_path = ""
     state.synced_hr_path = ""
     state.synced_ecg_path = ""
+    state.synced_hr_paths.clear()
+    state.synced_ecg_paths.clear()
     for i, cam in enumerate(raw.get("cameras", [])):
         video_file = cam.get("final_video_path", "")
         abs_video = str(base_dir / video_file) if video_file else ""
@@ -394,13 +406,16 @@ def load_sidecar(path: str, state: ProjectState) -> None:
             if abs_sig not in state.ecg_signal_paths:
                 state.ecg_signal_paths.append(abs_sig)
     state.signal_paths = list(state.hr_signal_paths)
-    hr_synced = raw.get("synced_hr_path", raw.get("synced_signal_path"))
-    if hr_synced:
-        state.synced_hr_path = str(base_dir / hr_synced)
-        state.synced_signal_path = state.synced_hr_path
-    ecg_synced = raw.get("synced_ecg_path")
-    if ecg_synced:
-        state.synced_ecg_path = str(base_dir / ecg_synced)
+    hr_synced_names = raw.get("synced_hr_paths")
+    if hr_synced_names is None:
+        legacy_hr = raw.get("synced_hr_path", raw.get("synced_signal_path"))
+        hr_synced_names = [legacy_hr] if legacy_hr else []
+    state.synced_hr_paths = [str(base_dir / name) for name in hr_synced_names if name]
+    ecg_synced_names = raw.get("synced_ecg_paths")
+    if ecg_synced_names is None:
+        legacy_ecg = raw.get("synced_ecg_path")
+        ecg_synced_names = [legacy_ecg] if legacy_ecg else []
+    state.synced_ecg_paths = [str(base_dir / name) for name in ecg_synced_names if name]
 
     state.output_directory = str(base_dir)
     state.mode1_complete = True
@@ -411,8 +426,8 @@ def load_sidecar(path: str, state: ProjectState) -> None:
     state.last_time_coherence_warnings = raw.get("time_coherence_warnings", [])
 
     state.mode2_complete = bool(
-        (state.synced_hr_path and Path(state.synced_hr_path).exists())
-        or (state.synced_ecg_path and Path(state.synced_ecg_path).exists())
+        any(Path(path).exists() for path in state.synced_hr_paths)
+        or any(Path(path).exists() for path in state.synced_ecg_paths)
     )
 
     log.info("Loaded sidecar with %d camera(s) from %s", len(state.tracks), path)

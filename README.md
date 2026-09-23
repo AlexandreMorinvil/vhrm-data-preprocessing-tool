@@ -20,11 +20,15 @@ python main.py
 1. **Preprocessing** — select video segments per camera, concatenate, audio-sync,
    and trim to common start/duration.
 2. **Signal synchronisation** — import HR and ECG CSV files separately, align
-   both with the video timeline, and write separate `hr_synced.csv` and
-   `ecg_synced.csv` files. Select the plot type to view one signal at a time.
+   them with the video timeline, and write one CSV per sensor directly in the
+   project output folder (for example, `polar_1.csv`, `polar_2.csv`,
+   `zephyr_1.csv`, or `ecg_1.csv`). Sensor numbering always starts at `_1`,
+   even when only one sensor of that type is loaded. Select the plot type to view one signal kind at
+   a time. Legacy projects containing combined synchronized CSVs remain
+   supported.
 3. **Labelling** — drag intervals on the timeline, assign labels, export each
-   labelled segment as a folder with trimmed video plus separate `hr.csv` and
-   `ecg.csv` files. To reuse existing segment folders, load the project metadata,
+   labelled segment as a folder with trimmed video plus one CSV per sensor. To
+   reuse existing segment folders, load the project metadata,
    import their `manifest.csv`, then use **Export ECG to existing segments** or
    **Export HR to existing segments** after adding or synchronizing the respective
    signal. These exports use the imported intervals directly without asking for

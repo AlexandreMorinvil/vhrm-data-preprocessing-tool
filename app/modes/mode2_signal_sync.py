@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLayout,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
@@ -34,9 +35,10 @@ from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_
 from ..signals import (
     get_loaders,
     load_signal_files,
-    read_synced_signal_csv,
+    read_synced_signal_csvs,
     signal_file_type_name,
     signal_long_to_wide,
+    write_synced_signal_csvs,
 )
 from ..state import (
     ProjectState,
@@ -157,28 +159,43 @@ class Mode2Widget(QWidget):
         info.setWordWrap(True)
         ll.addWidget(info)
 
-        hr_grp = QGroupBox("Heart-rate signals")
+        sources_grp = QGroupBox("Source signal files")
+        sources_lay = QVBoxLayout(sources_grp)
+
+        hr_grp = QGroupBox("Heart rate")
         hr_lay = QVBoxLayout(hr_grp)
         self._hr_file_list = QListWidget()
         hr_lay.addWidget(self._hr_file_list)
         hr_btn = QPushButton("Add HR file …")
         hr_btn.clicked.connect(lambda: self._add_signal(self._hr_file_list, "HR"))
         hr_lay.addWidget(hr_btn)
-        ll.addWidget(hr_grp)
+        sources_lay.addWidget(hr_grp)
 
-        ecg_grp = QGroupBox("ECG signals")
+        ecg_grp = QGroupBox("ECG")
         ecg_lay = QVBoxLayout(ecg_grp)
         self._ecg_file_list = QListWidget()
         ecg_lay.addWidget(self._ecg_file_list)
         ecg_btn = QPushButton("Add ECG file …")
         ecg_btn.clicked.connect(lambda: self._add_signal(self._ecg_file_list, "ECG"))
         ecg_lay.addWidget(ecg_btn)
-        ll.addWidget(ecg_grp)
+        sources_lay.addWidget(ecg_grp)
+        ll.addWidget(sources_grp)
 
-        self._avg_checkbox = QCheckBox("Include average column")
-        self._avg_checkbox.setChecked(state.include_signal_average)
-        self._avg_checkbox.toggled.connect(self._on_avg_toggled)
-        ll.addWidget(self._avg_checkbox)
+        synced_grp = QGroupBox("Generated synchronized files")
+        synced_grp.setStyleSheet(
+            "QGroupBox { font-weight: bold; border: 1px solid #5b8def; "
+            "margin-top: 8px; padding-top: 8px; }"
+        )
+        synced_lay = QGridLayout(synced_grp)
+        synced_lay.addWidget(QLabel("Heart rate"), 0, 0)
+        synced_lay.addWidget(QLabel("ECG"), 0, 1)
+        self._synced_hr_file_list = QListWidget()
+        self._synced_ecg_file_list = QListWidget()
+        self._synced_hr_file_list.setMinimumHeight(72)
+        self._synced_ecg_file_list.setMinimumHeight(72)
+        synced_lay.addWidget(self._synced_hr_file_list, 1, 0)
+        synced_lay.addWidget(self._synced_ecg_file_list, 1, 1)
+        ll.addWidget(synced_grp)
 
         self._load_btn = QPushButton("Load && synchronise HR / ECG")
         self._load_btn.setStyleSheet("font-weight:bold; padding:8px;")
@@ -217,11 +234,13 @@ class Mode2Widget(QWidget):
         left_scroll.setWidget(left)
         splitter.addWidget(left_scroll)
 
-        right = QWidget()
-        rl = QVBoxLayout(right)
+        self._right_content = QWidget()
+        rl = QVBoxLayout(self._right_content)
         rl.setContentsMargins(4, 4, 4, 4)
+        rl.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
         self._player = MultiCameraPlayer()
+        self._player.setMinimumHeight(300)
         rl.addWidget(self._player)
 
         self._plot_type = QComboBox()
@@ -229,10 +248,20 @@ class Mode2Widget(QWidget):
         self._plot_type.currentIndexChanged.connect(self._show_selected_plot)
         rl.addWidget(self._plot_type)
         self._plot = SignalPlot()
+        self._plot.setFixedHeight(420)
         rl.addWidget(self._plot)
-        splitter.addWidget(right)
 
-        configure_main_splitter(splitter, left_scroll, right)
+        self._right_scroll = QScrollArea()
+        self._right_scroll.setWidgetResizable(True)
+        self._right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self._right_scroll.verticalScrollBar().setSingleStep(40)
+        self._right_scroll.verticalScrollBar().setPageStep(280)
+        self._right_scroll.setStyleSheet("QScrollBar:vertical { width: 18px; }")
+        self._right_scroll.setWidget(self._right_content)
+        splitter.addWidget(self._right_scroll)
+
+        configure_main_splitter(splitter, left_scroll, self._right_scroll)
 
         self._player.frame_changed.connect(self._on_frame_changed)
 
@@ -247,14 +276,16 @@ class Mode2Widget(QWidget):
     def _refresh_signal_file_lists(self):
         self._hr_file_list.clear()
         self._ecg_file_list.clear()
+        self._synced_hr_file_list.clear()
+        self._synced_ecg_file_list.clear()
         for p in self.state.hr_signal_paths or self.state.signal_paths:
             self._hr_file_list.addItem(self._make_signal_item(p, "HR"))
-        if self.state.synced_hr_path:
-            self._hr_file_list.addItem(self._make_synced_item(self.state.synced_hr_path, "HR"))
+        for path in self.state.synced_hr_paths:
+            self._synced_hr_file_list.addItem(self._make_synced_item(path, "HR"))
         for p in self.state.ecg_signal_paths:
             self._ecg_file_list.addItem(self._make_signal_item(p, "ECG"))
-        if self.state.synced_ecg_path:
-            self._ecg_file_list.addItem(self._make_synced_item(self.state.synced_ecg_path, "ECG"))
+        for path in self.state.synced_ecg_paths:
+            self._synced_ecg_file_list.addItem(self._make_synced_item(path, "ECG"))
 
     def _make_signal_item(self, path: str, signal_kind: str = "signal") -> QListWidgetItem:
         sensor_type = signal_file_type_name(path) if Path(path).exists() else f"{signal_kind} source (file unavailable)"
@@ -265,9 +296,10 @@ class Mode2Widget(QWidget):
 
     @staticmethod
     def _make_synced_item(path: str, signal_kind: str) -> QListWidgetItem:
-        availability = "Synchronized" if Path(path).exists() else "Synchronized file unavailable"
-        item = QListWidgetItem(f"{Path(path).name} — {availability} {signal_kind}")
-        item.setToolTip(path)
+        exists = Path(path).exists()
+        availability = "Ready" if exists else "File unavailable"
+        item = QListWidgetItem(f"{Path(path).name} — {availability}")
+        item.setToolTip(f"Generated synchronized {signal_kind} file\n{path}")
         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
         return item
 
@@ -309,6 +341,10 @@ class Mode2Widget(QWidget):
         """Reload the player/plot from the current state.tracks."""
         labels = [t.camera_label for t in self.state.tracks]
         self._player.set_cameras(labels)
+        camera_rows = max(1, (len(labels) + 1) // 2)
+        player_height = camera_rows * 190 + 70
+        self._player.setMinimumHeight(player_height)
+        self._right_content.setMinimumHeight(player_height + self._plot.height() + 70)
         paths = [t.final_output_path for t in self.state.tracks]
         valid = [p for p in paths if p and Path(p).exists()]
         if valid:
@@ -318,18 +354,18 @@ class Mode2Widget(QWidget):
         """Load synced signal CSV from state if available."""
         self._hr_merged_df = None
         self._ecg_merged_df = None
-        hr_path = self.state.synced_hr_path or self.state.synced_signal_path
-        if hr_path and Path(hr_path).exists():
+        hr_paths = [path for path in self.state.synced_hr_paths if Path(path).exists()]
+        if hr_paths:
             try:
-                self._hr_merged_df = read_synced_signal_csv(hr_path)
+                self._hr_merged_df = read_synced_signal_csvs(hr_paths)
             except Exception as exc:
-                log.warning("Could not load synchronized HR CSV %s: %s", hr_path, exc)
-        ecg_path = self.state.synced_ecg_path
-        if ecg_path and Path(ecg_path).exists():
+                log.warning("Could not load synchronized HR CSVs %s: %s", hr_paths, exc)
+        ecg_paths = [path for path in self.state.synced_ecg_paths if Path(path).exists()]
+        if ecg_paths:
             try:
-                self._ecg_merged_df = read_synced_signal_csv(ecg_path)
+                self._ecg_merged_df = read_synced_signal_csvs(ecg_paths)
             except Exception as exc:
-                log.warning("Could not load synchronized ECG CSV %s: %s", ecg_path, exc)
+                log.warning("Could not load synchronized ECG CSVs %s: %s", ecg_paths, exc)
         self._show_selected_plot()
         if self._hr_merged_df is not None or self._ecg_merged_df is not None:
             self._status.setText("Synchronized HR/ECG data loaded")
@@ -349,9 +385,6 @@ class Mode2Widget(QWidget):
             existing = self._paths_from_list(target)
             if p not in existing:
                 target.addItem(self._make_signal_item(p))
-
-    def _on_avg_toggled(self, checked):
-        self.state.include_signal_average = checked
 
     # ------------------------------------------------------------------
     # Camera time correction
@@ -592,7 +625,7 @@ class Mode2Widget(QWidget):
             self.state.last_time_coherence_warnings = coherence_warnings
             duration = video_timeline_duration_sec(self.state.tracks)
 
-        loaded_hr = self._load_clip_and_pivot(hr_paths, anchor, duration, self.state.include_signal_average)
+        loaded_hr = self._load_clip_and_pivot(hr_paths, anchor, duration, False)
         loaded_ecg = self._load_clip_and_pivot(ecg_paths, anchor, duration, False)
         if loaded_hr is not None:
             self._hr_merged_df = loaded_hr
@@ -606,17 +639,22 @@ class Mode2Widget(QWidget):
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
             if self._hr_merged_df is not None:
-                self.state.synced_hr_path = str(Path(out_dir) / "hr_synced.csv")
-                self.state.synced_signal_path = self.state.synced_hr_path
-                self._hr_merged_df.to_csv(self.state.synced_hr_path, index=False)
+                self.state.synced_hr_paths = write_synced_signal_csvs(
+                    self._hr_merged_df, out_dir, "heart_rate_bpm"
+                )
+                self.state.synced_hr_path = ""
+                self.state.synced_signal_path = ""
             if self._ecg_merged_df is not None:
-                self.state.synced_ecg_path = str(Path(out_dir) / "ecg_synced.csv")
-                self._ecg_merged_df.to_csv(self.state.synced_ecg_path, index=False)
+                self.state.synced_ecg_paths = write_synced_signal_csvs(
+                    self._ecg_merged_df, out_dir, "ecg_waveform"
+                )
+                self.state.synced_ecg_path = ""
             try:
                 generate_sidecar(self.state)
             except Exception as exc:
                 log.warning("Could not update sidecar: %s", exc)
 
+        self._refresh_signal_file_lists()
         self._show_selected_plot()
         status_parts = []
         if self._hr_merged_df is not None:
