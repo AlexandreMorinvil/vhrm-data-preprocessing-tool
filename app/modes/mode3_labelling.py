@@ -46,6 +46,7 @@ from ..state import (
     ProjectState,
     compute_signal_anchor,
     format_time_coherence_warnings,
+    load_labelled_segments_manifest,
     load_sidecar,
     populate_tracks_from_videos,
     video_timeline_duration_sec,
@@ -304,30 +305,21 @@ class Mode3Widget(QWidget):
         self._ed_start.timeChanged.connect(self._update_editor_duration)
         self._ed_end.timeChanged.connect(self._update_editor_duration)
 
-        self._restore_from_state()
+        self.refresh_from_state()
 
-    def _restore_from_state(self):
+    def refresh_from_state(self):
+        self._lib_list.clear()
+        self._label_combo.clear()
         for lbl in self.state.labels_library:
             self._lib_list.addItem(lbl)
             self._label_combo.addItem(lbl)
+        for interval in self.state.intervals:
+            interval.color = colour_for_label(interval.label, self.state.labels_library)
 
-        if self.state.tracks:
-            labels = [t.camera_label for t in self.state.tracks]
-            self._player.set_cameras(labels)
-            paths = [t.final_output_path for t in self.state.tracks]
-            valid = [p for p in paths if p and Path(p).exists()]
-            if valid:
-                self._player.load_videos(valid)
-
-            dur = video_timeline_duration_sec(self.state.tracks)
-            self._timeline.set_duration(dur)
-
-        items = []
-        for iv in self.state.intervals:
-            items.append(IntervalItem(iv.label, iv.start_sec, iv.end_sec, iv.color))
-        self._timeline.set_intervals(items)
-        self._plot.set_intervals(self.state.intervals)
-
+        self._refresh_from_tracks()
+        self._sync_timeline()
+        self._hr_merged_df = None
+        self._ecg_merged_df = None
         if not self._load_synced_signal():
             self._load_signals()
         self._refresh_time_summary()
@@ -410,15 +402,14 @@ class Mode3Widget(QWidget):
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to load metadata:\n{exc}")
             return
-        self._refresh_from_tracks()
-        self._refresh_time_summary()
-        if not self._load_synced_signal():
-            self._load_signals()
+        self.refresh_from_state()
         n = len(self.state.tracks)
         self._load_status.setText(f"Loaded {n} camera(s) from sidecar.")
 
     def _import_segments_manifest(self):
-        default_path = str(Path(self.state.output_directory) / "labelled_segments" / "manifest.csv")
+        default_path = self.state.segments_manifest_path or str(
+            Path(self.state.output_directory) / "labelled_segments" / "manifest.csv"
+        )
         path, _ = QFileDialog.getOpenFileName(
             self, "Select labelled-segments manifest", default_path,
             "CSV (*.csv);;All files (*)",
@@ -426,46 +417,20 @@ class Mode3Widget(QWidget):
         if not path:
             return
         try:
-            intervals = self._read_manifest_intervals(path)
+            intervals = load_labelled_segments_manifest(path, self.state)
         except (OSError, KeyError, TypeError, ValueError) as exc:
             QMessageBox.critical(self, "Invalid manifest", f"Failed to import labelled segments:\n{exc}")
             return
-        self.state.intervals = intervals
+        self._lib_list.clear()
+        self._label_combo.clear()
+        for label in self.state.labels_library:
+            self._lib_list.addItem(label)
+            self._label_combo.addItem(label)
         for interval in intervals:
-            if interval.label and interval.label not in self.state.labels_library:
-                self.state.labels_library.append(interval.label)
-                self._lib_list.addItem(interval.label)
-                self._label_combo.addItem(interval.label)
             interval.color = colour_for_label(interval.label, self.state.labels_library)
         self._sync_timeline()
         self._editor_grp.setVisible(False)
         self._load_status.setText(f"Imported {len(intervals)} labelled segment(s) from {Path(path).name}.")
-
-    def _read_manifest_intervals(self, path: str) -> list[LabelInterval]:
-        intervals = []
-        with open(path, newline="", encoding="utf-8") as file:
-            for row in csv.DictReader(file):
-                label = (row.get("label") or "").strip()
-                start_sec = float(row["start_sec"])
-                end_sec = float(row["end_sec"])
-                folder = (row.get("folder") or "").strip()
-                if not label:
-                    raise ValueError("A segment has no label.")
-                if start_sec >= end_sec:
-                    raise ValueError(f"Segment '{label}' must end after it starts.")
-                if not folder:
-                    raise ValueError(f"Segment '{label}' has no folder.")
-                intervals.append(LabelInterval(
-                    label=label,
-                    start_sec=start_sec,
-                    end_sec=end_sec,
-                    color=colour_for_label(label, self.state.labels_library),
-                    folder=str(Path(path).parent / folder),
-                ))
-        if not intervals:
-            raise ValueError("The manifest contains no segments.")
-        intervals.sort(key=lambda interval: interval.start_sec)
-        return intervals
 
     def _load_from_videos(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -545,15 +510,13 @@ class Mode3Widget(QWidget):
 
     def _refresh_from_tracks(self):
         """Reload player and timeline from the current state.tracks."""
-        if self.state.tracks:
-            labels = [t.camera_label for t in self.state.tracks]
-            self._player.set_cameras(labels)
-            paths = [t.final_output_path for t in self.state.tracks]
-            valid = [p for p in paths if p and Path(p).exists()]
-            if valid:
-                self._player.load_videos(valid)
-            dur = video_timeline_duration_sec(self.state.tracks)
-            self._timeline.set_duration(dur)
+        labels = [t.camera_label for t in self.state.tracks]
+        self._player.set_cameras(labels)
+        paths = [t.final_output_path for t in self.state.tracks]
+        valid = [p for p in paths if p and Path(p).exists()]
+        if valid:
+            self._player.load_videos(valid)
+        self._timeline.set_duration(video_timeline_duration_sec(self.state.tracks))
 
     def _clear_time_summary(self):
         while self._time_summary_grid.count():
@@ -1044,6 +1007,7 @@ class Mode3Widget(QWidget):
             writer = csv.DictWriter(f, fieldnames=["index", "label", "start_sec", "end_sec", "duration_sec", "folder"])
             writer.writeheader()
             writer.writerows(manifest_rows)
+        self.state.segments_manifest_path = str(manifest_path)
 
         self._progress.setValue(100)
         self._has_exported = True

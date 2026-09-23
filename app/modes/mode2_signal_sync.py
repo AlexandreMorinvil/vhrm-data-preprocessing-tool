@@ -236,18 +236,12 @@ class Mode2Widget(QWidget):
 
         self._player.frame_changed.connect(self._on_frame_changed)
 
-        self._restore_from_state()
+        self.refresh_from_state()
 
-    def _restore_from_state(self):
+    def refresh_from_state(self):
         self._refresh_signal_file_lists()
-
-        if self.state.tracks:
-            labels = [t.camera_label for t in self.state.tracks]
-            self._player.set_cameras(labels)
-            paths = [t.final_output_path for t in self.state.tracks]
-            valid = [p for p in paths if p and Path(p).exists()]
-            if valid:
-                self._player.load_videos(valid)
+        self._refresh_player()
+        self._load_synced_signal()
         self._refresh_time_correction_ui()
 
     def _refresh_signal_file_lists(self):
@@ -313,13 +307,12 @@ class Mode2Widget(QWidget):
 
     def _refresh_player(self):
         """Reload the player/plot from the current state.tracks."""
-        if self.state.tracks:
-            labels = [t.camera_label for t in self.state.tracks]
-            self._player.set_cameras(labels)
-            paths = [t.final_output_path for t in self.state.tracks]
-            valid = [p for p in paths if p and Path(p).exists()]
-            if valid:
-                self._player.load_videos(valid)
+        labels = [t.camera_label for t in self.state.tracks]
+        self._player.set_cameras(labels)
+        paths = [t.final_output_path for t in self.state.tracks]
+        valid = [p for p in paths if p and Path(p).exists()]
+        if valid:
+            self._player.load_videos(valid)
 
     def _load_synced_signal(self):
         """Load synced signal CSV from state if available."""

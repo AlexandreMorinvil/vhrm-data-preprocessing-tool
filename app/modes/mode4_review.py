@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import json
 import logging
 from pathlib import Path
@@ -15,7 +14,6 @@ from PyQt6.QtWidgets import (
     QInputDialog,
     QLabel,
     QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -27,7 +25,12 @@ from PyQt6.QtWidgets import (
 from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_preset
 from ..frame_export import export_player_frames
 from ..signals import read_synced_signal_csv
-from ..state import ProjectState
+from ..state import (
+    LabelInterval,
+    ProjectState,
+    load_labelled_segments_manifest,
+    load_sidecar,
+)
 from ..widgets.frame_preview import MultiCameraPlayer
 from ..widgets.layout import configure_main_splitter
 from ..widgets.signal_plot import SignalPlot
@@ -37,21 +40,20 @@ log = logging.getLogger(__name__)
 
 
 class _SegmentInfo:
-    __slots__ = ("index", "label", "start_sec", "end_sec", "duration_sec", "folder", "base_dir", "color")
+    __slots__ = ("index", "label", "start_sec", "end_sec", "duration_sec", "folder", "color")
 
-    def __init__(self, row: dict, base_dir: Path):
-        self.index = int(row.get("index", 0))
-        self.label = row.get("label", "")
-        self.start_sec = float(row.get("start_sec", 0))
-        self.end_sec = float(row.get("end_sec", 0))
-        self.duration_sec = float(row.get("duration_sec", 0))
-        self.folder = row.get("folder", "")
-        self.base_dir = base_dir
-        self.color = "#4488cc"
+    def __init__(self, index: int, interval: LabelInterval):
+        self.index = index
+        self.label = interval.label
+        self.start_sec = interval.start_sec
+        self.end_sec = interval.end_sec
+        self.duration_sec = interval.end_sec - interval.start_sec
+        self.folder = interval.folder
+        self.color = interval.color
 
     @property
     def dir_path(self) -> Path:
-        return self.base_dir / self.folder
+        return Path(self.folder)
 
 
 class Mode4Widget(QWidget):
@@ -72,6 +74,9 @@ class Mode4Widget(QWidget):
         ll = QVBoxLayout(left)
         ll.setContentsMargins(4, 4, 4, 4)
 
+        self._meta_btn = QPushButton("Load from metadata file …")
+        self._meta_btn.clicked.connect(self._load_from_meta)
+        ll.addWidget(self._meta_btn)
         self._load_btn = QPushButton("Load manifest CSV …")
         self._load_btn.clicked.connect(self._load_manifest)
         ll.addWidget(self._load_btn)
@@ -126,50 +131,82 @@ class Mode4Widget(QWidget):
         self._player.frame_changed.connect(self._on_frame_changed)
         self._player.export_frames_requested.connect(self._export_current_frames)
 
-    def _load_manifest(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select manifest.csv", "", "CSV (*.csv);;All files (*)",
-        )
-        if not path:
-            return
-        base_dir = Path(path).parent
-        self._segments.clear()
+        self.refresh_from_state()
+
+    def refresh_from_state(self):
+        self._segments = [
+            _SegmentInfo(index, interval)
+            for index, interval in enumerate(self.state.intervals)
+            if interval.folder
+        ]
         self._seg_list.clear()
-        self._synced_signal_df = None
         self._current_seg = None
-
-        with open(path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                seg = _SegmentInfo(row, base_dir)
-                self._segments.append(seg)
-                item = QListWidgetItem(f"[{seg.index}] {seg.label}  ({seg.duration_sec:.1f}s)")
-                self._seg_list.addItem(item)
-
-        # --- Discover synced signal from first segment's meta.json ---
+        self._seg_signal_df = None
+        for segment in self._segments:
+            self._seg_list.addItem(
+                f"[{segment.index}] {segment.label}  ({segment.duration_sec:.1f}s)"
+            )
         self._load_synced_signal_from_segments()
-
-        # --- Timeline setup ---
-        total_dur = sum(s.end_sec - s.start_sec for s in self._segments)
-        self._timeline.set_duration(total_dur)
-        items = []
+        total_duration = sum(segment.duration_sec for segment in self._segments)
+        self._timeline.set_duration(total_duration)
         offset = 0.0
-        for seg in self._segments:
-            dur = seg.end_sec - seg.start_sec
-            items.append(IntervalItem(seg.label, offset, offset + dur, seg.color))
-            offset += dur
+        items = []
+        for segment in self._segments:
+            items.append(IntervalItem(
+                segment.label, offset, offset + segment.duration_sec, segment.color,
+            ))
+            offset += segment.duration_sec
         self._timeline.set_intervals(items)
-
-        # --- Show signal overview with shaded regions ---
         if self._synced_signal_df is not None:
             self._show_signal_overview()
         else:
             self._plot.clear()
+        if self._segments:
+            source = Path(self.state.segments_manifest_path).name if self.state.segments_manifest_path else "shared project state"
+            self._info_label.setText(f"Loaded {len(self._segments)} segments from {source}")
+        else:
+            self._info_label.setText("No labelled segments loaded.")
 
-        self._info_label.setText(f"Loaded {len(self._segments)} segments from {Path(path).name}")
+    def _load_from_meta(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select metadata sidecar", "", "Metadata sidecar (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            load_sidecar(path, self.state)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to load metadata:\n{exc}")
+            return
+        self.refresh_from_state()
+        self._info_label.setText(f"Loaded {len(self.state.tracks)} camera(s) from metadata.")
+
+    def _load_manifest(self):
+        default_path = self.state.segments_manifest_path or str(
+            Path(self.state.output_directory) / "labelled_segments" / "manifest.csv"
+        )
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select manifest.csv", default_path, "CSV (*.csv);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            load_labelled_segments_manifest(path, self.state)
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            QMessageBox.critical(self, "Invalid manifest", f"Failed to import labelled segments:\n{exc}")
+            return
+        self.refresh_from_state()
 
     def _load_synced_signal_from_segments(self):
         """Read first segment's meta.json to find synced_signal_path and load it."""
+        self._synced_signal_df = None
+        synced_path = self.state.synced_hr_path or self.state.synced_signal_path
+        if synced_path and Path(synced_path).exists():
+            try:
+                self._synced_signal_df = read_synced_signal_csv(synced_path)
+                return
+            except Exception as exc:
+                log.error("Error loading shared synced signal: %s", exc)
         if not self._segments:
             return
         for seg in self._segments:

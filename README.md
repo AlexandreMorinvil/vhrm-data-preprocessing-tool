@@ -31,6 +31,11 @@ python main.py
    the manifest again.
 4. **Review** — load a manifest CSV to browse through exported segments.
 
+Metadata, synchronized signals, and imported labelled-segment manifests are
+shared between Signal sync, Labelling, and Review. Switching sections refreshes
+the destination view from the same project state, regardless of which section
+performed the import.
+
 ## Adding a signal loader
 
 Place a new Python module in `app/signals/`.  Implement the `SignalLoader` ABC

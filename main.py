@@ -124,7 +124,7 @@ class MainWindow(QMainWindow):
 
     def _ensure_mode_widget(self, index: int):
         if self._mode_widgets[index] is not None:
-            return
+            return False
         if index == 0:
             from app.modes.mode1_preprocessing import Mode1Widget
             w = Mode1Widget(self.state)
@@ -141,10 +141,16 @@ class MainWindow(QMainWindow):
             w = QWidget()
         self._mode_widgets[index] = w
         self._stack.addWidget(w)
+        return True
 
     def _on_tab_changed(self, index: int):
-        self._ensure_mode_widget(index)
-        self._stack.setCurrentWidget(self._mode_widgets[index])
+        created = self._ensure_mode_widget(index)
+        widget = self._mode_widgets[index]
+        if not created:
+            refresh = getattr(widget, "refresh_from_state", None)
+            if refresh is not None:
+                refresh()
+        self._stack.setCurrentWidget(widget)
         self.state.active_mode = index + 1
         self.statusBar().showMessage(f"Mode {index + 1}", 3000)
 

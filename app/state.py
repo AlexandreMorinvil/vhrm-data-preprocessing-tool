@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
@@ -123,6 +124,7 @@ class ProjectState:
     synced_signal_path: str = ""
     synced_hr_path: str = ""
     synced_ecg_path: str = ""
+    segments_manifest_path: str = ""
     mosaic_preset: str = "balanced"
     time_coherence_tolerance_sec: float = 1.0
     last_signal_anchor_datetime: Optional[str] = None
@@ -177,7 +179,8 @@ class ProjectState:
 _PATH_KEYS = {
     "project_path", "output_directory", "concatenated_path",
     "trimstart_path", "final_output_path", "ffmpeg_path",
-    "synced_signal_path", "synced_hr_path", "synced_ecg_path", "folder",
+    "synced_signal_path", "synced_hr_path", "synced_ecg_path",
+    "segments_manifest_path", "folder",
 }
 _PATH_LIST_KEYS = {"segment_paths", "signal_paths", "hr_signal_paths", "ecg_signal_paths"}
 
@@ -230,6 +233,39 @@ def _resolve_paths(d, base):
     if isinstance(d, list):
         return [_resolve_paths(item, base) for item in d]
     return d
+
+
+def load_labelled_segments_manifest(path: str, state: ProjectState) -> list[LabelInterval]:
+    """Load labelled intervals and their existing folders into shared state."""
+    manifest_path = Path(path)
+    intervals = []
+    with open(manifest_path, newline="", encoding="utf-8") as file:
+        for row in csv.DictReader(file):
+            label = (row.get("label") or "").strip()
+            start_sec = float(row["start_sec"])
+            end_sec = float(row["end_sec"])
+            folder = (row.get("folder") or "").strip()
+            if not label:
+                raise ValueError("A segment has no label.")
+            if start_sec >= end_sec:
+                raise ValueError(f"Segment '{label}' must end after it starts.")
+            if not folder:
+                raise ValueError(f"Segment '{label}' has no folder.")
+            intervals.append(LabelInterval(
+                label=label,
+                start_sec=start_sec,
+                end_sec=end_sec,
+                folder=str(manifest_path.parent / folder),
+            ))
+    if not intervals:
+        raise ValueError("The manifest contains no segments.")
+    intervals.sort(key=lambda interval: interval.start_sec)
+    state.intervals = intervals
+    state.segments_manifest_path = str(manifest_path)
+    for interval in intervals:
+        if interval.label not in state.labels_library:
+            state.labels_library.append(interval.label)
+    return intervals
 
 
 # ---------------------------------------------------------------------------
