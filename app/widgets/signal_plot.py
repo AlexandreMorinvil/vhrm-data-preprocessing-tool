@@ -108,6 +108,13 @@ class SignalPlot(QWidget):
         y_controls.addWidget(self._hr_y_max_btn)
         y_controls.addStretch()
         layout.addLayout(y_controls)
+
+        self._signal_controls_widget = QWidget()
+        self._signal_controls = QHBoxLayout(self._signal_controls_widget)
+        self._signal_controls.setContentsMargins(0, 0, 0, 0)
+        self._signal_controls.addWidget(QLabel("Displayed signals:"))
+        self._signal_controls.addStretch()
+        layout.addWidget(self._signal_controls_widget)
         layout.addWidget(self._canvas)
 
         self._cursor_line = None
@@ -117,6 +124,8 @@ class SignalPlot(QWidget):
         self._video_duration_sec: float = 0.0
         self._sensor_ids: list[str] = []
         self._signal_lines = []
+        self._signal_checkboxes: dict[str, QCheckBox] = {}
+        self._signal_visibility: dict[str, bool] = {}
         self._intervals: list[tuple[float, float, str]] = []
         self._data_start_sec: float = 0.0
         self._data_end_sec: float = 0.0
@@ -160,6 +169,7 @@ class SignalPlot(QWidget):
         self._window_start_sec = 0.0
         self._set_window_controls_enabled(False)
         self._range_label.setText("Full range")
+        self._sync_signal_controls([])
         self._canvas.draw_idle()
 
     def set_intervals(self, intervals) -> None:
@@ -208,11 +218,68 @@ class SignalPlot(QWidget):
         self._apply_y_scale()
         self._canvas.draw_idle()
 
+    def _sync_signal_controls(self, signal_names: list[str]) -> None:
+        while self._signal_controls.count():
+            item = self._signal_controls.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        self._signal_checkboxes = {}
+        self._signal_visibility = {
+            name: self._signal_visibility.get(name, True) for name in signal_names
+        }
+        self._signal_controls.addWidget(QLabel("Displayed signals:"))
+        for name in signal_names:
+            checkbox = QCheckBox(name)
+            checkbox.setChecked(self._signal_visibility[name])
+            checkbox.toggled.connect(
+                lambda checked, signal_name=name: self._set_signal_visible(
+                    signal_name, checked
+                )
+            )
+            self._signal_checkboxes[name] = checkbox
+            self._signal_controls.addWidget(checkbox)
+        self._signal_controls.addStretch()
+        self._signal_controls_widget.setVisible(bool(signal_names))
+
+    def _set_signal_visible(self, signal_name: str, visible: bool) -> None:
+        self._signal_visibility[signal_name] = visible
+        for line in self._signal_lines:
+            if line.get_label() == signal_name:
+                line.set_visible(visible)
+        self._update_legend()
+        self._apply_y_scale()
+        self._canvas.draw_idle()
+
+    def _update_legend(self) -> None:
+        existing_legend = self._ax.get_legend()
+        if existing_legend is not None:
+            existing_legend.remove()
+
+        signal_line_ids = {id(line) for line in self._signal_lines}
+        handles, labels = self._ax.get_legend_handles_labels()
+        unique_handles = []
+        unique_labels = []
+        seen = set()
+        for handle, label in zip(handles, labels):
+            if id(handle) in signal_line_ids and not handle.get_visible():
+                continue
+            if not label or label.startswith("_") or label in seen:
+                continue
+            seen.add(label)
+            unique_handles.append(handle)
+            unique_labels.append(label)
+        if unique_handles and (len(self._sensor_ids) > 1 or len(unique_handles) > 1):
+            self._ax.legend(unique_handles, unique_labels, fontsize=8)
+
     def _visible_auto_y_bounds(self) -> Optional[tuple[float, float]]:
         visible_values = []
         window_start = self._window_start_sec
         window_end = window_start + self._visible_duration()
         for line in self._signal_lines:
+            if not line.get_visible():
+                continue
             x_values = np.asarray(line.get_xdata(), dtype=float)
             y_values = np.asarray(line.get_ydata(), dtype=float)
             visible = (
@@ -412,10 +479,14 @@ class SignalPlot(QWidget):
                     line, = self._ax.plot(rel_sec, values, label=col, linewidth=0.8)
                 self._signal_lines.append(line)
 
+        signal_names = [str(line.get_label()) for line in self._signal_lines]
+        self._sync_signal_controls(signal_names)
+        for line in self._signal_lines:
+            line.set_visible(self._signal_visibility.get(str(line.get_label()), True))
+
         self._ax.set_xlabel("Time (s from video start)")
         self._ax.set_ylabel("Value")
-        if len(self._sensor_ids) > 1:
-            self._ax.legend(fontsize=8)
+        self._update_legend()
         self._ax.grid(True, alpha=0.3)
         self._apply_time_window(redraw=False)
         self._fig.tight_layout()

@@ -76,6 +76,37 @@ class SignalPlotWindowTests(unittest.TestCase):
         self.assertAlmostEqual(restored_min, -0.2875)
         self.assertAlmostEqual(restored_max, 0.5375)
 
+    def test_toggles_individual_signal_visibility(self) -> None:
+        frame = pd.DataFrame({
+            "timestamp_utc": pd.to_datetime([
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:05Z",
+                "2026-01-01T00:00:10Z",
+            ]),
+            "Polar_1": [70.0, 72.0, 74.0],
+            "Zephyr_1": [180.0, 190.0, 200.0],
+        })
+        self.plot.set_data(frame, video_duration_sec=10.0)
+
+        self.assertEqual(
+            set(self.plot._signal_checkboxes), {"Polar_1", "Zephyr_1"}
+        )
+        self.plot._signal_checkboxes["Zephyr_1"].setChecked(False)
+
+        lines = {line.get_label(): line for line in self.plot._signal_lines}
+        self.assertTrue(lines["Polar_1"].get_visible())
+        self.assertFalse(lines["Zephyr_1"].get_visible())
+        self.assertLess(self.plot._ax.get_ylim()[1], 100.0)
+        legend_labels = [
+            text.get_text() for text in self.plot._ax.get_legend().get_texts()
+        ]
+        self.assertEqual(legend_labels, ["Polar_1"])
+
+        self.plot.set_data(frame, video_duration_sec=10.0)
+        redrawn_lines = {line.get_label(): line for line in self.plot._signal_lines}
+        self.assertFalse(redrawn_lines["Zephyr_1"].get_visible())
+        self.assertFalse(self.plot._signal_checkboxes["Zephyr_1"].isChecked())
+
 
 if __name__ == "__main__":
     unittest.main()
