@@ -5,7 +5,6 @@ import json
 import logging
 import math
 import os
-import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -38,12 +37,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..file_cleanup import cleanup_obsolete_paths
 from ..ffmpeg_utils import trim_video, find_ffmpeg
 from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_preset
 from ..signals import (
     load_signal_files,
     read_synced_signal_csvs,
-    signal_file_type_name,
     signal_long_to_wide,
     write_synced_signal_csvs,
 )
@@ -55,7 +54,6 @@ from ..state import (
     format_time_coherence_warnings,
     load_labelled_segments_manifest,
     load_sidecar,
-    populate_tracks_from_videos,
     video_timeline_duration_sec,
 )
 from ..widgets.frame_preview import MultiCameraPlayer
@@ -66,8 +64,6 @@ from ..widgets.timeline import IntervalItem, TimelineWidget, colour_for_label
 log = logging.getLogger(__name__)
 
 _META_FILTER = "Metadata sidecar (*.json);;All files (*)"
-_VIDEO_FILTER = "Videos (*.mp4 *.mov *.lrf *.avi *.mkv);;All files (*)"
-_SIGNAL_FILTER = "CSV / signal files (*.csv *.tsv *.txt);;All files (*)"
 
 
 def _secs_to_qtime(sec: float) -> QTime:
@@ -148,8 +144,7 @@ class Mode3Widget(QWidget):
         ll = QVBoxLayout(left)
         ll.setContentsMargins(4, 4, 4, 4)
 
-        # --- Load videos section (allows skipping Mode 1/2) ---
-        load_grp = QGroupBox("Load videos")
+        load_grp = QGroupBox("Load project data")
         load_lay = QVBoxLayout(load_grp)
         meta_btn = QPushButton("Load from metadata file …")
         meta_btn.clicked.connect(self._load_from_meta)
@@ -157,15 +152,6 @@ class Mode3Widget(QWidget):
         manifest_btn = QPushButton("Import labelled segments manifest …")
         manifest_btn.clicked.connect(self._import_segments_manifest)
         load_lay.addWidget(manifest_btn)
-        vids_btn = QPushButton("Select video files directly …")
-        vids_btn.clicked.connect(self._load_from_videos)
-        load_lay.addWidget(vids_btn)
-        hr_btn = QPushButton("Add HR file …")
-        hr_btn.clicked.connect(lambda: self._add_signal_inline("HR"))
-        load_lay.addWidget(hr_btn)
-        ecg_btn = QPushButton("Add ECG file …")
-        ecg_btn.clicked.connect(lambda: self._add_signal_inline("ECG"))
-        load_lay.addWidget(ecg_btn)
         self._load_status = QLabel("")
         self._load_status.setWordWrap(True)
         load_lay.addWidget(self._load_status)
@@ -228,6 +214,15 @@ class Mode3Widget(QWidget):
         self._keep_unlabelled = QCheckBox("Keep unlabelled segments")
         self._keep_unlabelled.setChecked(False)
         ll.addWidget(self._keep_unlabelled)
+
+        self._remove_legacy_csv_cb = QCheckBox(
+            "Remove legacy combined signal.csv files after export"
+        )
+        self._remove_legacy_csv_cb.setToolTip(
+            "Removes an old combined signal.csv only after replacement per-sensor "
+            "heart-rate files are exported successfully."
+        )
+        ll.addWidget(self._remove_legacy_csv_cb)
 
         # --- Subdivide all ---
         self._subdivide_all_btn = QPushButton("Subdivide all intervals …")
@@ -449,64 +444,6 @@ class Mode3Widget(QWidget):
         self._sync_timeline()
         self._editor_grp.setVisible(False)
         self._load_status.setText(f"Imported {len(intervals)} labelled segment(s) from {Path(path).name}.")
-
-    def _load_from_videos(self):
-        files, _ = QFileDialog.getOpenFileNames(
-            self, "Select video files", "", _VIDEO_FILTER,
-        )
-        if not files:
-            return
-        try:
-            populate_tracks_from_videos(files, self.state)
-        except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Failed to probe videos:\n{exc}")
-            return
-        self._refresh_from_tracks()
-        self._refresh_time_summary()
-        n = len(self.state.tracks)
-        self._load_status.setText(f"Loaded {n} video(s) directly.")
-
-    def _add_signal_inline(self, signal_kind: str):
-        files, _ = QFileDialog.getOpenFileNames(
-            self, "Select signal files", "", _SIGNAL_FILTER,
-        )
-        if not files:
-            return
-        target = self.state.ecg_signal_paths if signal_kind == "ECG" else self.state.hr_signal_paths
-        for p in files:
-            is_ecg = signal_file_type_name(p) == "ECG waveform"
-            if is_ecg != (signal_kind == "ECG"):
-                QMessageBox.warning(self, "Wrong signal type", f"{Path(p).name} is not an {signal_kind} file.")
-                continue
-            if p not in target:
-                target.append(p)
-        self.state.signal_paths = list(self.state.hr_signal_paths)
-        if signal_kind == "ECG":
-            self._ecg_merged_df = self._load_and_clip_paths(self.state.ecg_signal_paths, False)
-        else:
-            self._load_signals()
-        self._show_selected_plot()
-        type_names = [signal_file_type_name(p) for p in files]
-        self._load_status.setText(
-            f"Loaded {len(target)} {signal_kind} file(s): {', '.join(type_names)}."
-        )
-
-    def _load_and_clip_paths(self, paths: list[str], include_average: bool) -> Optional[pd.DataFrame]:
-        if not paths:
-            return None
-        dfs, _types, failed_paths = load_signal_files(paths)
-        for path in failed_paths:
-            log.warning("Failed to load signal: %s", path)
-        if not dfs:
-            return None
-        merged = pd.concat(dfs, ignore_index=True)
-        anchor = self._signal_anchor()
-        if anchor is not None and self.state.tracks:
-            end = pd.Timestamp(anchor + timedelta(seconds=video_timeline_duration_sec(self.state.tracks)))
-            merged = merged[(merged["timestamp_utc"] >= pd.Timestamp(anchor)) & (merged["timestamp_utc"] <= end)]
-        if merged.empty:
-            return None
-        return signal_long_to_wide(merged, include_average=include_average)
 
     def _signal_anchor(self) -> Optional[datetime]:
         if self.state.last_signal_anchor_datetime:
@@ -936,6 +873,7 @@ class Mode3Widget(QWidget):
 
         manifest_rows = []
         total = len(intervals)
+        cleaned_legacy_count = 0
 
         for idx, iv in enumerate(intervals):
             self._progress.setValue(int((idx / total) * 100))
@@ -943,6 +881,7 @@ class Mode3Widget(QWidget):
             seg_dir = segments_dir / seg_name
             seg_dir.mkdir(parents=True, exist_ok=True)
             iv.folder = str(seg_dir)
+            legacy_csv_paths = self._legacy_segment_csv_paths(seg_dir)
 
             for ti, track in enumerate(self.state.tracks):
                 src = track.final_output_path
@@ -966,6 +905,15 @@ class Mode3Widget(QWidget):
             ecg_files = self._export_signal_slice(
                 self._ecg_merged_df, signal_anchor, iv, seg_dir, "ecg_waveform"
             )
+            if self._remove_legacy_csv_cb.isChecked() and hr_files:
+                try:
+                    cleaned_legacy_count += cleanup_obsolete_paths(
+                        legacy_csv_paths,
+                        out_dir,
+                        self.state.archive_removed_files,
+                    )
+                except OSError as exc:
+                    log.warning("Could not clean up legacy segment CSV files: %s", exc)
 
             # Build enriched meta.json (aligned with project_meta.json)
             cameras_meta = []
@@ -1035,8 +983,28 @@ class Mode3Widget(QWidget):
 
         self._progress.setValue(100)
         self._has_exported = True
-        self._status.setText(f"Exported {len(manifest_rows)} segments to {segments_dir}")
+        status = f"Exported {len(manifest_rows)} segments to {segments_dir}"
+        if cleaned_legacy_count:
+            action = "archived" if self.state.archive_removed_files else "removed"
+            status += f"; legacy CSVs {action}: {cleaned_legacy_count}"
+        self._status.setText(status)
         log.info("Exported %d segments to %s", len(manifest_rows), segments_dir)
+
+    @staticmethod
+    def _legacy_segment_csv_paths(seg_dir: Path) -> list[Path]:
+        candidates = [seg_dir / "signal.csv"]
+        meta_path = seg_dir / "meta.json"
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                legacy_name = meta.get("signal_file")
+                if legacy_name:
+                    candidate = (seg_dir / legacy_name).resolve()
+                    candidate.relative_to(seg_dir.resolve())
+                    candidates.append(candidate)
+            except (json.JSONDecodeError, OSError, ValueError):
+                pass
+        return list(dict.fromkeys(candidates))
 
     @staticmethod
     def _relative_signal_path(path: str, seg_dir: Path) -> Optional[str]:
@@ -1105,10 +1073,12 @@ class Mode3Widget(QWidget):
             QMessageBox.warning(self, f"{display_name} unavailable", "Video time anchor is unavailable.")
             return
         count = 0
+        cleaned_legacy_count = 0
         for interval in intervals:
             seg_dir = Path(interval.folder)
             if not seg_dir.exists():
                 continue
+            legacy_csv_paths = self._legacy_segment_csv_paths(seg_dir)
             file_names = self._export_signal_slice(
                 df, anchor, interval, seg_dir, primary_column
             )
@@ -1120,9 +1090,27 @@ class Mode3Widget(QWidget):
             meta[state_paths_name] = self._relative_signal_paths(
                 getattr(self.state, state_paths_name), seg_dir
             )
+            if (
+                file_stem == "hr"
+                and self._remove_legacy_csv_cb.isChecked()
+            ):
+                try:
+                    cleaned_legacy_count += cleanup_obsolete_paths(
+                        legacy_csv_paths,
+                        self.state.output_directory,
+                        self.state.archive_removed_files,
+                    )
+                    meta.pop("signal_file", None)
+                    meta.pop("synced_signal_path", None)
+                except OSError as exc:
+                    log.warning("Could not clean up legacy segment CSV files: %s", exc)
             meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
             count += 1
-        self._status.setText(f"Exported {display_name} to {count} existing segment(s).")
+        status = f"Exported {display_name} to {count} existing segment(s)."
+        if cleaned_legacy_count:
+            action = "archived" if self.state.archive_removed_files else "removed"
+            status += f" Legacy CSVs {action}: {cleaned_legacy_count}."
+        self._status.setText(status)
 
     # ------------------------------------------------------------------
     # Mosaic export for selected interval

@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..file_cleanup import remove_or_archive
 from ..ffmpeg_utils import (
     FFmpegWorker,
     concatenate_segments,
@@ -436,6 +437,15 @@ class Mode1Widget(QWidget):
         tracks: list[VideoTrack] = []
         single_camera = (num == 1)
 
+        def cleanup_intermediate(path: str) -> None:
+            remove_or_archive(
+                path,
+                out_dir,
+                self.state.archive_removed_files,
+            )
+            action = "Archived" if self.state.archive_removed_files else "Deleted"
+            worker.log_message.emit(f"{action} intermediate: {Path(path).name}")
+
         # --- Concatenation (0–55%) -------------------------------------------
         for ci, cam in enumerate(cameras):
             if worker.is_cancelled:
@@ -521,10 +531,9 @@ class Mode1Widget(QWidget):
                 _shutil.copy2(t.concatenated_path, final_path)
                 if delete_intermediates and t.concatenated_path and Path(t.concatenated_path).exists():
                     try:
-                        os.remove(t.concatenated_path)
-                        worker.log_message.emit(f"Deleted intermediate: {Path(t.concatenated_path).name}")
+                        cleanup_intermediate(t.concatenated_path)
                     except OSError as exc:
-                        worker.log_message.emit(f"Could not delete {t.concatenated_path}: {exc}")
+                        worker.log_message.emit(f"Could not clean up {t.concatenated_path}: {exc}")
                     t.concatenated_path = ""
                 t.final_output_path = final_path
                 vf = probe_video(final_path, find_ffprobe())
@@ -587,10 +596,9 @@ class Mode1Widget(QWidget):
                 # Cleanup: concat file is no longer needed
                 if delete_intermediates and t.concatenated_path and Path(t.concatenated_path).exists():
                     try:
-                        os.remove(t.concatenated_path)
-                        worker.log_message.emit(f"Deleted intermediate: {Path(t.concatenated_path).name}")
+                        cleanup_intermediate(t.concatenated_path)
                     except OSError as exc:
-                        worker.log_message.emit(f"Could not delete {t.concatenated_path}: {exc}")
+                        worker.log_message.emit(f"Could not clean up {t.concatenated_path}: {exc}")
                     t.concatenated_path = ""
 
         if worker.is_cancelled:
@@ -649,18 +657,16 @@ class Mode1Widget(QWidget):
             if delete_intermediates:
                 if t.trimstart_path and Path(t.trimstart_path).exists():
                     try:
-                        os.remove(t.trimstart_path)
-                        worker.log_message.emit(f"Deleted intermediate: {Path(t.trimstart_path).name}")
+                        cleanup_intermediate(t.trimstart_path)
                     except OSError as exc:
-                        worker.log_message.emit(f"Could not delete {t.trimstart_path}: {exc}")
+                        worker.log_message.emit(f"Could not clean up {t.trimstart_path}: {exc}")
                     t.trimstart_path = ""
                 elif t.concatenated_path and Path(t.concatenated_path).exists():
                     # No trimstart was created, so concat was used directly as source
                     try:
-                        os.remove(t.concatenated_path)
-                        worker.log_message.emit(f"Deleted intermediate: {Path(t.concatenated_path).name}")
+                        cleanup_intermediate(t.concatenated_path)
                     except OSError as exc:
-                        worker.log_message.emit(f"Could not delete {t.concatenated_path}: {exc}")
+                        worker.log_message.emit(f"Could not clean up {t.concatenated_path}: {exc}")
                     t.concatenated_path = ""
 
         if worker.is_cancelled:

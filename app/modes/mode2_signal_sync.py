@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..file_cleanup import cleanup_obsolete_paths
 from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_preset
 from ..signals import (
     get_loaders,
@@ -46,7 +47,6 @@ from ..state import (
     format_time_coherence_warnings,
     generate_sidecar,
     load_sidecar,
-    populate_tracks_from_videos,
     video_timeline_duration_sec,
 )
 from ..widgets.layout import configure_main_splitter
@@ -57,7 +57,6 @@ log = logging.getLogger(__name__)
 
 _SIGNAL_FILTER = "CSV / signal files (*.csv *.tsv *.txt);;All files (*)"
 _META_FILTER = "Metadata sidecar (*.json);;All files (*)"
-_VIDEO_FILTER = "Videos (*.mp4 *.mov *.lrf *.avi *.mkv);;All files (*)"
 
 
 def _normalise_dt(dt: datetime) -> datetime:
@@ -128,15 +127,11 @@ class Mode2Widget(QWidget):
         ll = QVBoxLayout(left)
         ll.setContentsMargins(4, 4, 4, 4)
 
-        # --- Load videos section (allows skipping Mode 1) ---
-        load_grp = QGroupBox("Load videos")
+        load_grp = QGroupBox("Load project metadata")
         load_lay = QVBoxLayout(load_grp)
         meta_btn = QPushButton("Load from metadata file …")
         meta_btn.clicked.connect(self._load_from_meta)
         load_lay.addWidget(meta_btn)
-        vids_btn = QPushButton("Select video files directly …")
-        vids_btn.clicked.connect(self._load_from_videos)
-        load_lay.addWidget(vids_btn)
         self._load_status = QLabel("")
         self._load_status.setWordWrap(True)
         load_lay.addWidget(self._load_status)
@@ -201,6 +196,15 @@ class Mode2Widget(QWidget):
         self._load_btn.setStyleSheet("font-weight:bold; padding:8px;")
         self._load_btn.clicked.connect(self._load_and_sync)
         ll.addWidget(self._load_btn)
+
+        self._remove_legacy_csv_cb = QCheckBox(
+            "Remove legacy combined synchronized CSV files after synchronization"
+        )
+        self._remove_legacy_csv_cb.setToolTip(
+            "Removes old signal_synced.csv, hr_synced.csv, and ecg_synced.csv files "
+            "only after replacement per-sensor files are written successfully."
+        )
+        ll.addWidget(self._remove_legacy_csv_cb)
 
         self._skip_btn = QPushButton("Skip (no signal)")
         self._skip_btn.clicked.connect(self._skip)
@@ -321,22 +325,6 @@ class Mode2Widget(QWidget):
         n = len(self.state.tracks)
         self._load_status.setText(f"Loaded {n} camera(s) from sidecar.")
 
-    def _load_from_videos(self):
-        files, _ = QFileDialog.getOpenFileNames(
-            self, "Select video files", "", _VIDEO_FILTER,
-        )
-        if not files:
-            return
-        try:
-            populate_tracks_from_videos(files, self.state)
-        except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Failed to probe videos:\n{exc}")
-            return
-        self._refresh_player()
-        self._refresh_time_correction_ui()
-        n = len(self.state.tracks)
-        self._load_status.setText(f"Loaded {n} video(s) directly.")
-
     def _refresh_player(self):
         """Reload the player/plot from the current state.tracks."""
         labels = [t.camera_label for t in self.state.tracks]
@@ -408,7 +396,7 @@ class Mode2Widget(QWidget):
             self._time_grid.addWidget(label, 0, col)
 
         if not self.state.tracks:
-            self._time_grid.addWidget(QLabel("Load videos to edit time corrections."), 1, 0, 1, 5)
+            self._time_grid.addWidget(QLabel("Load project metadata to edit time corrections."), 1, 0, 1, 5)
             self._time_status.setText("")
             return
 
@@ -636,6 +624,10 @@ class Mode2Widget(QWidget):
             return
 
         out_dir = self.state.output_directory
+        legacy_paths = set(self.state.legacy_synced_paths)
+        legacy_hr_paths = legacy_paths.intersection(self.state.synced_hr_paths)
+        legacy_ecg_paths = legacy_paths.intersection(self.state.synced_ecg_paths)
+        cleaned_legacy_count = 0
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
             if self._hr_merged_df is not None:
@@ -649,6 +641,37 @@ class Mode2Widget(QWidget):
                     self._ecg_merged_df, out_dir, "ecg_waveform"
                 )
                 self.state.synced_ecg_path = ""
+            if self._remove_legacy_csv_cb.isChecked():
+                obsolete_paths: list[str | Path] = []
+                if self._hr_merged_df is not None:
+                    obsolete_paths.extend(legacy_hr_paths)
+                    obsolete_paths.extend([
+                        Path(out_dir) / "signal_synced.csv",
+                        Path(out_dir) / "hr_synced.csv",
+                    ])
+                if self._ecg_merged_df is not None:
+                    obsolete_paths.extend(legacy_ecg_paths)
+                    obsolete_paths.append(Path(out_dir) / "ecg_synced.csv")
+                generated_paths = {
+                    str(Path(path).resolve())
+                    for path in self.state.synced_hr_paths + self.state.synced_ecg_paths
+                }
+                obsolete_paths = [
+                    path for path in obsolete_paths
+                    if str(Path(path).resolve()) not in generated_paths
+                ]
+                try:
+                    cleaned_legacy_count = cleanup_obsolete_paths(
+                        obsolete_paths,
+                        out_dir,
+                        self.state.archive_removed_files,
+                    )
+                    self.state.legacy_synced_paths = [
+                        path for path in self.state.legacy_synced_paths
+                        if Path(path).exists()
+                    ]
+                except OSError as exc:
+                    log.warning("Could not clean up legacy synchronized CSV files: %s", exc)
             try:
                 generate_sidecar(self.state)
             except Exception as exc:
@@ -661,6 +684,9 @@ class Mode2Widget(QWidget):
             status_parts.append(f"HR: {len(self._hr_merged_df)} samples")
         if self._ecg_merged_df is not None:
             status_parts.append(f"ECG: {len(self._ecg_merged_df)} samples")
+        if cleaned_legacy_count:
+            action = "archived" if self.state.archive_removed_files else "removed"
+            status_parts.append(f"legacy CSVs {action}: {cleaned_legacy_count}")
         self._status.setText("; ".join(status_parts) + ".")
         self.state.mode2_complete = True
 

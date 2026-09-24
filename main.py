@@ -41,8 +41,12 @@ class MainWindow(QMainWindow):
         else:
             self.resize(1400, 900)
 
-        self.state = ProjectState()
         self._settings = QSettings("VideoResearchTool", "VRT")
+        self.state = ProjectState(
+            archive_removed_files=self._settings.value(
+                "archive_removed_files", False, type=bool
+            )
+        )
 
         self._build_menus()
         self._build_toolbar()
@@ -90,6 +94,18 @@ class MainWindow(QMainWindow):
         light_act = QAction("Light theme", self)
         light_act.triggered.connect(lambda: self._apply_theme("light"))
         view_menu.addAction(light_act)
+
+        options_menu = mb.addMenu("&Options")
+        self._archive_removed_action = QAction(
+            "Archive removed files instead of deleting", self
+        )
+        self._archive_removed_action.setCheckable(True)
+        self._archive_removed_action.setChecked(self.state.archive_removed_files)
+        self._archive_removed_action.setToolTip(
+            "Move obsolete files into the output folder's obsolete_files directory."
+        )
+        self._archive_removed_action.toggled.connect(self._set_archive_removed_files)
+        options_menu.addAction(self._archive_removed_action)
 
         help_menu = mb.addMenu("&Help")
         about_act = QAction("&About", self)
@@ -155,7 +171,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Mode {index + 1}", 3000)
 
     def _new_project(self):
-        self.state = ProjectState()
+        self.state = ProjectState(
+            archive_removed_files=self._archive_removed_action.isChecked()
+        )
         self._reload_modes()
         self.setWindowTitle("Video Research Tool — New project")
 
@@ -164,6 +182,7 @@ class MainWindow(QMainWindow):
         if path:
             try:
                 self.state = ProjectState.load(path)
+                self.state.archive_removed_files = self._archive_removed_action.isChecked()
                 self._reload_modes()
                 self.setWindowTitle(f"Video Research Tool — {Path(path).stem}")
             except Exception as exc:
@@ -223,6 +242,12 @@ class MainWindow(QMainWindow):
             )
         self.setStyleSheet(qss)
         self._settings.setValue("theme", name)
+
+    def _set_archive_removed_files(self, enabled: bool):
+        self.state.archive_removed_files = enabled
+        self._settings.setValue("archive_removed_files", enabled)
+        policy = "archived" if enabled else "deleted permanently"
+        self.statusBar().showMessage(f"Removed files will be {policy}.", 3000)
 
     def _show_about(self):
         QMessageBox.about(

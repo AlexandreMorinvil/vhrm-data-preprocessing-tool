@@ -126,8 +126,10 @@ class ProjectState:
     synced_ecg_path: str = ""
     synced_hr_paths: list[str] = field(default_factory=list)
     synced_ecg_paths: list[str] = field(default_factory=list)
+    legacy_synced_paths: list[str] = field(default_factory=list)
     segments_manifest_path: str = ""
     mosaic_preset: str = "balanced"
+    archive_removed_files: bool = False
     time_coherence_tolerance_sec: float = 1.0
     last_signal_anchor_datetime: Optional[str] = None
     last_time_coherence_warnings: list[str] = field(default_factory=list)
@@ -158,6 +160,15 @@ class ProjectState:
         if "synced_ecg_paths" not in d:
             legacy_ecg = d.get("synced_ecg_path")
             d["synced_ecg_paths"] = [legacy_ecg] if legacy_ecg else []
+        if "legacy_synced_paths" not in d:
+            legacy_paths = [
+                d.get("synced_signal_path"),
+                d.get("synced_hr_path"),
+                d.get("synced_ecg_path"),
+            ]
+            d["legacy_synced_paths"] = list(dict.fromkeys(
+                path for path in legacy_paths if path
+            ))
         valid = {k for k in cls.__dataclass_fields__}
         filtered = {k: v for k, v in d.items() if k in valid}
         state = cls(**filtered)
@@ -192,7 +203,7 @@ _PATH_KEYS = {
 }
 _PATH_LIST_KEYS = {
     "segment_paths", "signal_paths", "hr_signal_paths", "ecg_signal_paths",
-    "synced_hr_paths", "synced_ecg_paths",
+    "synced_hr_paths", "synced_ecg_paths", "legacy_synced_paths",
 }
 
 
@@ -365,6 +376,7 @@ def load_sidecar(path: str, state: ProjectState) -> None:
     state.synced_ecg_path = ""
     state.synced_hr_paths.clear()
     state.synced_ecg_paths.clear()
+    state.legacy_synced_paths.clear()
     for i, cam in enumerate(raw.get("cameras", [])):
         video_file = cam.get("final_video_path", "")
         abs_video = str(base_dir / video_file) if video_file else ""
@@ -406,6 +418,14 @@ def load_sidecar(path: str, state: ProjectState) -> None:
             if abs_sig not in state.ecg_signal_paths:
                 state.ecg_signal_paths.append(abs_sig)
     state.signal_paths = list(state.hr_signal_paths)
+    legacy_synced_names = list(dict.fromkeys(
+        name for name in (
+            raw.get("synced_signal_path"),
+            raw.get("synced_hr_path"),
+            raw.get("synced_ecg_path"),
+        ) if name
+    ))
+    state.legacy_synced_paths = [str(base_dir / name) for name in legacy_synced_names]
     hr_synced_names = raw.get("synced_hr_paths")
     if hr_synced_names is None:
         legacy_hr = raw.get("synced_hr_path", raw.get("synced_signal_path"))
@@ -431,42 +451,6 @@ def load_sidecar(path: str, state: ProjectState) -> None:
     )
 
     log.info("Loaded sidecar with %d camera(s) from %s", len(state.tracks), path)
-
-
-def populate_tracks_from_videos(
-    video_paths: list[str],
-    state: ProjectState,
-    probe_func=None,
-) -> None:
-    """Populate *state*.tracks by probing raw video files directly.
-
-    *probe_func* defaults to :func:`ffmpeg_utils.probe_video`.
-    """
-    if probe_func is None:
-        from .ffmpeg_utils import probe_video, find_ffprobe
-        ffprobe = find_ffprobe()
-        probe_func = lambda p: probe_video(p, ffprobe)  # noqa: E731
-
-    state.tracks.clear()
-    for i, vp in enumerate(video_paths):
-        info = probe_func(vp)
-        track = VideoTrack(
-            camera_index=i,
-            camera_label=Path(vp).stem,
-            final_output_path=vp,
-            fps=info.get("fps", 0.0),
-            frame_count=info.get("frame_count", 0),
-            width=info.get("width", 0),
-            height=info.get("height", 0),
-            codec=info.get("codec", ""),
-            duration_sec=info.get("duration", 0.0),
-        )
-        dt = parse_dji_datetime(Path(vp).stem)
-        track.set_start_datetime(dt)
-        state.tracks.append(track)
-    state.num_cameras = len(state.tracks)
-    state.mode1_complete = True
-    log.info("Populated %d track(s) from video files", len(state.tracks))
 
 
 def video_timeline_duration_sec(tracks: list[VideoTrack]) -> float:

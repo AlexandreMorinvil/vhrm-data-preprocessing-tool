@@ -111,6 +111,10 @@ class SignalExportTests(unittest.TestCase):
 
         self.assertEqual(state.synced_hr_paths, ["hr_synced.csv"])
         self.assertEqual(state.synced_ecg_paths, ["ecg_synced.csv"])
+        self.assertEqual(
+            state.legacy_synced_paths,
+            ["hr_synced.csv", "ecg_synced.csv"],
+        )
 
 
 if __name__ == "__main__":

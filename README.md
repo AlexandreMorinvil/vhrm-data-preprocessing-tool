@@ -18,8 +18,10 @@ python main.py
 ## Workflow
 
 1. **Preprocessing** — select video segments per camera, concatenate, audio-sync,
-   and trim to common start/duration.
-2. **Signal synchronisation** — import HR and ECG CSV files separately, align
+   trim to common start/duration, and generate the project metadata file. To use
+   videos that are already prepared, generate their metadata before loading the
+   project in another section.
+2. **Signal synchronisation** — load the project metadata, import HR and ECG CSV files separately, align
    them with the video timeline, and write one CSV per sensor directly in the
    project output folder (for example, `polar_1.csv`, `polar_2.csv`,
    `zephyr_1.csv`, or `ecg_1.csv`). Sensor numbering always starts at `_1`,
@@ -34,6 +36,13 @@ python main.py
    signal. These exports use the imported intervals directly without asking for
    the manifest again.
 4. **Review** — load a manifest CSV to browse through exported segments.
+
+Signal synchronisation and labelled export provide an optional cleanup checkbox
+for removing legacy combined CSV files after replacement per-sensor files are
+written successfully. Enable **Options > Archive removed files instead of
+deleting** to move cleaned files into `obsolete_files/` in the project output
+directory instead of deleting them. Their original project-relative folder
+structure is preserved for recovery.
 
 Metadata, synchronized signals, and imported labelled-segment manifests are
 shared between Signal sync, Labelling, and Review. Switching sections refreshes
