@@ -8,6 +8,7 @@ from typing import Optional
 import pandas as pd
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -64,9 +65,11 @@ class Mode4Widget(QWidget):
         self.state = state
         self._segments: list[_SegmentInfo] = []
         self._current_seg: Optional[_SegmentInfo] = None
-        self._synced_signal_df: Optional[pd.DataFrame] = None
+        self._synced_hr_df: Optional[pd.DataFrame] = None
+        self._synced_ecg_df: Optional[pd.DataFrame] = None
         self._mosaic_worker: MosaicWorker | None = None
-        self._seg_signal_df: Optional[pd.DataFrame] = None
+        self._seg_hr_df: Optional[pd.DataFrame] = None
+        self._seg_ecg_df: Optional[pd.DataFrame] = None
 
         root = QHBoxLayout(self)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -82,6 +85,12 @@ class Mode4Widget(QWidget):
         self._load_btn = QPushButton("Load manifest CSV …")
         self._load_btn.clicked.connect(self._load_manifest)
         ll.addWidget(self._load_btn)
+
+        self._global_view_btn = QPushButton("Show global view")
+        self._global_view_btn.setToolTip("Clear the selected segment and show all labelled segments")
+        self._global_view_btn.setEnabled(False)
+        self._global_view_btn.clicked.connect(self._show_global_view)
+        ll.addWidget(self._global_view_btn)
 
         self._seg_list = QListWidget()
         self._seg_list.currentRowChanged.connect(self._on_segment_selected)
@@ -125,6 +134,11 @@ class Mode4Widget(QWidget):
         self._player.setMinimumHeight(300)
         rl.addWidget(self._player)
 
+        self._plot_type = QComboBox()
+        self._plot_type.addItems(["Heart rate", "ECG"])
+        self._plot_type.currentIndexChanged.connect(self._show_selected_plot)
+        rl.addWidget(self._plot_type)
+
         self._plot = SignalPlot()
         self._plot.setFixedHeight(420)
         rl.addWidget(self._plot)
@@ -156,12 +170,13 @@ class Mode4Widget(QWidget):
         ]
         self._seg_list.clear()
         self._current_seg = None
-        self._seg_signal_df = None
+        self._seg_hr_df = None
+        self._seg_ecg_df = None
         for segment in self._segments:
             self._seg_list.addItem(
                 f"[{segment.index}] {segment.label}  ({segment.duration_sec:.1f}s)"
             )
-        self._load_synced_signal_from_segments()
+        self._load_synced_signals_from_segments()
         total_duration = sum(segment.duration_sec for segment in self._segments)
         self._timeline.set_duration(total_duration)
         offset = 0.0
@@ -172,15 +187,8 @@ class Mode4Widget(QWidget):
             ))
             offset += segment.duration_sec
         self._timeline.set_intervals(items)
-        if self._synced_signal_df is not None:
-            self._show_signal_overview()
-        else:
-            self._plot.clear()
-        if self._segments:
-            source = Path(self.state.segments_manifest_path).name if self.state.segments_manifest_path else "shared project state"
-            self._info_label.setText(f"Loaded {len(self._segments)} segments from {source}")
-        else:
-            self._info_label.setText("No labelled segments loaded.")
+        self._show_selected_plot()
+        self._set_overview_info()
 
     def _load_from_meta(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -212,18 +220,28 @@ class Mode4Widget(QWidget):
             return
         self.refresh_from_state()
 
-    def _load_synced_signal_from_segments(self):
-        """Load shared synchronized HR files from state or segment metadata."""
-        self._synced_signal_df = None
-        synced_paths = [path for path in self.state.synced_hr_paths if Path(path).exists()]
+    def _load_synced_signals_from_segments(self):
+        """Load shared synchronized HR and ECG files from state or segment metadata."""
+        self._synced_hr_df = self._load_synced_signal(
+            self.state.synced_hr_paths, "synced_hr_paths", "synced_signal_path"
+        )
+        self._synced_ecg_df = self._load_synced_signal(
+            self.state.synced_ecg_paths, "synced_ecg_paths"
+        )
+
+    def _load_synced_signal(
+        self,
+        state_paths: list[str],
+        metadata_key: str,
+        legacy_key: str | None = None,
+    ) -> Optional[pd.DataFrame]:
+        synced_paths = [Path(path) for path in state_paths if Path(path).exists()]
         if synced_paths:
             try:
-                self._synced_signal_df = read_synced_signal_csvs(synced_paths)
-                return
+                return read_synced_signal_csvs(synced_paths)
             except Exception as exc:
-                log.error("Error loading shared synced signal: %s", exc)
-        if not self._segments:
-            return
+                log.error("Error loading shared %s files: %s", metadata_key, exc)
+
         for seg in self._segments:
             meta_path = seg.dir_path / "meta.json"
             if not meta_path.exists():
@@ -232,24 +250,40 @@ class Mode4Widget(QWidget):
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
             except Exception:
                 continue
-            relative_paths = meta.get("synced_hr_paths")
-            if relative_paths is None:
-                legacy_path = meta.get("synced_signal_path")
+            relative_paths = meta.get(metadata_key)
+            if relative_paths is None and legacy_key:
+                legacy_path = meta.get(legacy_key)
                 relative_paths = [legacy_path] if legacy_path else []
-            synced_paths = [(seg.dir_path / path).resolve() for path in relative_paths]
+            synced_paths = [
+                (seg.dir_path / path).resolve()
+                for path in (relative_paths or [])
+            ]
             synced_paths = [path for path in synced_paths if path.exists()]
             if not synced_paths:
                 continue
             try:
-                self._synced_signal_df = read_synced_signal_csvs(synced_paths)
-                log.info("Loaded synced signals from %s", synced_paths)
+                frame = read_synced_signal_csvs(synced_paths)
+                log.info("Loaded %s from %s", metadata_key, synced_paths)
+                return frame
             except Exception as exc:
-                log.error("Error loading synced signal: %s", exc)
-            break  # only need the first valid one
+                log.error("Error loading %s: %s", metadata_key, exc)
+        return None
 
-    def _show_signal_overview(self):
+    def _show_selected_plot(self):
+        show_ecg = self._plot_type.currentIndex() == 1
+        if self._current_seg is not None:
+            df = self._seg_ecg_df if show_ecg else self._seg_hr_df
+            if df is None or df.empty:
+                self._plot.clear()
+                return
+            self._plot.set_data(df, video_duration_sec=self._current_seg.duration_sec)
+            return
+
+        df = self._synced_ecg_df if show_ecg else self._synced_hr_df
+        self._show_signal_overview(df)
+
+    def _show_signal_overview(self, df: Optional[pd.DataFrame]):
         """Display the full synced signal with segment regions shaded."""
-        df = self._synced_signal_df
         if df is None or df.empty:
             self._plot.clear()
             return
@@ -262,7 +296,6 @@ class Mode4Widget(QWidget):
         self._plot.set_data(df, video_duration_sec=max_end)
 
         # Overlay shaded regions for each segment
-        t0 = df["timestamp_utc"].iloc[0]
         for seg in self._segments:
             self._plot._ax.axvspan(
                 seg.start_sec, seg.end_sec,
@@ -282,11 +315,38 @@ class Mode4Widget(QWidget):
             self._plot._ax.legend(unique_h, unique_l, fontsize=7, loc="upper right")
         self._plot._canvas.draw_idle()
 
+    def _set_overview_info(self) -> None:
+        if self._segments:
+            source = (
+                Path(self.state.segments_manifest_path).name
+                if self.state.segments_manifest_path else "shared project state"
+            )
+            self._info_label.setText(f"Loaded {len(self._segments)} segments from {source}")
+        else:
+            self._info_label.setText("No labelled segments loaded.")
+
+    def _show_global_view(self) -> None:
+        self._current_seg = None
+        self._seg_hr_df = None
+        self._seg_ecg_df = None
+        self._seg_list.blockSignals(True)
+        self._seg_list.clearSelection()
+        self._seg_list.setCurrentRow(-1)
+        self._seg_list.blockSignals(False)
+        self._player.set_cameras([])
+        self._global_view_btn.setEnabled(False)
+        self._show_selected_plot()
+        self._set_overview_info()
+
     def _on_segment_selected(self, row: int):
-        if row < 0 or row >= len(self._segments):
+        if row < 0:
+            self._show_global_view()
+            return
+        if row >= len(self._segments):
             return
         seg = self._segments[row]
         self._current_seg = seg
+        self._global_view_btn.setEnabled(True)
 
         seg_dir = seg.dir_path
         if not seg_dir.exists():
@@ -315,41 +375,14 @@ class Mode4Widget(QWidget):
         self._player.setMinimumHeight(player_height)
         self._right_content.setMinimumHeight(player_height + self._plot.height() + 140)
 
-        # --- Load signal: prefer per-segment, fallback to synced slice ---
-        signal_loaded = False
-        signal_files = meta.get("hr_files")
-        if signal_files is None:
-            legacy_file = meta.get("signal_file", "signal.csv")
-            signal_files = [legacy_file] if legacy_file else []
-        signal_paths = [seg_dir / file_name for file_name in signal_files]
-        signal_paths = [path for path in signal_paths if path.exists()]
-        if signal_paths:
-            try:
-                df = read_synced_signal_csvs(signal_paths)
-                self._plot.set_data(df, video_duration_sec=seg.duration_sec)
-                signal_loaded = True
-            except Exception as exc:
-                log.error("Error loading signal for segment %d: %s", seg.index, exc)
-
-        if not signal_loaded and self._synced_signal_df is not None:
-            # Fallback: slice from synced signal
-            try:
-                df = self._synced_signal_df
-                t0 = df["timestamp_utc"].iloc[0]
-                start_ts = t0 + pd.Timedelta(seconds=seg.start_sec)
-                end_ts = t0 + pd.Timedelta(seconds=seg.end_sec)
-                sliced = df[
-                    (df["timestamp_utc"] >= start_ts)
-                    & (df["timestamp_utc"] <= end_ts)
-                ].copy()
-                if not sliced.empty:
-                    self._plot.set_data(sliced, video_duration_sec=seg.duration_sec)
-                    signal_loaded = True
-            except Exception as exc:
-                log.error("Error slicing synced signal for segment %d: %s", seg.index, exc)
-
-        if not signal_loaded:
-            self._plot.clear()
+        # --- Load signals: prefer per-segment files, fallback to synced slices ---
+        self._seg_hr_df = self._load_segment_signal(
+            seg, meta, "hr_files", self._synced_hr_df, "signal_file"
+        )
+        self._seg_ecg_df = self._load_segment_signal(
+            seg, meta, "ecg_files", self._synced_ecg_df
+        )
+        self._show_selected_plot()
 
         # --- Info panel ---
         info_lines = [
@@ -360,8 +393,8 @@ class Mode4Widget(QWidget):
         ]
         if meta:
             skip = {"index", "label", "start_sec", "end_sec", "duration_sec", "folder",
-                "cameras", "signal_file", "hr_files", "synced_signal_path",
-                "synced_hr_paths", "generated_at"}
+                "cameras", "signal_file", "hr_files", "ecg_files", "synced_signal_path",
+                "synced_hr_paths", "synced_ecg_paths", "generated_at"}
             for k, v in meta.items():
                 if k not in skip:
                     info_lines.append(f"{k}: {v}")
@@ -369,11 +402,41 @@ class Mode4Widget(QWidget):
                 info_lines.append(f"Cameras: {len(meta['cameras'])}")
         self._info_label.setText("\n".join(info_lines))
 
-        # Store the loaded signal for mosaic use
-        if signal_loaded:
-            self._seg_signal_df = self._plot._df
-        else:
-            self._seg_signal_df = None
+    def _load_segment_signal(
+        self,
+        seg: _SegmentInfo,
+        meta: dict,
+        files_key: str,
+        synced_df: Optional[pd.DataFrame],
+        legacy_key: str | None = None,
+    ) -> Optional[pd.DataFrame]:
+        signal_files = meta.get(files_key)
+        if signal_files is None and legacy_key:
+            legacy_file = meta.get(legacy_key, "signal.csv")
+            signal_files = [legacy_file] if legacy_file else []
+        signal_paths = [seg.dir_path / file_name for file_name in (signal_files or [])]
+        signal_paths = [path for path in signal_paths if path.exists()]
+        if signal_paths:
+            try:
+                return read_synced_signal_csvs(signal_paths)
+            except Exception as exc:
+                log.error("Error loading %s for segment %d: %s", files_key, seg.index, exc)
+
+        if synced_df is not None:
+            try:
+                t0 = synced_df["timestamp_utc"].iloc[0]
+                start_ts = t0 + pd.Timedelta(seconds=seg.start_sec)
+                end_ts = t0 + pd.Timedelta(seconds=seg.end_sec)
+                sliced = synced_df[
+                    (synced_df["timestamp_utc"] >= start_ts)
+                    & (synced_df["timestamp_utc"] <= end_ts)
+                ].copy()
+                if not sliced.empty:
+                    return sliced
+            except Exception as exc:
+                log.error("Error slicing %s for segment %d: %s", files_key, seg.index, exc)
+        return None
+
     def _on_playhead(self, sec: float):
         cumulative = 0.0
         for i, seg in enumerate(self._segments):
@@ -462,6 +525,7 @@ class Mode4Widget(QWidget):
 
         fps = self._player.get_fps() or 30.0
         total_frames = int(seg.duration_sec * fps)
+        signal_df = self._seg_ecg_df if self._plot_type.currentIndex() == 1 else self._seg_hr_df
 
         self._mosaic_worker = MosaicWorker(
             video_paths=video_paths,
@@ -470,7 +534,7 @@ class Mode4Widget(QWidget):
             total_frames=total_frames,
             video_duration_sec=seg.duration_sec,
             output_path=path,
-            signal_df=self._seg_signal_df,
+            signal_df=signal_df,
             quality_preset=preset_key,
             ffmpeg_path=self.state.ffmpeg_path,
         )
