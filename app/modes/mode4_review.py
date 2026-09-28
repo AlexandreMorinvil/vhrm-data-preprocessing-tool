@@ -67,9 +67,11 @@ class Mode4Widget(QWidget):
         self._current_seg: Optional[_SegmentInfo] = None
         self._synced_hr_df: Optional[pd.DataFrame] = None
         self._synced_ecg_df: Optional[pd.DataFrame] = None
+        self._synced_ppg_df: Optional[pd.DataFrame] = None
         self._mosaic_worker: MosaicWorker | None = None
         self._seg_hr_df: Optional[pd.DataFrame] = None
         self._seg_ecg_df: Optional[pd.DataFrame] = None
+        self._seg_ppg_df: Optional[pd.DataFrame] = None
 
         root = QHBoxLayout(self)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -130,12 +132,12 @@ class Mode4Widget(QWidget):
         self._timeline.setFixedHeight(50)
         rl.addWidget(self._timeline)
 
-        self._player = MultiCameraPlayer()
+        self._player = MultiCameraPlayer(face_blur_enabled=state.blur_faces)
         self._player.setMinimumHeight(300)
         rl.addWidget(self._player)
 
         self._plot_type = QComboBox()
-        self._plot_type.addItems(["Heart rate", "ECG"])
+        self._plot_type.addItems(["Heart rate", "ECG", "Synthetic PPG"])
         self._plot_type.currentIndexChanged.connect(self._show_selected_plot)
         rl.addWidget(self._plot_type)
 
@@ -172,6 +174,7 @@ class Mode4Widget(QWidget):
         self._current_seg = None
         self._seg_hr_df = None
         self._seg_ecg_df = None
+        self._seg_ppg_df = None
         for segment in self._segments:
             self._seg_list.addItem(
                 f"[{segment.index}] {segment.label}  ({segment.duration_sec:.1f}s)"
@@ -228,6 +231,10 @@ class Mode4Widget(QWidget):
         self._synced_ecg_df = self._load_synced_signal(
             self.state.synced_ecg_paths, "synced_ecg_paths"
         )
+        ppg_paths = [self.state.synthetic_ppg_path] if self.state.synthetic_ppg_path else []
+        self._synced_ppg_df = self._load_synced_signal(
+            ppg_paths, "synthetic_ppg_path"
+        )
 
     def _load_synced_signal(
         self,
@@ -270,16 +277,26 @@ class Mode4Widget(QWidget):
         return None
 
     def _show_selected_plot(self):
-        show_ecg = self._plot_type.currentIndex() == 1
+        plot_index = self._plot_type.currentIndex()
         if self._current_seg is not None:
-            df = self._seg_ecg_df if show_ecg else self._seg_hr_df
+            if plot_index == 0:
+                df = self._seg_hr_df
+            elif plot_index == 1:
+                df = self._seg_ecg_df
+            else:
+                df = self._seg_ppg_df
             if df is None or df.empty:
                 self._plot.clear()
                 return
             self._plot.set_data(df, video_duration_sec=self._current_seg.duration_sec)
             return
 
-        df = self._synced_ecg_df if show_ecg else self._synced_hr_df
+        if plot_index == 0:
+            df = self._synced_hr_df
+        elif plot_index == 1:
+            df = self._synced_ecg_df
+        else:
+            df = self._synced_ppg_df
         self._show_signal_overview(df)
 
     def _show_signal_overview(self, df: Optional[pd.DataFrame]):
@@ -329,6 +346,7 @@ class Mode4Widget(QWidget):
         self._current_seg = None
         self._seg_hr_df = None
         self._seg_ecg_df = None
+        self._seg_ppg_df = None
         self._seg_list.blockSignals(True)
         self._seg_list.clearSelection()
         self._seg_list.setCurrentRow(-1)
@@ -382,6 +400,9 @@ class Mode4Widget(QWidget):
         self._seg_ecg_df = self._load_segment_signal(
             seg, meta, "ecg_files", self._synced_ecg_df
         )
+        self._seg_ppg_df = self._load_segment_signal(
+            seg, meta, "ppg_files", self._synced_ppg_df
+        )
         self._show_selected_plot()
 
         # --- Info panel ---
@@ -393,8 +414,9 @@ class Mode4Widget(QWidget):
         ]
         if meta:
             skip = {"index", "label", "start_sec", "end_sec", "duration_sec", "folder",
-                "cameras", "signal_file", "hr_files", "ecg_files", "synced_signal_path",
-                "synced_hr_paths", "synced_ecg_paths", "generated_at"}
+                "cameras", "signal_file", "hr_files", "ecg_files", "ppg_files",
+                "synced_signal_path", "synced_hr_paths", "synced_ecg_paths",
+                "synthetic_ppg_path", "generated_at"}
             for k, v in meta.items():
                 if k not in skip:
                     info_lines.append(f"{k}: {v}")
@@ -525,7 +547,12 @@ class Mode4Widget(QWidget):
 
         fps = self._player.get_fps() or 30.0
         total_frames = int(seg.duration_sec * fps)
-        signal_df = self._seg_ecg_df if self._plot_type.currentIndex() == 1 else self._seg_hr_df
+        if self._plot_type.currentIndex() == 1:
+            signal_df = self._seg_ecg_df
+        elif self._plot_type.currentIndex() == 2:
+            signal_df = self._seg_ppg_df
+        else:
+            signal_df = self._seg_hr_df
 
         self._mosaic_worker = MosaicWorker(
             video_paths=video_paths,
@@ -537,6 +564,7 @@ class Mode4Widget(QWidget):
             signal_df=signal_df,
             quality_preset=preset_key,
             ffmpeg_path=self.state.ffmpeg_path,
+            blur_faces=self.state.blur_faces,
         )
         self._mosaic_worker.progress.connect(self._on_mosaic_progress)
         self._mosaic_worker.finished.connect(self._on_mosaic_finished)

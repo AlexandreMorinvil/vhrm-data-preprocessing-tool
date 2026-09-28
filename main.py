@@ -45,7 +45,8 @@ class MainWindow(QMainWindow):
         self.state = ProjectState(
             archive_removed_files=self._settings.value(
                 "archive_removed_files", False, type=bool
-            )
+            ),
+            blur_faces=self._settings.value("blur_faces", False, type=bool),
         )
 
         self._build_menus()
@@ -107,6 +108,15 @@ class MainWindow(QMainWindow):
         self._archive_removed_action.toggled.connect(self._set_archive_removed_files)
         options_menu.addAction(self._archive_removed_action)
 
+        self._blur_faces_action = QAction("Blur faces for privacy", self)
+        self._blur_faces_action.setCheckable(True)
+        self._blur_faces_action.setChecked(self.state.blur_faces)
+        self._blur_faces_action.setToolTip(
+            "Anonymize detected faces in previews, captured frames, and exported videos."
+        )
+        self._blur_faces_action.toggled.connect(self._set_blur_faces)
+        options_menu.addAction(self._blur_faces_action)
+
         help_menu = mb.addMenu("&Help")
         about_act = QAction("&About", self)
         about_act.triggered.connect(self._show_about)
@@ -120,8 +130,9 @@ class MainWindow(QMainWindow):
         self._mode_tabs = QTabBar()
         self._mode_tabs.addTab("1. Preprocessing")
         self._mode_tabs.addTab("2. Signal sync")
-        self._mode_tabs.addTab("3. Labelling")
-        self._mode_tabs.addTab("4. Review")
+        self._mode_tabs.addTab("3. Synthetic PPG")
+        self._mode_tabs.addTab("4. Labelling")
+        self._mode_tabs.addTab("5. Review")
         self._mode_tabs.currentChanged.connect(self._on_tab_changed)
         tb.addWidget(self._mode_tabs)
 
@@ -129,7 +140,7 @@ class MainWindow(QMainWindow):
         self._stack = QStackedWidget()
         self.setCentralWidget(self._stack)
 
-        self._mode_widgets: list[QWidget] = [None, None, None, None]
+        self._mode_widgets: list[QWidget] = [None, None, None, None, None]
 
     def _build_statusbar(self):
         sb = QStatusBar()
@@ -148,9 +159,12 @@ class MainWindow(QMainWindow):
             from app.modes.mode2_signal_sync import Mode2Widget
             w = Mode2Widget(self.state)
         elif index == 2:
+            from app.modes.mode3_synthetic_ppg import SyntheticPpgWidget
+            w = SyntheticPpgWidget(self.state)
+        elif index == 3:
             from app.modes.mode3_labelling import Mode3Widget
             w = Mode3Widget(self.state)
-        elif index == 3:
+        elif index == 4:
             from app.modes.mode4_review import Mode4Widget
             w = Mode4Widget(self.state)
         else:
@@ -172,7 +186,8 @@ class MainWindow(QMainWindow):
 
     def _new_project(self):
         self.state = ProjectState(
-            archive_removed_files=self._archive_removed_action.isChecked()
+            archive_removed_files=self._archive_removed_action.isChecked(),
+            blur_faces=self._blur_faces_action.isChecked(),
         )
         self._reload_modes()
         self.setWindowTitle("Video Research Tool — New project")
@@ -183,6 +198,7 @@ class MainWindow(QMainWindow):
             try:
                 self.state = ProjectState.load(path)
                 self.state.archive_removed_files = self._archive_removed_action.isChecked()
+                self.state.blur_faces = self._blur_faces_action.isChecked()
                 self._reload_modes()
                 self.setWindowTitle(f"Video Research Tool — {Path(path).stem}")
             except Exception as exc:
@@ -209,7 +225,7 @@ class MainWindow(QMainWindow):
             if w is not None:
                 self._stack.removeWidget(w)
                 w.deleteLater()
-        self._mode_widgets = [None, None, None, None]
+        self._mode_widgets = [None, None, None, None, None]
         self._on_tab_changed(self._mode_tabs.currentIndex())
 
     def _apply_theme(self, name: str):
@@ -249,13 +265,25 @@ class MainWindow(QMainWindow):
         policy = "archived" if enabled else "deleted permanently"
         self.statusBar().showMessage(f"Removed files will be {policy}.", 3000)
 
+    def _set_blur_faces(self, enabled: bool):
+        from app.widgets.frame_preview import MultiCameraPlayer
+
+        self.state.blur_faces = enabled
+        self._settings.setValue("blur_faces", enabled)
+        for player in self.findChildren(MultiCameraPlayer):
+            player.set_face_blur_enabled(enabled)
+        status = "enabled" if enabled else "disabled"
+        self.statusBar().showMessage(f"Privacy face blurring {status}.", 3000)
+
     def _show_about(self):
         QMessageBox.about(
             self, "About",
             "Video Research Tool\n\n"
             "Multi-camera DJI video preprocessing, signal synchronisation, "
-            "labelling, and review browser.\n\n"
-            "Built with PyQt6."
+            "synthetic PPG generation, labelling, and review browser.\n\n"
+            "Synthetic PPG generation adapts PPGSynth by Tang et al. under "
+            "GNU GPL v3. See THIRD_PARTY_NOTICES.md and LICENSES/PPGSynth-GPL-3.0.txt.\n\n"
+            "This program comes with absolutely no warranty. Built with PyQt6."
         )
 
 

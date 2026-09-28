@@ -5,6 +5,8 @@ from pathlib import Path
 
 import cv2
 
+from .face_privacy import anonymize_faces
+
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -71,6 +73,9 @@ def export_player_frames(player, output_root: str | Path, prefix: str = "capture
         if not ok:
             failures.append(Path(preview.video_path).name)
             continue
+
+        if preview.face_blur_enabled:
+            frame = anonymize_faces(frame)
 
         camera_name = _safe_name(Path(preview.video_path).stem, f"camera{index:02d}")
         out_path = capture_dir / f"cam{index:02d}_{camera_name}_frame{frame_no:06d}.png"

@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..file_cleanup import cleanup_obsolete_paths
+from ..face_privacy import export_anonymized_video_segment
 from ..ffmpeg_utils import trim_video, find_ffmpeg
 from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_preset
 from ..signals import (
@@ -133,6 +134,7 @@ class Mode3Widget(QWidget):
         self.state = state
         self._hr_merged_df: Optional[pd.DataFrame] = None
         self._ecg_merged_df: Optional[pd.DataFrame] = None
+        self._ppg_merged_df: Optional[pd.DataFrame] = None
         self._has_exported: bool = False
         self._mosaic_worker: MosaicWorker | None = None
 
@@ -239,6 +241,9 @@ class Mode3Widget(QWidget):
         self._export_hr_btn = QPushButton("Export HR to existing segments")
         self._export_hr_btn.clicked.connect(self._export_hr_to_existing_segments)
         ll.addWidget(self._export_hr_btn)
+        self._export_ppg_btn = QPushButton("Export synthetic PPG to existing segments")
+        self._export_ppg_btn.clicked.connect(self._export_ppg_to_existing_segments)
+        ll.addWidget(self._export_ppg_btn)
 
         self._progress = QProgressBar()
         self._progress.setTextVisible(True)
@@ -257,12 +262,12 @@ class Mode3Widget(QWidget):
         rl.setContentsMargins(4, 4, 4, 4)
         rl.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
-        self._player = MultiCameraPlayer()
+        self._player = MultiCameraPlayer(face_blur_enabled=state.blur_faces)
         self._player.setMinimumHeight(300)
         rl.addWidget(self._player)
 
         self._plot_type = QComboBox()
-        self._plot_type.addItems(["Heart rate", "ECG"])
+        self._plot_type.addItems(["Heart rate", "ECG", "Synthetic PPG"])
         self._plot_type.currentIndexChanged.connect(self._show_selected_plot)
         rl.addWidget(self._plot_type)
         self._plot = SignalPlot()
@@ -333,6 +338,7 @@ class Mode3Widget(QWidget):
         self._sync_timeline()
         self._hr_merged_df = None
         self._ecg_merged_df = None
+        self._ppg_merged_df = None
         if not self._load_synced_signal():
             self._load_signals()
         self._refresh_time_summary()
@@ -385,7 +391,12 @@ class Mode3Widget(QWidget):
         """Load pre-synced signal CSV from state. Returns True if loaded."""
         hr_paths = [path for path in self.state.synced_hr_paths if Path(path).exists()]
         ecg_paths = [path for path in self.state.synced_ecg_paths if Path(path).exists()]
-        if not hr_paths and not ecg_paths:
+        ppg_paths = (
+            [self.state.synthetic_ppg_path]
+            if self.state.synthetic_ppg_path and Path(self.state.synthetic_ppg_path).exists()
+            else []
+        )
+        if not hr_paths and not ecg_paths and not ppg_paths:
             return False
         loaded = False
         if hr_paths:
@@ -400,6 +411,12 @@ class Mode3Widget(QWidget):
                 loaded = True
             except Exception as exc:
                 log.warning("Could not load synchronized ECG CSVs %s: %s", ecg_paths, exc)
+        if ppg_paths:
+            try:
+                self._ppg_merged_df = read_synced_signal_csvs(ppg_paths)
+                loaded = True
+            except Exception as exc:
+                log.warning("Could not load synthetic PPG CSV %s: %s", ppg_paths, exc)
         if loaded:
             self._show_selected_plot()
         return loaded
@@ -455,7 +472,8 @@ class Mode3Widget(QWidget):
         return anchor
 
     def _show_selected_plot(self):
-        df = self._hr_merged_df if self._plot_type.currentIndex() == 0 else self._ecg_merged_df
+        frames = [self._hr_merged_df, self._ecg_merged_df, self._ppg_merged_df]
+        df = frames[self._plot_type.currentIndex()]
         if df is None:
             self._plot.clear()
             self._plot.set_intervals(self.state.intervals)
@@ -890,12 +908,21 @@ class Mode3Widget(QWidget):
                 dst = str(seg_dir / f"cam{ti+1}_{track.camera_label}.mp4")
                 duration = iv.end_sec - iv.start_sec
                 try:
-                    trim_video(
-                        src, dst,
-                        start_sec=iv.start_sec,
-                        duration_sec=duration,
-                        ffmpeg=ffmpeg,
-                    )
+                    if self.state.blur_faces:
+                        export_anonymized_video_segment(
+                            src,
+                            dst,
+                            start_sec=iv.start_sec,
+                            duration_sec=duration,
+                            ffmpeg=ffmpeg,
+                        )
+                    else:
+                        trim_video(
+                            src, dst,
+                            start_sec=iv.start_sec,
+                            duration_sec=duration,
+                            ffmpeg=ffmpeg,
+                        )
                 except Exception as exc:
                     log.error("Trim failed for %s: %s", dst, exc)
 
@@ -904,6 +931,9 @@ class Mode3Widget(QWidget):
             )
             ecg_files = self._export_signal_slice(
                 self._ecg_merged_df, signal_anchor, iv, seg_dir, "ecg_waveform"
+            )
+            ppg_files = self._export_signal_slice(
+                self._ppg_merged_df, signal_anchor, iv, seg_dir, "synthetic_ppg"
             )
             if self._remove_legacy_csv_cb.isChecked() and hr_files:
                 try:
@@ -936,6 +966,7 @@ class Mode3Widget(QWidget):
 
             synced_hr_rel = self._relative_signal_paths(self.state.synced_hr_paths, seg_dir)
             synced_ecg_rel = self._relative_signal_paths(self.state.synced_ecg_paths, seg_dir)
+            synthetic_ppg_rel = self._relative_signal_path(self.state.synthetic_ppg_path, seg_dir)
 
             meta = {
                 "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -948,8 +979,10 @@ class Mode3Widget(QWidget):
                 "cameras": cameras_meta,
                 "hr_files": hr_files,
                 "ecg_files": ecg_files,
+                "ppg_files": ppg_files,
                 "synced_hr_paths": synced_hr_rel,
                 "synced_ecg_paths": synced_ecg_rel,
+                "synthetic_ppg_path": synthetic_ppg_rel,
                 "signal_anchor_datetime_utc": signal_anchor.isoformat() if signal_anchor else None,
                 "segment_start_datetime_utc": (
                     (signal_anchor + timedelta(seconds=iv.start_sec)).isoformat()
@@ -1045,6 +1078,48 @@ class Mode3Widget(QWidget):
         self._export_signal_to_existing_segments(
             "HR", "hr", "synced_hr_paths", "heart_rate_bpm"
         )
+
+    def _export_ppg_to_existing_segments(self):
+        if self._ppg_merged_df is None:
+            self._load_synced_signal()
+        if self._ppg_merged_df is None:
+            QMessageBox.warning(
+                self, "Synthetic PPG unavailable", "Generate a synthetic PPG before exporting it."
+            )
+            return
+        intervals = [interval for interval in self.state.intervals if interval.folder]
+        anchor = self._signal_anchor()
+        if not intervals or anchor is None:
+            QMessageBox.information(
+                self, "No existing segments", "Import or export labelled segments first."
+            )
+            return
+        count = 0
+        for interval in intervals:
+            segment_directory = Path(interval.folder)
+            if not segment_directory.exists():
+                continue
+            file_names = self._export_signal_slice(
+                self._ppg_merged_df,
+                anchor,
+                interval,
+                segment_directory,
+                "synthetic_ppg",
+            )
+            if not file_names:
+                continue
+            metadata_path = segment_directory / "meta.json"
+            metadata = (
+                json.loads(metadata_path.read_text(encoding="utf-8"))
+                if metadata_path.exists() else {}
+            )
+            metadata["ppg_files"] = file_names
+            metadata["synthetic_ppg_path"] = self._relative_signal_path(
+                self.state.synthetic_ppg_path, segment_directory
+            )
+            metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+            count += 1
+        self._status.setText(f"Exported synthetic PPG to {count} existing segment(s).")
 
     def _export_signal_to_existing_segments(
         self,
@@ -1177,6 +1252,7 @@ class Mode3Widget(QWidget):
             end_sec=iv.end_sec,
             quality_preset=preset_key,
             ffmpeg_path=self.state.ffmpeg_path,
+            blur_faces=self.state.blur_faces,
         )
         self._mosaic_worker.progress.connect(self._on_mosaic_progress)
         self._mosaic_worker.finished.connect(self._on_mosaic_finished)

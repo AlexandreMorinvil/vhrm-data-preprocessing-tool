@@ -15,7 +15,7 @@ log = logging.getLogger(__name__)
 
 SIGNAL_CORE_COLUMNS = {"timestamp_utc", "value", "sensor_id"}
 SIGNAL_AUX_PREFIX = "aux__"
-SYNCED_PRIMARY_COLUMNS = ("heart_rate_bpm", "ecg_waveform")
+SYNCED_PRIMARY_COLUMNS = ("heart_rate_bpm", "ecg_waveform", "synthetic_ppg")
 
 
 class SignalLoader(abc.ABC):

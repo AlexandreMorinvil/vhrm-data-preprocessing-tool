@@ -119,6 +119,7 @@ class ProjectState:
     active_mode: int = 1
     mode1_complete: bool = False
     mode2_complete: bool = False
+    mode3_complete: bool = False
     ffmpeg_path: str = ""
     keep_temp_files: bool = False
     synced_signal_path: str = ""
@@ -126,10 +127,16 @@ class ProjectState:
     synced_ecg_path: str = ""
     synced_hr_paths: list[str] = field(default_factory=list)
     synced_ecg_paths: list[str] = field(default_factory=list)
+    synthetic_ppg_path: str = ""
+    synthetic_ppg_hr_path: str = ""
+    synthetic_ppg_hrv_path: str = ""
+    synthetic_rr_path: str = ""
+    synthetic_ppg_source_ecg_path: str = ""
     legacy_synced_paths: list[str] = field(default_factory=list)
     segments_manifest_path: str = ""
     mosaic_preset: str = "balanced"
     archive_removed_files: bool = False
+    blur_faces: bool = False
     time_coherence_tolerance_sec: float = 1.0
     last_signal_anchor_datetime: Optional[str] = None
     last_time_coherence_warnings: list[str] = field(default_factory=list)
@@ -199,6 +206,8 @@ _PATH_KEYS = {
     "project_path", "output_directory", "concatenated_path",
     "trimstart_path", "final_output_path", "ffmpeg_path",
     "synced_signal_path", "synced_hr_path", "synced_ecg_path",
+    "synthetic_ppg_path", "synthetic_ppg_hr_path", "synthetic_ppg_hrv_path",
+    "synthetic_rr_path", "synthetic_ppg_source_ecg_path",
     "segments_manifest_path", "folder",
 }
 _PATH_LIST_KEYS = {
@@ -332,6 +341,25 @@ def generate_sidecar(state: ProjectState) -> str:
 
     hr_synced_names = [Path(path).name for path in state.synced_hr_paths]
     ecg_synced_names = [Path(path).name for path in state.synced_ecg_paths]
+
+    def output_relative_path(path: str) -> str:
+        if not path:
+            return ""
+        try:
+            return str(Path(path).resolve().relative_to(Path(out_dir).resolve()))
+        except ValueError:
+            return Path(path).name
+
+    synthetic_paths = {
+        "synthetic_ppg_path": output_relative_path(state.synthetic_ppg_path),
+        "synthetic_ppg_hr_path": output_relative_path(state.synthetic_ppg_hr_path),
+        "synthetic_ppg_hrv_path": output_relative_path(state.synthetic_ppg_hrv_path),
+        "synthetic_rr_path": output_relative_path(state.synthetic_rr_path),
+        "synthetic_ppg_source_ecg_path": (
+            Path(state.synthetic_ppg_source_ecg_path).name
+            if state.synthetic_ppg_source_ecg_path else ""
+        ),
+    }
     anchor_dt, warnings = compute_signal_anchor(
         state.tracks, state.time_coherence_tolerance_sec
     )
@@ -346,6 +374,7 @@ def generate_sidecar(state: ProjectState) -> str:
         "ecg_signal_paths": [Path(p).name for p in state.ecg_signal_paths],
         "synced_hr_paths": hr_synced_names,
         "synced_ecg_paths": ecg_synced_names,
+        **synthetic_paths,
         "hr_time_range_sec": [0.0, common_dur] if hr_synced_names else None,
         "ecg_time_range_sec": [0.0, common_dur] if ecg_synced_names else None,
         "signal_paths": [Path(p).name for p in state.hr_signal_paths],
@@ -376,6 +405,11 @@ def load_sidecar(path: str, state: ProjectState) -> None:
     state.synced_ecg_path = ""
     state.synced_hr_paths.clear()
     state.synced_ecg_paths.clear()
+    state.synthetic_ppg_path = ""
+    state.synthetic_ppg_hr_path = ""
+    state.synthetic_ppg_hrv_path = ""
+    state.synthetic_rr_path = ""
+    state.synthetic_ppg_source_ecg_path = ""
     state.legacy_synced_paths.clear()
     for i, cam in enumerate(raw.get("cameras", [])):
         video_file = cam.get("final_video_path", "")
@@ -436,6 +470,15 @@ def load_sidecar(path: str, state: ProjectState) -> None:
         legacy_ecg = raw.get("synced_ecg_path")
         ecg_synced_names = [legacy_ecg] if legacy_ecg else []
     state.synced_ecg_paths = [str(base_dir / name) for name in ecg_synced_names if name]
+    for field_name in (
+        "synthetic_ppg_path",
+        "synthetic_ppg_hr_path",
+        "synthetic_ppg_hrv_path",
+        "synthetic_rr_path",
+        "synthetic_ppg_source_ecg_path",
+    ):
+        name = raw.get(field_name, "")
+        setattr(state, field_name, str(base_dir / name) if name else "")
 
     state.output_directory = str(base_dir)
     state.mode1_complete = True
@@ -448,6 +491,9 @@ def load_sidecar(path: str, state: ProjectState) -> None:
     state.mode2_complete = bool(
         any(Path(path).exists() for path in state.synced_hr_paths)
         or any(Path(path).exists() for path in state.synced_ecg_paths)
+    )
+    state.mode3_complete = bool(
+        state.synthetic_ppg_path and Path(state.synthetic_ppg_path).exists()
     )
 
     log.info("Loaded sidecar with %d camera(s) from %s", len(state.tracks), path)

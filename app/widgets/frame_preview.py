@@ -13,6 +13,8 @@ from PyQt6.QtWidgets import (
     QPushButton, QVBoxLayout, QWidget,
 )
 
+from ..face_privacy import anonymize_faces
+
 log = logging.getLogger(__name__)
 
 _DISPLAY_MIN_SIZE = QSize(240, 135)
@@ -25,7 +27,7 @@ _PREVIEW_COLUMNS = 2
 class FramePreview(QWidget):
     clicked = pyqtSignal()
 
-    def __init__(self, label: str = "Camera", parent=None):
+    def __init__(self, label: str = "Camera", face_blur_enabled: bool = False, parent=None):
         super().__init__(parent)
         self._cap: Optional[cv2.VideoCapture] = None
         self._fps: float = 30.0
@@ -34,6 +36,7 @@ class FramePreview(QWidget):
         self._video_path: str = ""
         self._source_pixmap: Optional[QPixmap] = None
         self._scaled_size_bucket: Optional[tuple[int, int]] = None
+        self._face_blur_enabled = face_blur_enabled
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
@@ -97,6 +100,17 @@ class FramePreview(QWidget):
         frame_no = int(ratio * (self._frame_count - 1))
         self.seek_frame(frame_no)
 
+    def set_face_blur_enabled(self, enabled: bool) -> None:
+        if self._face_blur_enabled == enabled:
+            return
+        self._face_blur_enabled = enabled
+        if self._cap is not None:
+            self._show_frame(self._current_frame)
+
+    @property
+    def face_blur_enabled(self) -> bool:
+        return self._face_blur_enabled
+
     @property
     def fps(self) -> float:
         return self._fps
@@ -121,6 +135,8 @@ class FramePreview(QWidget):
         if not ret:
             return
         self._current_frame = frame_no
+        if self._face_blur_enabled:
+            frame = anonymize_faces(frame)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
@@ -172,13 +188,14 @@ class MultiCameraPlayer(QWidget):
     frame_changed = pyqtSignal(int)
     export_frames_requested = pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, face_blur_enabled: bool = False, parent=None):
         super().__init__(parent)
         self._previews: list[FramePreview] = []
         self._playing = False
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._advance_frame)
         self._total_frames = 0
+        self._face_blur_enabled = face_blur_enabled
 
         self._vlayout = QVBoxLayout(self)
         self._preview_layout = QGridLayout()
@@ -215,7 +232,7 @@ class MultiCameraPlayer(QWidget):
             pw.deleteLater()
         self._previews.clear()
         for index, lbl in enumerate(labels):
-            pw = FramePreview(label=lbl)
+            pw = FramePreview(label=lbl, face_blur_enabled=self._face_blur_enabled)
             row, column = divmod(index, _PREVIEW_COLUMNS)
             self._preview_layout.addWidget(pw, row, column)
             self._previews.append(pw)
@@ -249,6 +266,11 @@ class MultiCameraPlayer(QWidget):
     @property
     def previews(self) -> list[FramePreview]:
         return self._previews
+
+    def set_face_blur_enabled(self, enabled: bool) -> None:
+        self._face_blur_enabled = enabled
+        for preview in self._previews:
+            preview.set_face_blur_enabled(enabled)
 
     @property
     def total_frames(self) -> int:

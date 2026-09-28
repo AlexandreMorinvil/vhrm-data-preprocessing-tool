@@ -243,7 +243,7 @@ class Mode2Widget(QWidget):
         rl.setContentsMargins(4, 4, 4, 4)
         rl.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
-        self._player = MultiCameraPlayer()
+        self._player = MultiCameraPlayer(face_blur_enabled=state.blur_faces)
         self._player.setMinimumHeight(300)
         rl.addWidget(self._player)
 
@@ -782,6 +782,7 @@ class Mode2Widget(QWidget):
             signal_df=self._hr_merged_df,
             quality_preset=preset_key,
             ffmpeg_path=self.state.ffmpeg_path,
+            blur_faces=self.state.blur_faces,
         )
         self._mosaic_worker.progress.connect(self._on_mosaic_progress)
         self._mosaic_worker.finished.connect(self._on_mosaic_finished)

@@ -31,6 +31,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
 from .ffmpeg_utils import find_ffmpeg
+from .face_privacy import anonymize_faces
 from .signals import is_aux_signal_column
 
 log = logging.getLogger(__name__)
@@ -261,6 +262,7 @@ def export_mosaic(
     ffmpeg_path: str = "",
     progress_callback: Optional[Callable[[int, int], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    blur_faces: bool = False,
 ) -> str:
     """Render a mosaic video frame-by-frame and pipe to FFmpeg.
 
@@ -423,6 +425,8 @@ def export_mosaic(
                     if cam_idx < n_cams and caps[cam_idx] is not None:
                         ret, raw = caps[cam_idx].read()
                         if ret:
+                            if blur_faces:
+                                raw = anonymize_faces(raw)
                             lx, ly, lw, lh = cam_layouts[cam_idx]
                             if lw > 0 and lh > 0:
                                 resized = cv2.resize(raw, (lw, lh), interpolation=cv2.INTER_AREA)
@@ -498,6 +502,7 @@ class MosaicWorker(QThread):
         end_sec: float = 0.0,
         quality_preset: str = "balanced",
         ffmpeg_path: str = "",
+        blur_faces: bool = False,
         parent=None,
     ):
         super().__init__(parent)
@@ -512,6 +517,7 @@ class MosaicWorker(QThread):
         self._end_sec = end_sec
         self._quality_preset = quality_preset
         self._ffmpeg_path = ffmpeg_path
+        self._blur_faces = blur_faces
         self._cancelled = False
 
     def cancel(self):
@@ -538,6 +544,7 @@ class MosaicWorker(QThread):
                 ffmpeg_path=self._ffmpeg_path,
                 progress_callback=self._on_progress,
                 cancel_check=lambda: self._cancelled,
+                blur_faces=self._blur_faces,
             )
             if self._cancelled:
                 self.finished.emit(False, "Cancelled.")

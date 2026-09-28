@@ -278,7 +278,7 @@ class Mode1Widget(QWidget):
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(4, 4, 4, 4)
 
-        self._player = MultiCameraPlayer()
+        self._player = MultiCameraPlayer(face_blur_enabled=state.blur_faces)
         right_layout.addWidget(self._player)
 
         self._metadata_panel = _MetadataPanel("Video metadata")

@@ -103,6 +103,19 @@ class SignalExportTests(unittest.TestCase):
                 list(frame.columns), ["timestamp_utc", "Polar", "Zephyr"]
             )
 
+    def test_reads_synthetic_ppg_as_a_separated_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "synthetic_ppg.csv"
+            pd.DataFrame({
+                "timestamp_utc": ["2026-01-01T00:00:00Z"],
+                "synthetic_ppg": [0.75],
+            }).to_csv(path, index=False)
+
+            frame = read_synced_signal_csvs([path])
+
+            self.assertIsNotNone(frame)
+            self.assertEqual(list(frame.columns), ["timestamp_utc", "Synthetic_Ppg"])
+
     def test_migrates_legacy_project_signal_paths(self) -> None:
         state = ProjectState.from_dict({
             "synced_signal_path": "hr_synced.csv",
