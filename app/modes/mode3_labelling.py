@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -65,6 +66,12 @@ from ..widgets.timeline import IntervalItem, TimelineWidget, colour_for_label
 log = logging.getLogger(__name__)
 
 _META_FILTER = "Metadata sidecar (*.json);;All files (*)"
+_SYNTHETIC_ARTIFACT_FIELDS = (
+    "synthetic_ppg_path",
+    "synthetic_ppg_hr_path",
+    "synthetic_ppg_hrv_path",
+    "synthetic_rr_path",
+)
 
 
 def _secs_to_qtime(sec: float) -> QTime:
@@ -235,15 +242,9 @@ class Mode3Widget(QWidget):
         self._export_btn.setStyleSheet("font-weight:bold; padding:8px;")
         self._export_btn.clicked.connect(self._export)
         ll.addWidget(self._export_btn)
-        self._export_ecg_btn = QPushButton("Export ECG to existing segments")
-        self._export_ecg_btn.clicked.connect(self._export_ecg_to_existing_segments)
-        ll.addWidget(self._export_ecg_btn)
-        self._export_hr_btn = QPushButton("Export HR to existing segments")
-        self._export_hr_btn.clicked.connect(self._export_hr_to_existing_segments)
-        ll.addWidget(self._export_hr_btn)
-        self._export_ppg_btn = QPushButton("Export synthetic PPG to existing segments")
-        self._export_ppg_btn.clicked.connect(self._export_ppg_to_existing_segments)
-        ll.addWidget(self._export_ppg_btn)
+        self._export_signals_btn = QPushButton("Export all signals to existing segments")
+        self._export_signals_btn.clicked.connect(self._export_signals_to_existing_segments)
+        ll.addWidget(self._export_signals_btn)
 
         self._progress = QProgressBar()
         self._progress.setTextVisible(True)
@@ -926,15 +927,10 @@ class Mode3Widget(QWidget):
                 except Exception as exc:
                     log.error("Trim failed for %s: %s", dst, exc)
 
-            hr_files = self._export_signal_slice(
-                self._hr_merged_df, signal_anchor, iv, seg_dir, "heart_rate_bpm"
-            )
-            ecg_files = self._export_signal_slice(
-                self._ecg_merged_df, signal_anchor, iv, seg_dir, "ecg_waveform"
-            )
-            ppg_files = self._export_signal_slice(
-                self._ppg_merged_df, signal_anchor, iv, seg_dir, "synthetic_ppg"
-            )
+            signal_meta = self._export_all_signal_slices(signal_anchor, iv, seg_dir)
+            hr_files = signal_meta["hr_files"]
+            ecg_files = signal_meta["ecg_files"]
+            ppg_files = signal_meta["ppg_files"]
             if self._remove_legacy_csv_cb.isChecked() and hr_files:
                 try:
                     cleaned_legacy_count += cleanup_obsolete_paths(
@@ -966,7 +962,6 @@ class Mode3Widget(QWidget):
 
             synced_hr_rel = self._relative_signal_paths(self.state.synced_hr_paths, seg_dir)
             synced_ecg_rel = self._relative_signal_paths(self.state.synced_ecg_paths, seg_dir)
-            synthetic_ppg_rel = self._relative_signal_path(self.state.synthetic_ppg_path, seg_dir)
 
             meta = {
                 "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -982,7 +977,6 @@ class Mode3Widget(QWidget):
                 "ppg_files": ppg_files,
                 "synced_hr_paths": synced_hr_rel,
                 "synced_ecg_paths": synced_ecg_rel,
-                "synthetic_ppg_path": synthetic_ppg_rel,
                 "signal_anchor_datetime_utc": signal_anchor.isoformat() if signal_anchor else None,
                 "segment_start_datetime_utc": (
                     (signal_anchor + timedelta(seconds=iv.start_sec)).isoformat()
@@ -995,6 +989,7 @@ class Mode3Widget(QWidget):
                 "time_coherence_tolerance_sec": self.state.time_coherence_tolerance_sec,
                 "time_coherence_warnings": coherence_warnings,
             }
+            meta.update(signal_meta["synthetic_artifacts"])
             (seg_dir / "meta.json").write_text(
                 json.dumps(meta, indent=2), encoding="utf-8"
             )
@@ -1069,73 +1064,63 @@ class Mode3Widget(QWidget):
             for path in write_synced_signal_csvs(sub, destination, primary_column)
         ]
 
-    def _export_ecg_to_existing_segments(self):
-        self._export_signal_to_existing_segments(
-            "ECG", "ecg", "synced_ecg_paths", "ecg_waveform"
-        )
+    def _export_synthetic_artifact_slices(
+        self, anchor: datetime, interval: LabelInterval, segment_directory: Path
+    ) -> dict[str, str]:
+        sources = {
+            field_name: Path(path)
+            for field_name in _SYNTHETIC_ARTIFACT_FIELDS
+            if (path := getattr(self.state, field_name))
+            if path and Path(path).exists()
+        }
+        if not sources:
+            return {}
 
-    def _export_hr_to_existing_segments(self):
-        self._export_signal_to_existing_segments(
-            "HR", "hr", "synced_hr_paths", "heart_rate_bpm"
-        )
-
-    def _export_ppg_to_existing_segments(self):
-        if self._ppg_merged_df is None:
-            self._load_synced_signal()
-        if self._ppg_merged_df is None:
-            QMessageBox.warning(
-                self, "Synthetic PPG unavailable", "Generate a synthetic PPG before exporting it."
-            )
-            return
-        intervals = [interval for interval in self.state.intervals if interval.folder]
-        anchor = self._signal_anchor()
-        if not intervals or anchor is None:
-            QMessageBox.information(
-                self, "No existing segments", "Import or export labelled segments first."
-            )
-            return
-        count = 0
-        for interval in intervals:
-            segment_directory = Path(interval.folder)
-            if not segment_directory.exists():
+        destination = segment_directory / "synthetic_ppg"
+        if destination.exists():
+            shutil.rmtree(destination)
+        destination.mkdir(parents=True)
+        start = pd.Timestamp(anchor + timedelta(seconds=interval.start_sec))
+        end = pd.Timestamp(anchor + timedelta(seconds=interval.end_sec))
+        exported: dict[str, str] = {}
+        for field_name, source in sources.items():
+            frame = pd.read_csv(source)
+            if "timestamp_utc" not in frame.columns:
+                log.warning("Synthetic artifact has no timestamp_utc column: %s", source)
                 continue
-            file_names = self._export_signal_slice(
-                self._ppg_merged_df,
-                anchor,
-                interval,
-                segment_directory,
-                "synthetic_ppg",
+            timestamps = pd.to_datetime(
+                frame["timestamp_utc"], format="mixed", utc=True, errors="coerce"
             )
-            if not file_names:
+            sliced = frame[(timestamps >= start) & (timestamps <= end)]
+            if sliced.empty:
                 continue
-            metadata_path = segment_directory / "meta.json"
-            metadata = (
-                json.loads(metadata_path.read_text(encoding="utf-8"))
-                if metadata_path.exists() else {}
-            )
-            metadata["ppg_files"] = file_names
-            metadata["synthetic_ppg_path"] = self._relative_signal_path(
-                self.state.synthetic_ppg_path, segment_directory
-            )
-            metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-            count += 1
-        self._status.setText(f"Exported synthetic PPG to {count} existing segment(s).")
+            relative_path = Path("synthetic_ppg") / source.name
+            sliced.to_csv(segment_directory / relative_path, index=False)
+            exported[field_name] = relative_path.as_posix()
+        return exported
 
-    def _export_signal_to_existing_segments(
-        self,
-        display_name: str,
-        file_stem: str,
-        state_paths_name: str,
-        primary_column: str,
-    ):
-        df = self._ecg_merged_df if file_stem == "ecg" else self._hr_merged_df
-        if df is None and not self._load_synced_signal():
-            QMessageBox.warning(self, f"{display_name} unavailable", f"Load a project metadata file with a synchronized {display_name} CSV first.")
-            return
-        df = self._ecg_merged_df if file_stem == "ecg" else self._hr_merged_df
-        if df is None:
-            QMessageBox.warning(self, f"{display_name} unavailable", f"No synchronized {display_name} CSV is available.")
-            return
+    def _export_all_signal_slices(
+        self, anchor: datetime, interval: LabelInterval, segment_directory: Path
+    ) -> dict[str, object]:
+        hr_files = self._export_signal_slice(
+            self._hr_merged_df, anchor, interval, segment_directory, "heart_rate_bpm"
+        )
+        ecg_files = self._export_signal_slice(
+            self._ecg_merged_df, anchor, interval, segment_directory, "ecg_waveform"
+        )
+        synthetic_artifacts = self._export_synthetic_artifact_slices(
+            anchor, interval, segment_directory
+        )
+        ppg_path = synthetic_artifacts.get("synthetic_ppg_path")
+        return {
+            "hr_files": hr_files,
+            "ecg_files": ecg_files,
+            "ppg_files": [ppg_path] if ppg_path else [],
+            "synthetic_artifacts": synthetic_artifacts,
+        }
+
+    def _export_signals_to_existing_segments(self):
+        self._load_synced_signal()
         intervals = [interval for interval in self.state.intervals if interval.folder]
         if not intervals:
             QMessageBox.information(
@@ -1145,7 +1130,7 @@ class Mode3Widget(QWidget):
             return
         anchor = self._signal_anchor()
         if anchor is None:
-            QMessageBox.warning(self, f"{display_name} unavailable", "Video time anchor is unavailable.")
+            QMessageBox.warning(self, "Signals unavailable", "Video time anchor is unavailable.")
             return
         count = 0
         cleaned_legacy_count = 0
@@ -1154,21 +1139,29 @@ class Mode3Widget(QWidget):
             if not seg_dir.exists():
                 continue
             legacy_csv_paths = self._legacy_segment_csv_paths(seg_dir)
-            file_names = self._export_signal_slice(
-                df, anchor, interval, seg_dir, primary_column
-            )
-            if not file_names:
+            signal_meta = self._export_all_signal_slices(anchor, interval, seg_dir)
+            if not any((
+                signal_meta["hr_files"],
+                signal_meta["ecg_files"],
+                signal_meta["ppg_files"],
+                signal_meta["synthetic_artifacts"],
+            )):
                 continue
             meta_path = seg_dir / "meta.json"
             meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
-            meta[f"{file_stem}_files"] = file_names
-            meta[state_paths_name] = self._relative_signal_paths(
-                getattr(self.state, state_paths_name), seg_dir
+            meta["hr_files"] = signal_meta["hr_files"]
+            meta["ecg_files"] = signal_meta["ecg_files"]
+            meta["ppg_files"] = signal_meta["ppg_files"]
+            meta["synced_hr_paths"] = self._relative_signal_paths(
+                self.state.synced_hr_paths, seg_dir
             )
-            if (
-                file_stem == "hr"
-                and self._remove_legacy_csv_cb.isChecked()
-            ):
+            meta["synced_ecg_paths"] = self._relative_signal_paths(
+                self.state.synced_ecg_paths, seg_dir
+            )
+            for field_name in _SYNTHETIC_ARTIFACT_FIELDS:
+                meta.pop(field_name, None)
+            meta.update(signal_meta["synthetic_artifacts"])
+            if self._remove_legacy_csv_cb.isChecked() and signal_meta["hr_files"]:
                 try:
                     cleaned_legacy_count += cleanup_obsolete_paths(
                         legacy_csv_paths,
@@ -1181,7 +1174,7 @@ class Mode3Widget(QWidget):
                     log.warning("Could not clean up legacy segment CSV files: %s", exc)
             meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
             count += 1
-        status = f"Exported {display_name} to {count} existing segment(s)."
+        status = f"Exported all available signals to {count} existing segment(s)."
         if cleaned_legacy_count:
             action = "archived" if self.state.archive_removed_files else "removed"
             status += f" Legacy CSVs {action}: {cleaned_legacy_count}."

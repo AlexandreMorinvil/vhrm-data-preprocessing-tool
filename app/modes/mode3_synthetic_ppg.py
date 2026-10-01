@@ -152,6 +152,79 @@ def _comparison_text(
     )
 
 
+SYNTHETIC_PPG_VIEWS = (
+    "ECG + synthetic PPG (normalized)",
+    "Synthetic PPG",
+    "Heart rate comparison",
+    "HRV comparison",
+    "Detected RR intervals",
+)
+
+
+def build_synthetic_ppg_view(
+    view_index: int,
+    *,
+    ppg: pd.DataFrame | None,
+    heart_rate: pd.DataFrame | None,
+    hrv: pd.DataFrame | None,
+    rr: pd.DataFrame | None,
+    ecg: pd.DataFrame | None,
+    sensor_hr: pd.DataFrame | None,
+) -> tuple[pd.DataFrame | None, str]:
+    """Return the plot frame and comparison metrics for one of ``SYNTHETIC_PPG_VIEWS``."""
+    frame: pd.DataFrame | None = None
+    metric_text = ""
+    if view_index == 0:
+        renamed_ppg = ppg.rename(columns={"synthetic_ppg": "Synthetic PPG"}) if ppg is not None else None
+        frame = _combine_timestamped([ecg, renamed_ppg])
+        frame = _normalise_columns(frame) if frame is not None else None
+    elif view_index == 1:
+        frame = ppg
+    elif view_index == 2:
+        generated = (
+            heart_rate.rename(columns={"heart_rate_bpm": "Synthetic PPG HR (10 s FFT)"})
+            if heart_rate is not None else None
+        )
+        frame = _combine_timestamped([sensor_hr, generated])
+        if sensor_hr is not None and heart_rate is not None:
+            reference_columns = [
+                column for column in sensor_hr.columns
+                if column != "timestamp_utc" and not is_aux_signal_column(str(column))
+            ]
+            if reference_columns:
+                zephyr_columns = [
+                    column for column in reference_columns
+                    if str(column).lower().startswith("zephyr")
+                ]
+                reference_column = zephyr_columns[0] if zephyr_columns else reference_columns[0]
+                metric_text = _comparison_text(
+                    sensor_hr, reference_column, heart_rate, "heart_rate_bpm", "BPM"
+                )
+    elif view_index == 3:
+        references = None
+        reference_column = None
+        if sensor_hr is not None:
+            hrv_columns = [column for column in sensor_hr.columns if str(column).endswith("__HRV")]
+            if hrv_columns:
+                reference_column = hrv_columns[0]
+                references = sensor_hr[["timestamp_utc", reference_column]].copy()
+                references[reference_column] = pd.to_numeric(references[reference_column], errors="coerce")
+                references = references[references[reference_column].between(1, 1000)]
+                references = references.rename(columns={reference_column: "Zephyr HRV"})
+                reference_column = "Zephyr HRV"
+        generated = None
+        if hrv is not None:
+            generated = hrv[["timestamp_utc", "sdnn_ms", "rmssd_ms"]].rename(
+                columns={"sdnn_ms": "Synthetic PPG SDNN", "rmssd_ms": "Synthetic PPG RMSSD"}
+            )
+        frame = _combine_timestamped([references, generated])
+        if references is not None and hrv is not None and reference_column is not None:
+            metric_text = _comparison_text(references, reference_column, hrv, "sdnn_ms", "ms")
+    else:
+        frame = rr.rename(columns={"rr_interval_ms": "ECG RR interval"}) if rr is not None else None
+    return frame, metric_text
+
+
 class SyntheticPpgWidget(QWidget):
     def __init__(self, state: ProjectState, parent=None):
         super().__init__(parent)
@@ -230,13 +303,7 @@ class SyntheticPpgWidget(QWidget):
         self._player.setMinimumHeight(300)
         right_layout.addWidget(self._player)
         self._view = QComboBox()
-        self._view.addItems([
-            "ECG + synthetic PPG (normalized)",
-            "Synthetic PPG",
-            "Heart rate comparison",
-            "HRV comparison",
-            "Detected RR intervals",
-        ])
+        self._view.addItems(SYNTHETIC_PPG_VIEWS)
         self._view.currentIndexChanged.connect(self._show_selected_plot)
         right_layout.addWidget(self._view)
         self._plot = SignalPlot()
@@ -397,73 +464,15 @@ class SyntheticPpgWidget(QWidget):
         self._status.setText("Synthetic PPG generation skipped.")
 
     def _show_selected_plot(self) -> None:
-        frame: pd.DataFrame | None = None
-        metric_text = ""
-        if self._view.currentIndex() == 0:
-            ppg = self._ppg.rename(columns={"synthetic_ppg": "Synthetic PPG"}) if self._ppg is not None else None
-            frame = _combine_timestamped([self._ecg, ppg])
-            frame = _normalise_columns(frame) if frame is not None else None
-        elif self._view.currentIndex() == 1:
-            frame = self._ppg
-        elif self._view.currentIndex() == 2:
-            generated = (
-                self._heart_rate.rename(
-                    columns={"heart_rate_bpm": "Synthetic PPG HR (10 s FFT)"}
-                )
-                if self._heart_rate is not None else None
-            )
-            frame = _combine_timestamped([self._sensor_hr, generated])
-            if self._sensor_hr is not None and self._heart_rate is not None:
-                reference_columns = [
-                    column for column in self._sensor_hr.columns
-                    if column != "timestamp_utc" and not is_aux_signal_column(str(column))
-                ]
-                if reference_columns:
-                    zephyr_columns = [
-                        column for column in reference_columns
-                        if str(column).lower().startswith("zephyr")
-                    ]
-                    reference_column = (
-                        zephyr_columns[0] if zephyr_columns else reference_columns[0]
-                    )
-                    metric_text = _comparison_text(
-                        self._sensor_hr,
-                        reference_column,
-                        self._heart_rate,
-                        "heart_rate_bpm",
-                        "BPM",
-                    )
-        elif self._view.currentIndex() == 3:
-            references = None
-            reference_column = None
-            if self._sensor_hr is not None:
-                hrv_columns = [column for column in self._sensor_hr.columns if str(column).endswith("__HRV")]
-                if hrv_columns:
-                    reference_column = hrv_columns[0]
-                    references = self._sensor_hr[["timestamp_utc", reference_column]].copy()
-                    references[reference_column] = pd.to_numeric(references[reference_column], errors="coerce")
-                    references = references[references[reference_column].between(1, 1000)]
-                    references = references.rename(columns={reference_column: "Zephyr HRV"})
-                    reference_column = "Zephyr HRV"
-            generated = None
-            if self._hrv is not None:
-                generated = self._hrv[["timestamp_utc", "sdnn_ms", "rmssd_ms"]].rename(
-                    columns={"sdnn_ms": "Synthetic PPG SDNN", "rmssd_ms": "Synthetic PPG RMSSD"}
-                )
-            frame = _combine_timestamped([references, generated])
-            if references is not None and self._hrv is not None and reference_column is not None:
-                metric_text = _comparison_text(
-                    references,
-                    reference_column,
-                    self._hrv,
-                    "sdnn_ms",
-                    "ms",
-                )
-        else:
-            frame = (
-                self._rr.rename(columns={"rr_interval_ms": "ECG RR interval"})
-                if self._rr is not None else None
-            )
+        frame, metric_text = build_synthetic_ppg_view(
+            self._view.currentIndex(),
+            ppg=self._ppg,
+            heart_rate=self._heart_rate,
+            hrv=self._hrv,
+            rr=self._rr,
+            ecg=self._ecg,
+            sensor_hr=self._sensor_hr,
+        )
 
         if frame is None or frame.empty:
             self._plot.clear()

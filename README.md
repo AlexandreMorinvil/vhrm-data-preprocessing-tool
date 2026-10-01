@@ -38,11 +38,11 @@ python main.py
    not load the original ECG or look for peaks outside the imported interval.
    Output spans from the first detected peak through the last detected peak. It
    also exports detected RR intervals, one-second HR estimates from overlapping
-   10-second FFT windows, rolling 300-beat SDNN, and RMSSD. The HR estimator uses
+   10-second FFT windows, and SDNN/RMSSD over the latest 30-300 accepted beats. The HR estimator uses
    sampling-rate-scaled smoothness-prior detrending, a 0.6-3.3 Hz band-pass, and
-   continuity-aware fundamental selection to avoid mistaking the synthetic
-   waveform's second harmonic for heart rate. Spectral peaks are refined between
-   FFT bins to avoid stair-step BPM values. When synchronized Zephyr HR exists,
+   continuity- and autocorrelation-supported fundamental selection to avoid
+   mistaking the synthetic waveform's second harmonic for heart rate. Spectral
+   peaks are refined between FFT bins to avoid stair-step BPM values. When synchronized Zephyr HR exists,
    generated HR is evaluated on those exact timestamps and therefore has the same
    point count; timestamps near either edge use the nearest complete 10-second
    PPG window. Views compare synthetic HR and HRV with synchronized Zephyr data

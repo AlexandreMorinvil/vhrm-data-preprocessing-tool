@@ -38,8 +38,25 @@ from ..widgets.frame_preview import MultiCameraPlayer
 from ..widgets.layout import configure_main_splitter
 from ..widgets.signal_plot import SignalPlot
 from ..widgets.timeline import IntervalItem, TimelineWidget
+from .mode3_synthetic_ppg import (
+    SYNTHETIC_PPG_VIEWS,
+    _read_timestamped_csv,
+    build_synthetic_ppg_view,
+)
 
 log = logging.getLogger(__name__)
+
+_SYNTHETIC_ARTIFACT_FIELDS = (
+    "synthetic_ppg_path",
+    "synthetic_ppg_hr_path",
+    "synthetic_ppg_hrv_path",
+    "synthetic_rr_path",
+)
+
+
+def _utc_timestamp(value) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    return timestamp.tz_localize("UTC") if timestamp.tzinfo is None else timestamp.tz_convert("UTC")
 
 
 class _SegmentInfo:
@@ -67,11 +84,11 @@ class Mode4Widget(QWidget):
         self._current_seg: Optional[_SegmentInfo] = None
         self._synced_hr_df: Optional[pd.DataFrame] = None
         self._synced_ecg_df: Optional[pd.DataFrame] = None
-        self._synced_ppg_df: Optional[pd.DataFrame] = None
+        self._synced_synthetic: dict[str, Optional[pd.DataFrame]] = {}
         self._mosaic_worker: MosaicWorker | None = None
         self._seg_hr_df: Optional[pd.DataFrame] = None
         self._seg_ecg_df: Optional[pd.DataFrame] = None
-        self._seg_ppg_df: Optional[pd.DataFrame] = None
+        self._seg_synthetic: dict[str, Optional[pd.DataFrame]] = {}
 
         root = QHBoxLayout(self)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -137,9 +154,13 @@ class Mode4Widget(QWidget):
         rl.addWidget(self._player)
 
         self._plot_type = QComboBox()
-        self._plot_type.addItems(["Heart rate", "ECG", "Synthetic PPG"])
+        self._plot_type.addItems(["Heart rate", "ECG", *SYNTHETIC_PPG_VIEWS])
         self._plot_type.currentIndexChanged.connect(self._show_selected_plot)
         rl.addWidget(self._plot_type)
+
+        self._metrics_label = QLabel("")
+        self._metrics_label.setWordWrap(True)
+        rl.addWidget(self._metrics_label)
 
         self._plot = SignalPlot()
         self._plot.setFixedHeight(420)
@@ -174,7 +195,7 @@ class Mode4Widget(QWidget):
         self._current_seg = None
         self._seg_hr_df = None
         self._seg_ecg_df = None
-        self._seg_ppg_df = None
+        self._seg_synthetic = {}
         for segment in self._segments:
             self._seg_list.addItem(
                 f"[{segment.index}] {segment.label}  ({segment.duration_sec:.1f}s)"
@@ -231,10 +252,95 @@ class Mode4Widget(QWidget):
         self._synced_ecg_df = self._load_synced_signal(
             self.state.synced_ecg_paths, "synced_ecg_paths"
         )
-        ppg_paths = [self.state.synthetic_ppg_path] if self.state.synthetic_ppg_path else []
-        self._synced_ppg_df = self._load_synced_signal(
-            ppg_paths, "synthetic_ppg_path"
+        self._synced_synthetic = {
+            field_name: self._load_synced_synthetic_artifact(field_name)
+            for field_name in _SYNTHETIC_ARTIFACT_FIELDS
+        }
+
+    @staticmethod
+    def _read_segment_meta(seg: _SegmentInfo) -> dict:
+        meta_path = seg.dir_path / "meta.json"
+        if not meta_path.exists():
+            return {}
+        try:
+            return json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _load_synced_synthetic_artifact(self, field_name: str) -> Optional[pd.DataFrame]:
+        """Load a project-level synthetic artifact, else stitch the per-segment slices."""
+        try:
+            frame = _read_timestamped_csv(getattr(self.state, field_name, "") or "")
+        except Exception as exc:
+            log.error("Error loading %s: %s", field_name, exc)
+            frame = None
+        if frame is not None:
+            return frame
+
+        frames = []
+        for seg in self._segments:
+            relative_path = self._read_segment_meta(seg).get(field_name)
+            if not relative_path:
+                continue
+            try:
+                segment_frame = _read_timestamped_csv(str(seg.dir_path / relative_path))
+            except Exception as exc:
+                log.error("Error loading %s for segment %d: %s", field_name, seg.index, exc)
+                continue
+            if segment_frame is not None:
+                frames.append(segment_frame)
+        if not frames:
+            return None
+        return (
+            pd.concat(frames, ignore_index=True)
+            .drop_duplicates(subset="timestamp_utc")
+            .sort_values("timestamp_utc")
+            .reset_index(drop=True)
         )
+
+    def _load_segment_synthetic_artifacts(
+        self, seg: _SegmentInfo, meta: dict
+    ) -> dict[str, Optional[pd.DataFrame]]:
+        artifacts: dict[str, Optional[pd.DataFrame]] = {}
+        for field_name in _SYNTHETIC_ARTIFACT_FIELDS:
+            relative_path = meta.get(field_name)
+            if not relative_path and field_name == "synthetic_ppg_path" and meta.get("ppg_files"):
+                relative_path = meta["ppg_files"][0]
+            frame = None
+            if relative_path:
+                try:
+                    frame = _read_timestamped_csv(str(seg.dir_path / relative_path))
+                except Exception as exc:
+                    log.error("Error loading %s for segment %d: %s", field_name, seg.index, exc)
+            if frame is None:
+                frame = self._slice_to_segment(self._synced_synthetic.get(field_name), seg, meta)
+            artifacts[field_name] = frame
+        return artifacts
+
+    def _slice_to_segment(
+        self, frame: Optional[pd.DataFrame], seg: _SegmentInfo, meta: dict
+    ) -> Optional[pd.DataFrame]:
+        if frame is None or frame.empty:
+            return None
+        try:
+            if meta.get("segment_start_datetime_utc") and meta.get("segment_end_datetime_utc"):
+                start_ts = _utc_timestamp(meta["segment_start_datetime_utc"])
+                end_ts = _utc_timestamp(meta["segment_end_datetime_utc"])
+            else:
+                anchor = (
+                    _utc_timestamp(self.state.last_signal_anchor_datetime)
+                    if self.state.last_signal_anchor_datetime
+                    else frame["timestamp_utc"].iloc[0]
+                )
+                start_ts = anchor + pd.Timedelta(seconds=seg.start_sec)
+                end_ts = anchor + pd.Timedelta(seconds=seg.end_sec)
+            sliced = frame[
+                (frame["timestamp_utc"] >= start_ts) & (frame["timestamp_utc"] <= end_ts)
+            ].reset_index(drop=True)
+        except Exception as exc:
+            log.error("Error slicing synthetic artifact for segment %d: %s", seg.index, exc)
+            return None
+        return sliced if not sliced.empty else None
 
     def _load_synced_signal(
         self,
@@ -276,27 +382,35 @@ class Mode4Widget(QWidget):
                 log.error("Error loading %s: %s", metadata_key, exc)
         return None
 
-    def _show_selected_plot(self):
+    def _selected_view(self) -> tuple[Optional[pd.DataFrame], str]:
         plot_index = self._plot_type.currentIndex()
+        in_segment = self._current_seg is not None
+        hr_df = self._seg_hr_df if in_segment else self._synced_hr_df
+        ecg_df = self._seg_ecg_df if in_segment else self._synced_ecg_df
+        if plot_index == 0:
+            return hr_df, ""
+        if plot_index == 1:
+            return ecg_df, ""
+        synthetic = self._seg_synthetic if in_segment else self._synced_synthetic
+        return build_synthetic_ppg_view(
+            plot_index - 2,
+            ppg=synthetic.get("synthetic_ppg_path"),
+            heart_rate=synthetic.get("synthetic_ppg_hr_path"),
+            hrv=synthetic.get("synthetic_ppg_hrv_path"),
+            rr=synthetic.get("synthetic_rr_path"),
+            ecg=ecg_df,
+            sensor_hr=hr_df,
+        )
+
+    def _show_selected_plot(self):
+        df, metric_text = self._selected_view()
+        self._metrics_label.setText(metric_text)
         if self._current_seg is not None:
-            if plot_index == 0:
-                df = self._seg_hr_df
-            elif plot_index == 1:
-                df = self._seg_ecg_df
-            else:
-                df = self._seg_ppg_df
             if df is None or df.empty:
                 self._plot.clear()
                 return
             self._plot.set_data(df, video_duration_sec=self._current_seg.duration_sec)
             return
-
-        if plot_index == 0:
-            df = self._synced_hr_df
-        elif plot_index == 1:
-            df = self._synced_ecg_df
-        else:
-            df = self._synced_ppg_df
         self._show_signal_overview(df)
 
     def _show_signal_overview(self, df: Optional[pd.DataFrame]):
@@ -346,7 +460,7 @@ class Mode4Widget(QWidget):
         self._current_seg = None
         self._seg_hr_df = None
         self._seg_ecg_df = None
-        self._seg_ppg_df = None
+        self._seg_synthetic = {}
         self._seg_list.blockSignals(True)
         self._seg_list.clearSelection()
         self._seg_list.setCurrentRow(-1)
@@ -400,9 +514,7 @@ class Mode4Widget(QWidget):
         self._seg_ecg_df = self._load_segment_signal(
             seg, meta, "ecg_files", self._synced_ecg_df
         )
-        self._seg_ppg_df = self._load_segment_signal(
-            seg, meta, "ppg_files", self._synced_ppg_df
-        )
+        self._seg_synthetic = self._load_segment_synthetic_artifacts(seg, meta)
         self._show_selected_plot()
 
         # --- Info panel ---
@@ -547,12 +659,7 @@ class Mode4Widget(QWidget):
 
         fps = self._player.get_fps() or 30.0
         total_frames = int(seg.duration_sec * fps)
-        if self._plot_type.currentIndex() == 1:
-            signal_df = self._seg_ecg_df
-        elif self._plot_type.currentIndex() == 2:
-            signal_df = self._seg_ppg_df
-        else:
-            signal_df = self._seg_hr_df
+        signal_df, _ = self._selected_view()
 
         self._mosaic_worker = MosaicWorker(
             video_paths=video_paths,

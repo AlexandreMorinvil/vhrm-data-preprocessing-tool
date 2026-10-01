@@ -71,7 +71,7 @@ All internal and exported timestamps are timezone-aware UTC timestamps.
 | HRV artifact filter | Accepted interval | 300-2000 ms |
 | HRV artifact filter | Local median width | 11 intervals |
 | HRV artifact filter | Accepted local ratio | 0.6-1.6 |
-| HRV | Window length | 300 accepted intervals |
+| HRV | Window length | 30-300 accepted intervals (expanding, then rolling) |
 | HRV | Update interval | 1 s |
 
 ECG detection and PPG sampling parameters are editable in the GUI. The current
@@ -205,24 +205,44 @@ $HR=60f$ BPM.
 ### Second-harmonic correction
 
 The two-Gaussian morphology can make the second harmonic stronger than the
-fundamental. A continuity-aware guard is applied after dominant-bin selection.
-Let $HR_m$ be the median of the previous five accepted estimates. A candidate
-is treated as a possible second harmonic when:
+fundamental. Two independent guards are applied after dominant-bin selection:
+recent-HR continuity and window autocorrelation. Let $HR_m$ be the median of the
+previous five accepted estimates. A candidate is treated as a possible second
+harmonic by the continuity path when:
 
 $$
 1.6HR_m < HR_{candidate} < 2.4HR_m.
 $$
 
 The strongest spectral bin in a five-bin neighborhood around half the dominant
-frequency is selected as the fundamental candidate. It replaces the dominant
-candidate only when:
+frequency is selected as the fundamental candidate. The continuity path uses
+that candidate only when its power is at least 20% of the dominant peak power
+and its BPM differs from $HR_m$ by no more than 30%.
 
-- its power is at least 20% of the dominant peak power; and
-- its BPM differs from $HR_m$ by no more than 30%.
+Continuity alone cannot recover when the first analyzed window is already on the
+second harmonic or when a lock persists long enough to redefine the recent
+median. Therefore, autocorrelation is calculated from the same FFT power through
+the Wiener-Khinchin relation. The positive-lag autocorrelation is divided by the
+number of overlapping samples at each lag. The strongest local maximum between
+$f_s/3.3$ and $f_s/0.6$ samples is refined parabolically and converted to an
+autocorrelation HR, $HR_{ACF}$. The half-frequency candidate is selected when:
 
-This is a continuity rule, not a fixed upper-HR cutoff. It was chosen to reject
-abrupt $2\times$ harmonic locks while allowing gradual physiological changes.
-It can nevertheless suppress a genuine abrupt near-doubling and must be
+$$
+1.6HR_{ACF} < HR_{candidate} < 2.4HR_{ACF}
+$$
+
+and the half-frequency BPM differs from $HR_{ACF}$ by no more than 30%. This
+autocorrelation path does not require the 20% spectral-power threshold because
+its purpose is to recover a fundamental that is weak in the amplitude spectrum.
+After a history is available, autocorrelation-only correction is applied only
+when the dominant candidate differs by more than 10% from the median of the
+previous five accepted estimates. This prevents isolated autocorrelation
+subharmonics from halving a dominant estimate that is already locally stable.
+
+Neither path uses a fixed upper-HR cutoff or reference HR values. The combined
+rule rejects abrupt and sustained $2\times$ harmonic locks, including locks
+present from the first window. It can nevertheless suppress a genuine signal
+whose dominant frequency is twice an autocorrelation subharmonic and must be
 reported as an algorithmic assumption.
 
 ### Output timestamps and edge windows
@@ -256,8 +276,14 @@ $$
 0.6\leq\frac{IBI_i}{\operatorname{median}_{11}(IBI)}\leq1.6.
 $$
 
-At each one-second output time after 300 accepted intervals are available, SDNN
-is the sample standard deviation of the most recent 300 accepted intervals:
+At each one-second output time after at least 30 accepted intervals are
+available, SDNN is the sample standard deviation of the most recent
+$N=\min(n_{accepted}, 300)$ accepted intervals. The window therefore expands
+from 30 to 300 intervals and then rolls. The warm-up exists because the
+synthetic PPG starts at the first detected peak of the synchronized ECG crop:
+a short recording (for example, a 175 s baseline with about 200 beats) never
+reaches 300 intervals, whereas Zephyr has beat history from before the crop.
+The `accepted_intervals` column records $N$ for every estimate:
 
 $$
 SDNN=\sqrt{\frac{1}{N-1}\sum_{i=1}^{N}(IBI_i-\overline{IBI})^2}.
@@ -273,7 +299,7 @@ $$
 
 where $C$ is the set of accepted adjacent interval pairs. `quality_fraction` is
 the accepted fraction of all intervals in the time span covered by the current
-300-accepted-interval window.
+window.
 
 ## Outputs and provenance
 
@@ -299,11 +325,14 @@ listed above.
 
 ## Development validation example
 
-The following results are an engineering regression check on one development
-recording (`jzc16`), not an independent validation cohort. Synthetic HR was
-compared with synchronized Zephyr HR at 1,984 identical timestamps.
+The following results are engineering regression checks, not an independent
+validation cohort. They must not be presented as clinical performance.
 
-| Measure | Earlier beat-to-beat implementation | Current implementation |
+The first table records the 2026-09-24 `jzc16` development comparison at 1,984
+identical timestamps. “FFT implementation” refers to the continuity-corrected
+implementation before autocorrelation support was added.
+
+| Measure | Earlier beat-to-beat implementation | FFT implementation (2026-09-24) |
 |---|---:|---:|
 | Generated/reference rows | not equal | 1,984 / 1,984 |
 | Distinct generated HR values | not recorded | 1,976 |
@@ -314,11 +343,24 @@ compared with synchronized Zephyr HR at 1,984 identical timestamps.
 | Pearson correlation | 0.528 | 0.931 |
 | Bias, generated minus Zephyr | +3.50 BPM | -0.07 BPM |
 
-The improvement resulted from replacing instantaneous pulse-to-pulse HR with
-windowed FFT HR, adding second-harmonic correction, matching reference
-timestamps, and refining spectral peaks between bins. These numbers quantify
-software behavior on this recording only. They do not establish clinical
-accuracy, generalizability, or equivalence to Zephyr.
+The second table records the `jzc17` regression that motivated autocorrelation
+support. Both columns use the same saved synthetic PPG and 1,902 synchronized
+Zephyr timestamps.
+
+| Measure | Continuity-only correction | Continuity + autocorrelation (2026-09-28) |
+|---|---:|---:|
+| Generated HR range | 36.48-108.60 BPM | 36.48-108.60 BPM |
+| MAE versus Zephyr | 5.54 BPM | 3.17 BPM |
+| RMSE versus Zephyr | 11.31 BPM | 5.11 BPM |
+| Pearson correlation | 0.753 | 0.940 |
+| Bias, generated minus Zephyr | not recorded | -0.54 BPM |
+| Absolute errors above 20 BPM | 154 | 19 |
+
+The improvements resulted from separating HR from pulse-interval HRV, matching
+reference timestamps, refining spectral peaks between bins, and adding two
+independent second-harmonic checks. These numbers quantify software behavior on
+two development recordings only. They do not establish clinical accuracy,
+generalizability, or equivalence to Zephyr.
 
 ## Implementation choices and change rationale
 
@@ -334,8 +376,9 @@ accuracy, generalizability, or equivalence to Zephyr.
    into the estimate.
 5. **Use sub-bin interpolation.** Zero-padding plus log-parabolic refinement
    reduces visually blocky frequency-bin quantization.
-6. **Use continuity-aware harmonic correction.** This addresses the observed
-   second-harmonic failure without imposing a universal maximum HR.
+6. **Combine continuity and autocorrelation for harmonic correction.** Recent HR
+   handles abrupt harmonic jumps, while autocorrelation can recover when a lock
+   begins immediately or persists. Neither imposes a universal maximum HR.
 7. **Keep generated artifacts together.** A dedicated directory improves
    provenance, portability, cleanup, and labelled-segment integration.
 8. **Run generation off the GUI thread.** Long ECG recordings and ODE
@@ -354,6 +397,8 @@ accuracy, generalizability, or equivalence to Zephyr.
 | 2026-09-24 | Matched generated HR timestamps to synchronized Zephyr HR when available | Produced equal point counts and direct time-aligned comparisons without using Zephyr HR values in estimation. |
 | 2026-09-24 | Added FFT zero-padding and log-parabolic peak refinement | Reduced frequency-bin quantization and visibly blocky HR trajectories. |
 | 2026-09-24 | Grouped outputs under `synthetic_ppg/` | Kept waveform, RR, HR, and HRV provenance together and simplified cleanup and transfer. |
+| 2026-09-28 | Added history-gated, autocorrelation-supported second-harmonic correction | Fixed long and start-of-recording harmonic locks that could defeat recent-HR continuity while limiting false subharmonic selection; jzc17 large-error points fell from 154 to 19. |
+| 2026-09-29 | Changed HRV from a fixed 300-interval window to an expanding 30-300 interval window | Recordings shorter than 300 beats previously produced an empty HRV file; a 175 s jzc02 baseline now yields 144 estimates. |
 
 Changes after a study analysis begins should be treated as analysis-pipeline
 changes. Regenerate all affected outputs and record the software revision rather
@@ -369,10 +414,14 @@ than mixing artifacts produced by different rows of this table.
 - ECG peak errors propagate into RR timing, PPG morphology, and HRV.
 - The exact Zephyr artifact correction and normal-beat classification are not
   reproduced.
-- The harmonic continuity rule may misclassify an abrupt real HR transition.
+- Harmonic correction may select a subharmonic when autocorrelation favors a
+   longer period than the true rhythm.
 - A 10-second HR window smooths rapid changes and introduces temporal averaging;
   timestamp matching does not imply instantaneous equivalence.
 - Edge estimates reuse the nearest complete window.
+- Early HRV values use fewer than 300 intervals. SDNN depends on window length,
+  so estimates with small `accepted_intervals` are not directly comparable to
+  300-beat SDNN and should be reported or filtered accordingly.
 - The current development validation uses one recording and one reference
   device. A publication should report subject-level and aggregate uncertainty,
   agreement plots, missingness, and pre-specified exclusion rules.
@@ -391,11 +440,12 @@ the study protocol rather than copied without verification:
 > sample-rounding drift, and the resulting waveform was min-max normalized.
 > Heart rate was estimated every second from overlapping 10-s windows using
 > smoothness-prior detrending, a 0.6-3.3 Hz band-pass, an oversampled FFT,
-> log-parabolic peak interpolation, and continuity-aware second-harmonic
-> correction. Generated HR was evaluated at the synchronized reference HR
+> log-parabolic peak interpolation, and continuity- and
+> autocorrelation-supported second-harmonic correction. Generated HR was evaluated at the synchronized reference HR
 > timestamps when available. HRV was computed independently from detected pulse
-> intervals as rolling 300-interval SDNN and RMSSD after physiological and local
-> median artifact filtering.
+> intervals as SDNN and RMSSD over the most recent accepted intervals (expanding
+> from 30 to 300, then rolling) after physiological and local median artifact
+> filtering.
 
 ## References and licensing
 

@@ -140,6 +140,42 @@ def _refine_peak_frequency(
     return float(frequencies[peak_index] + offset * (frequencies[1] - frequencies[0]))
 
 
+def _estimate_autocorrelation_bpm(
+    power: np.ndarray,
+    *,
+    nfft: int,
+    window_samples: int,
+    fs: float,
+    low_hz: float,
+    high_hz: float,
+) -> float:
+    """Estimate the fundamental period from overlap-normalized autocorrelation."""
+
+    autocorrelation = np.fft.irfft(power, n=nfft)[:window_samples]
+    minimum_lag = max(1, round(fs / high_hz))
+    maximum_lag = min(window_samples - 2, round(fs / low_hz))
+    lags = np.arange(minimum_lag, maximum_lag + 1)
+    scores = autocorrelation[lags] / (window_samples - lags)
+    peaks, _ = find_peaks(scores)
+    peak_offset = int(peaks[np.argmax(scores[peaks])]) if peaks.size else int(np.argmax(scores))
+    lag = float(lags[peak_offset])
+    if 0 < peak_offset < scores.size - 1:
+        denominator = (
+            scores[peak_offset - 1]
+            - 2.0 * scores[peak_offset]
+            + scores[peak_offset + 1]
+        )
+        if abs(denominator) > np.finfo(float).eps:
+            lag += float(np.clip(
+                0.5
+                * (scores[peak_offset - 1] - scores[peak_offset + 1])
+                / denominator,
+                -0.5,
+                0.5,
+            ))
+    return float(60.0 * fs / lag)
+
+
 def estimate_ppg_heart_rate(
     ppg: pd.DataFrame,
     *,
@@ -218,21 +254,41 @@ def estimate_ppg_heart_rate(
         peak_index = np.flatnonzero(in_band)[np.argmax(power[in_band])]
         peak_frequency = _refine_peak_frequency(frequencies, power, peak_index)
         bpm = float(peak_frequency * 60.0)
+        half_center = int(np.argmin(np.abs(frequencies - peak_frequency / 2.0)))
+        half_candidates = np.arange(max(1, half_center - 2), half_center + 3)
+        half_index = int(half_candidates[np.argmax(power[half_candidates])])
+        half_frequency = _refine_peak_frequency(frequencies, power, half_index)
+        half_bpm = float(half_frequency * 60.0)
+        half_power_ratio = power[half_index] / power[peak_index]
+        autocorrelation_bpm = _estimate_autocorrelation_bpm(
+            power,
+            nfft=nfft,
+            window_samples=window_samples,
+            fs=fs,
+            low_hz=low_hz,
+            high_hz=high_hz,
+        )
+        autocorrelation_support = (
+            1.6 * autocorrelation_bpm < bpm < 2.4 * autocorrelation_bpm
+            and abs(half_bpm - autocorrelation_bpm) <= 0.3 * autocorrelation_bpm
+        )
+        continuity_support = False
+        dominant_disagrees_with_history = not recent_bpm
         if recent_bpm:
             recent_median = float(np.median(recent_bpm[-5:]))
-            half_center = int(np.argmin(np.abs(frequencies - peak_frequency / 2.0)))
-            half_candidates = np.arange(max(1, half_center - 2), half_center + 3)
-            half_index = int(half_candidates[np.argmax(power[half_candidates])])
-            half_frequency = _refine_peak_frequency(frequencies, power, half_index)
-            half_bpm = float(half_frequency * 60.0)
-            half_power_ratio = power[half_index] / power[peak_index]
-            harmonic_jump = 1.6 * recent_median < bpm < 2.4 * recent_median
-            supported_fundamental = (
-                half_power_ratio >= 0.2
+            dominant_disagrees_with_history = (
+                abs(bpm - recent_median) > 0.1 * recent_median
+            )
+            continuity_support = (
+                1.6 * recent_median < bpm < 2.4 * recent_median
                 and abs(half_bpm - recent_median) <= 0.3 * recent_median
             )
-            if harmonic_jump and supported_fundamental:
-                bpm = half_bpm
+        if (
+            autocorrelation_support and dominant_disagrees_with_history
+        ) or (
+            half_power_ratio >= 0.2 and continuity_support
+        ):
+            bpm = half_bpm
         estimates.append({
             "timestamp_utc": output_time,
             "heart_rate_bpm": bpm,
@@ -246,6 +302,7 @@ def estimate_ppg_metrics(
     *,
     fs: float,
     window_beats: int = 300,
+    min_window_beats: int = 30,
     step_seconds: float = 1.0,
     hr_timestamps: pd.DatetimeIndex | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -285,21 +342,23 @@ def estimate_ppg_metrics(
         & (local_ratio <= 1.6)
     )
     accepted_indices = np.flatnonzero(accepted)
-    if accepted_indices.size < window_beats:
+    min_window_beats = max(3, min(min_window_beats, window_beats))
+    if accepted_indices.size < min_window_beats:
         return heart_rate, pd.DataFrame(columns=hrv_columns)
 
     valid_times = interval_end_times[accepted_indices]
-    first_output = valid_times[window_beats - 1].ceil(f"{step_seconds}s")
+    first_output = valid_times[min_window_beats - 1].ceil(f"{step_seconds}s")
     last_output = interval_end_times[-1].floor(f"{step_seconds}s")
     output_times = pd.date_range(first_output, last_output, freq=f"{step_seconds}s")
     estimates = []
     for output_time in output_times:
         valid_stop = int(valid_times.searchsorted(output_time, side="right"))
-        if valid_stop < window_beats:
+        if valid_stop < min_window_beats:
             continue
-        window_indices = accepted_indices[valid_stop - window_beats : valid_stop]
+        window_count = min(valid_stop, window_beats)
+        window_indices = accepted_indices[valid_stop - window_count : valid_stop]
         window = intervals_ms[window_indices]
-        window_start = valid_times[valid_stop - window_beats] - pd.to_timedelta(
+        window_start = valid_times[valid_stop - window_count] - pd.to_timedelta(
             window[0], unit="ms"
         )
         in_span = (interval_end_times > window_start) & (interval_end_times <= output_time)
@@ -310,7 +369,7 @@ def estimate_ppg_metrics(
             "timestamp_utc": output_time,
             "sdnn_ms": float(np.std(window, ddof=1)),
             "rmssd_ms": float(np.sqrt(np.mean(successive**2))) if successive.size else np.nan,
-            "accepted_intervals": window_beats,
+            "accepted_intervals": window_count,
             "rejected_intervals": total_count - accepted_count,
             "quality_fraction": accepted_count / total_count if total_count else 0.0,
         })

@@ -103,6 +103,22 @@ class SyntheticPpgTimingTests(unittest.TestCase):
         self.assertAlmostEqual(hrv["sdnn_ms"].max(), 0.0, places=6)
         self.assertAlmostEqual(hrv["rmssd_ms"].max(), 0.0, places=6)
 
+    def test_hrv_uses_expanding_window_for_short_recordings(self) -> None:
+        fs = 40.0
+        elapsed = np.arange(0.0, 120.0, 1.0 / fs)
+        ppg = pd.DataFrame({
+            "timestamp_utc": pd.Timestamp("2026-01-01T12:00:00Z")
+            + pd.to_timedelta(elapsed, unit="s"),
+            "synthetic_ppg": np.sin(2 * np.pi * elapsed),
+        })
+
+        _heart_rate, hrv = estimate_ppg_metrics(ppg, fs=fs)
+
+        self.assertFalse(hrv.empty)
+        self.assertEqual(hrv["accepted_intervals"].min(), 30)
+        self.assertLess(hrv["accepted_intervals"].max(), 300)
+        self.assertTrue(hrv["accepted_intervals"].is_monotonic_increasing)
+
     def test_fft_hr_rejects_sustained_second_harmonic_lock(self) -> None:
         fs = 40.0
         elapsed = np.arange(0.0, 45.0, 1.0 / fs)
@@ -122,6 +138,42 @@ class SyntheticPpgTimingTests(unittest.TestCase):
         heart_rate = estimate_ppg_heart_rate(ppg, fs=fs)
 
         self.assertLess(heart_rate["heart_rate_bpm"].max(), 100.0)
+        self.assertAlmostEqual(heart_rate["heart_rate_bpm"].median(), 75.0, delta=3.0)
+
+    def test_fft_hr_recovers_when_harmonic_lock_starts_immediately(self) -> None:
+        fs = 40.0
+        elapsed = np.arange(0.0, 30.0, 1.0 / fs)
+        fundamental = 0.4 * np.sin(2 * np.pi * 1.25 * elapsed)
+        second_harmonic = np.sin(2 * np.pi * 2.5 * elapsed)
+        ppg = pd.DataFrame({
+            "timestamp_utc": pd.Timestamp("2026-01-01T12:00:00Z")
+            + pd.to_timedelta(elapsed, unit="s"),
+            "synthetic_ppg": fundamental + second_harmonic,
+        })
+
+        heart_rate = estimate_ppg_heart_rate(ppg, fs=fs)
+
+        self.assertLess(heart_rate["heart_rate_bpm"].max(), 100.0)
+        self.assertAlmostEqual(heart_rate["heart_rate_bpm"].median(), 75.0, delta=3.0)
+
+    def test_recent_hr_prevents_false_autocorrelation_halving(self) -> None:
+        fs = 40.0
+        elapsed = np.arange(0.0, 45.0, 1.0 / fs)
+        cycles = np.floor(elapsed * 1.25).astype(int)
+        amplitude = np.where(
+            elapsed < 15.0,
+            1.0,
+            np.where(cycles % 2 == 0, 1.0, 0.35),
+        )
+        ppg = pd.DataFrame({
+            "timestamp_utc": pd.Timestamp("2026-01-01T12:00:00Z")
+            + pd.to_timedelta(elapsed, unit="s"),
+            "synthetic_ppg": amplitude * np.sin(2 * np.pi * 1.25 * elapsed),
+        })
+
+        heart_rate = estimate_ppg_heart_rate(ppg, fs=fs)
+
+        self.assertGreater(heart_rate["heart_rate_bpm"].min(), 70.0)
         self.assertAlmostEqual(heart_rate["heart_rate_bpm"].median(), 75.0, delta=3.0)
 
     def test_fft_hr_matches_reference_timestamps_and_refines_frequency(self) -> None:
