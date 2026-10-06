@@ -9,6 +9,7 @@ from typing import Optional
 import pandas as pd
 from PyQt6.QtCore import Qt, QTime
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -26,6 +27,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSplitter,
+    QStyle,
     QTimeEdit,
     QVBoxLayout,
     QWidget,
@@ -160,19 +162,25 @@ class Mode2Widget(QWidget):
         hr_grp = QGroupBox("Heart rate")
         hr_lay = QVBoxLayout(hr_grp)
         self._hr_file_list = QListWidget()
+        self._hr_file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         hr_lay.addWidget(self._hr_file_list)
         hr_btn = QPushButton("Add HR file …")
         hr_btn.clicked.connect(lambda: self._add_signal(self._hr_file_list, "HR"))
         hr_lay.addWidget(hr_btn)
+        self._remove_hr_btn = self._make_remove_signal_button(self._hr_file_list)
+        hr_lay.addWidget(self._remove_hr_btn)
         sources_lay.addWidget(hr_grp)
 
         ecg_grp = QGroupBox("ECG")
         ecg_lay = QVBoxLayout(ecg_grp)
         self._ecg_file_list = QListWidget()
+        self._ecg_file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         ecg_lay.addWidget(self._ecg_file_list)
         ecg_btn = QPushButton("Add ECG file …")
         ecg_btn.clicked.connect(lambda: self._add_signal(self._ecg_file_list, "ECG"))
         ecg_lay.addWidget(ecg_btn)
+        self._remove_ecg_btn = self._make_remove_signal_button(self._ecg_file_list)
+        ecg_lay.addWidget(self._remove_ecg_btn)
         sources_lay.addWidget(ecg_grp)
         ll.addWidget(sources_grp)
 
@@ -362,6 +370,7 @@ class Mode2Widget(QWidget):
         files, _ = QFileDialog.getOpenFileNames(
             self, "Select signal files", "", _SIGNAL_FILTER,
         )
+        added = False
         for p in files:
             loader = signal_file_type_name(p)
             if signal_kind == "ECG" and loader != "ECG waveform":
@@ -373,6 +382,33 @@ class Mode2Widget(QWidget):
             existing = self._paths_from_list(target)
             if p not in existing:
                 target.addItem(self._make_signal_item(p))
+                added = True
+        if added:
+            self._update_source_paths()
+
+    def _make_remove_signal_button(self, target: QListWidget) -> QPushButton:
+        button = QPushButton("Remove selected")
+        button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon))
+        button.setToolTip("Remove selected source signals from the project without deleting the original files.")
+        button.setEnabled(False)
+        target.itemSelectionChanged.connect(lambda: button.setEnabled(bool(target.selectedItems())))
+        button.clicked.connect(lambda: self._remove_signals(target))
+        return button
+
+    def _remove_signals(self, target: QListWidget):
+        selected = target.selectedItems()
+        if not selected:
+            return
+        for item in selected:
+            target.takeItem(target.row(item))
+        self._update_source_paths()
+        self._status.setText("Removed source signals from the project. Original files unchanged.")
+
+    def _update_source_paths(self):
+        self.state.hr_signal_paths = self._paths_from_list(self._hr_file_list)
+        self.state.signal_paths = list(self.state.hr_signal_paths)
+        self.state.ecg_signal_paths = self._paths_from_list(self._ecg_file_list)
+        self.state.mode2_complete = False
 
     # ------------------------------------------------------------------
     # Camera time correction
@@ -615,13 +651,18 @@ class Mode2Widget(QWidget):
 
         loaded_hr = self._load_clip_and_pivot(hr_paths, anchor, duration, False)
         loaded_ecg = self._load_clip_and_pivot(ecg_paths, anchor, duration, False)
-        if loaded_hr is not None:
-            self._hr_merged_df = loaded_hr
-        if loaded_ecg is not None:
-            self._ecg_merged_df = loaded_ecg
-        if self._hr_merged_df is None and self._ecg_merged_df is None:
+        if loaded_hr is None and loaded_ecg is None:
             QMessageBox.warning(self, "Warning", "No signal data within the video time range.")
             return
+        self._hr_merged_df = loaded_hr
+        self._ecg_merged_df = loaded_ecg
+        if loaded_hr is None:
+            self.state.synced_hr_paths = []
+            self.state.synced_hr_path = ""
+            self.state.synced_signal_path = ""
+        if loaded_ecg is None:
+            self.state.synced_ecg_paths = []
+            self.state.synced_ecg_path = ""
 
         out_dir = self.state.output_directory
         legacy_paths = set(self.state.legacy_synced_paths)

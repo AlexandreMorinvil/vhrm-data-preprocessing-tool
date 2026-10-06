@@ -31,7 +31,11 @@ python main.py
    `zephyr_1.csv`, or `ecg_1.csv`). Sensor numbering always starts at `_1`,
    even when only one sensor of that type is loaded. Select the plot type to view one signal kind at
    a time. Legacy projects containing combined synchronized CSVs remain
-   supported.
+   supported. To replace source signals, select files in the Heart rate or ECG
+   source list and click **Remove selected**, then add the new files and run
+   **Load & synchronise HR / ECG** again. Multiple sources can be selected with
+   Ctrl or Shift. Removal only unlinks sources from the project; it does not
+   delete the original files or existing synchronized CSVs from disk.
 3. **Synthetic PPG (optional)** — choose one of the ECG files produced by Signal
    sync, detect R peaks, and generate an absolute-timestamped synthetic PPG at
    125 Hz. Only samples in that synchronized ECG are used; the generator does
