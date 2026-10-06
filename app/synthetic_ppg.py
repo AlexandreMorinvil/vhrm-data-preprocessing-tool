@@ -80,6 +80,18 @@ def detect_ecg_peaks(
         distance=max(1, round(min_peak_distance_s * fs)),
         prominence=prominence_factor * robust_scale,
     )
+    candidate_prominences = properties["prominences"]
+    local_qrs_prominence = (
+        pd.Series(
+            candidate_prominences,
+            index=pd.DatetimeIndex(samples["timestamp_utc"].iloc[peak_indices]),
+        )
+        .rolling("10s", center=True, min_periods=1)
+        .quantile(0.9)
+        .to_numpy()
+    )
+    accepted = candidate_prominences >= 0.25 * local_qrs_prominence
+    peak_indices = peak_indices[accepted]
     if peak_indices.size < 2:
         raise ValueError("Too few ECG peaks detected; inspect the signal or detector settings")
 
@@ -89,7 +101,7 @@ def detect_ecg_peaks(
         "rr_interval_ms": pd.Series(peak_times).diff().dt.total_seconds().mul(1000.0),
         "ecg_waveform": values[peak_indices],
         "filtered_ecg": filtered[peak_indices],
-        "prominence": properties["prominences"],
+        "prominence": candidate_prominences[accepted],
     })
     return result.reset_index(drop=True)
 

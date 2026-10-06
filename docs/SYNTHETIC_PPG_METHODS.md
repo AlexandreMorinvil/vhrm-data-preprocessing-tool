@@ -5,7 +5,7 @@
 This document is the canonical technical description of the synthetic
 photoplethysmography (PPG) stage in the Video Research Tool. It is intended to
 support software maintenance, reproducibility, and preparation of a scientific
-paper. It describes the implementation as of **2026-09-25**.
+paper. It describes the implementation as of **2026-10-06**.
 
 The implementation is in:
 
@@ -58,6 +58,9 @@ All internal and exported timestamps are timezone-aware UTC timestamps.
 | ECG detector | Band-pass | 5-25 Hz |
 | ECG detector | Minimum peak distance | 0.35 s |
 | ECG detector | Prominence multiplier | 4.0 |
+| ECG detector | Local prominence window | 10 s, centered |
+| ECG detector | Local QRS prominence estimate | 90th percentile of candidate prominences |
+| ECG detector | Relative prominence threshold | 25% of local QRS prominence estimate |
 | PPG synthesis | Sampling frequency | 125 Hz |
 | PPG model | Gaussian phase locations | -1.6184, 0.8903 rad |
 | PPG model | Gaussian amplitudes | 0.7482, 0.0444 |
@@ -74,8 +77,9 @@ All internal and exported timestamps are timezone-aware UTC timestamps.
 | HRV | Window length | 30-300 accepted intervals (expanding, then rolling) |
 | HRV | Update interval | 1 s |
 
-ECG detection and PPG sampling parameters are editable in the GUI. The current
-HR and HRV analysis settings are implementation constants.
+ECG band-pass, minimum peak distance, prominence multiplier, and PPG sampling
+frequency are editable in the GUI. The local prominence filter and current HR
+and HRV analysis settings are implementation constants.
 
 ## ECG R-peak detection
 
@@ -97,9 +101,19 @@ s_{MAD}=\operatorname{median}\left(\left|x_f-
 \operatorname{median}(x_f)\right|\right).
 $$
 
-SciPy `find_peaks` detects positive peaks with a minimum separation of 0.35 s
-and minimum prominence $4s_{MAD}$. RR intervals are timestamp differences
-between consecutive detected peaks:
+SciPy `find_peaks` proposes positive peaks with a minimum separation of 0.35 s
+and minimum prominence $4s_{MAD}$. A noise-floor threshold alone can also accept
+small secondary ECG waves between genuine R peaks, shortening RR intervals
+and inflating the synthesized pulse rate.
+
+For each candidate, the detector estimates local QRS prominence as the 90th
+percentile of candidate prominences in a centered 10-second window. It keeps
+only candidates with at least 25% of that local estimate. The relative threshold
+adapts to changes in ECG amplitude without imposing a target HR or modifying
+the timestamps of accepted peaks. Zephyr HR values are not used for detection.
+This is a prominence-based rejection rule, not a morphological QRS classifier.
+
+RR intervals are timestamp differences between consecutive accepted peaks:
 
 $$
 RR_i = t_i-t_{i-1}.

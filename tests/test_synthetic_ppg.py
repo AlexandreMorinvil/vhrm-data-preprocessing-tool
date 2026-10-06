@@ -9,6 +9,7 @@ from app.synthetic_ppg import (
     detect_ecg_peaks,
     estimate_ppg_heart_rate,
     estimate_ppg_metrics,
+    generate_synthetic_ppg,
     synthesize_from_peak_times,
 )
 from app.state import ProjectState
@@ -81,6 +82,55 @@ class SyntheticPpgTimingTests(unittest.TestCase):
         ).dt.total_seconds().to_numpy()
         self.assertEqual(len(peaks), 9)
         np.testing.assert_allclose(detected_elapsed, np.arange(1.0, 9.1, 1.0), atol=0.02)
+
+    def test_ecg_detector_rejects_secondary_waves_between_beats(self) -> None:
+        fs = 250.0
+        elapsed = np.arange(0.0, 30.0, 1.0 / fs)
+        expected_peaks = np.arange(1.0, 29.1, 1.0)
+        values = 0.03 * np.sin(2 * np.pi * 0.3 * elapsed)
+        for peak_time in expected_peaks:
+            amplitude = 1.0 if peak_time < 15.0 else 0.3
+            values += amplitude * np.exp(-0.5 * ((elapsed - peak_time) / 0.015) ** 2)
+            values += 0.18 * amplitude * np.exp(
+                -0.5 * ((elapsed - peak_time - 0.42) / 0.035) ** 2
+            )
+        ecg = pd.DataFrame({
+            "timestamp_utc": pd.Timestamp("2026-01-01T12:00:00Z")
+            + pd.to_timedelta(elapsed, unit="s"),
+            "ecg_waveform": values,
+        })
+
+        result = generate_synthetic_ppg(ecg, fs=40.0)
+        peaks = result.peaks
+
+        detected_elapsed = (
+            peaks["timestamp_utc"] - ecg["timestamp_utc"].iloc[0]
+        ).dt.total_seconds().to_numpy()
+        self.assertEqual(len(peaks), len(expected_peaks))
+        np.testing.assert_allclose(detected_elapsed, expected_peaks, atol=0.02)
+        self.assertAlmostEqual(result.heart_rate["heart_rate_bpm"].median(), 60.0, delta=2.0)
+        self.assertLess(result.heart_rate["heart_rate_bpm"].max(), 70.0)
+
+    def test_ecg_detector_preserves_genuine_high_rate_beats(self) -> None:
+        fs = 250.0
+        elapsed = np.arange(0.0, 12.0, 1.0 / fs)
+        expected_peaks = np.arange(1.0, 11.1, 0.4)
+        values = np.zeros_like(elapsed)
+        for peak_time in expected_peaks:
+            values += np.exp(-0.5 * ((elapsed - peak_time) / 0.015) ** 2)
+        ecg = pd.DataFrame({
+            "timestamp_utc": pd.Timestamp("2026-01-01T12:00:00Z")
+            + pd.to_timedelta(elapsed, unit="s"),
+            "ecg_waveform": values,
+        })
+
+        peaks = detect_ecg_peaks(ecg)
+
+        detected_elapsed = (
+            peaks["timestamp_utc"] - ecg["timestamp_utc"].iloc[0]
+        ).dt.total_seconds().to_numpy()
+        self.assertEqual(len(peaks), len(expected_peaks))
+        np.testing.assert_allclose(detected_elapsed, expected_peaks, atol=0.02)
 
     def test_estimates_windowed_hr_and_hrv_from_constant_pulse_train(self) -> None:
         fs = 40.0
