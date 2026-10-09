@@ -6,38 +6,37 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QTimer, QUrl
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFileDialog,
-    QGroupBox,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
-    QLayout,
     QListWidget,
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QScrollArea,
-    QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
-from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_preset
 from ..frame_export import export_player_frames
+from ..mosaic_export import MosaicWorker
 from ..signals import read_synced_signal_csvs
 from ..state import (
     LabelInterval,
     ProjectState,
+    effective_signal_anchor,
     load_labelled_segments_manifest,
     load_sidecar,
 )
 from ..widgets.frame_preview import MultiCameraPlayer
-from ..widgets.layout import configure_main_splitter
+from ..widgets.layout import ModeWorkspace
 from ..widgets.signal_plot import SignalPlot
 from ..widgets.timeline import IntervalItem, TimelineWidget
+from .common import ask_mosaic_options, export_snapshot_interactive
 from .mode3_synthetic_ppg import (
     SYNTHETIC_PPG_VIEWS,
     _read_timestamped_csv,
@@ -89,39 +88,60 @@ class Mode4Widget(QWidget):
         self._seg_hr_df: Optional[pd.DataFrame] = None
         self._seg_ecg_df: Optional[pd.DataFrame] = None
         self._seg_synthetic: dict[str, Optional[pd.DataFrame]] = {}
+        self._seg_time_zero: Optional[pd.Timestamp] = None
 
         root = QHBoxLayout(self)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        root.addWidget(splitter)
+        root.setContentsMargins(0, 0, 0, 0)
+        self._workspace = ModeWorkspace("review", self)
+        root.addWidget(self._workspace)
+        ws = self._workspace
 
-        left = QWidget()
-        ll = QVBoxLayout(left)
-        ll.setContentsMargins(4, 4, 4, 4)
-
+        load_box = QWidget()
+        load_lay = QVBoxLayout(load_box)
+        load_lay.setContentsMargins(0, 0, 0, 0)
         self._meta_btn = QPushButton("Load from metadata file …")
         self._meta_btn.clicked.connect(self._load_from_meta)
-        ll.addWidget(self._meta_btn)
+        load_lay.addWidget(self._meta_btn)
         self._load_btn = QPushButton("Load manifest CSV …")
         self._load_btn.clicked.connect(self._load_manifest)
-        ll.addWidget(self._load_btn)
+        load_lay.addWidget(self._load_btn)
+        ws.add_section("Project data", load_box)
 
+        seg_box = QWidget()
+        seg_lay = QVBoxLayout(seg_box)
+        seg_lay.setContentsMargins(0, 0, 0, 0)
         self._global_view_btn = QPushButton("Show global view")
         self._global_view_btn.setToolTip("Clear the selected segment and show all labelled segments")
         self._global_view_btn.setEnabled(False)
         self._global_view_btn.clicked.connect(self._show_global_view)
-        ll.addWidget(self._global_view_btn)
-
+        seg_lay.addWidget(self._global_view_btn)
         self._seg_list = QListWidget()
+        self._seg_list.setMinimumHeight(220)
         self._seg_list.currentRowChanged.connect(self._on_segment_selected)
-        ll.addWidget(self._seg_list)
-
+        seg_lay.addWidget(self._seg_list)
+        nav = QHBoxLayout()
+        self._prev_btn = QPushButton("◀ Previous")
+        self._prev_btn.setToolTip("Previous segment (Page Up)")
+        self._prev_btn.clicked.connect(lambda: self._step_segment(-1))
+        self._next_btn = QPushButton("Next ▶")
+        self._next_btn.setToolTip("Next segment (Page Down)")
+        self._next_btn.clicked.connect(lambda: self._step_segment(1))
+        nav.addWidget(self._prev_btn)
+        nav.addWidget(self._next_btn)
+        seg_lay.addLayout(nav)
+        self._open_folder_btn = QPushButton("Open segment folder")
+        self._open_folder_btn.clicked.connect(self._open_folder)
+        seg_lay.addWidget(self._open_folder_btn)
+        self._auto_advance = QCheckBox("Continue with the next segment when playback ends")
+        seg_lay.addWidget(self._auto_advance)
         self._info_label = QLabel("")
         self._info_label.setWordWrap(True)
-        ll.addWidget(self._info_label)
+        seg_lay.addWidget(self._info_label)
+        ws.add_section("Segments", seg_box)
 
-        # --- Mosaic export ---
-        mosaic_grp = QGroupBox("Mosaic video export")
-        mosaic_lay = QVBoxLayout(mosaic_grp)
+        mosaic_box = QWidget()
+        mosaic_lay = QVBoxLayout(mosaic_box)
+        mosaic_lay.setContentsMargins(0, 0, 0, 0)
         self._mosaic_btn = QPushButton("Export mosaic for selected segment")
         self._mosaic_btn.setStyleSheet("font-weight:bold; padding:6px;")
         self._mosaic_btn.clicked.connect(self._export_mosaic)
@@ -134,54 +154,51 @@ class Mode4Widget(QWidget):
         self._mosaic_progress.setTextVisible(True)
         mosaic_lay.addWidget(self._mosaic_progress)
         self._mosaic_status = QLabel("")
+        self._mosaic_status.setWordWrap(True)
         mosaic_lay.addWidget(self._mosaic_status)
-        ll.addWidget(mosaic_grp)
-
-        ll.addStretch()
-        splitter.addWidget(left)
-
-        self._right_content = QWidget()
-        rl = QVBoxLayout(self._right_content)
-        rl.setContentsMargins(4, 4, 4, 4)
-        rl.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        ws.add_section("Mosaic video export", mosaic_box, expanded=False)
+        ws.finish_left()
 
         self._timeline = TimelineWidget()
-        self._timeline.setFixedHeight(50)
-        rl.addWidget(self._timeline)
+        self._timeline.set_editable(False)
+        self._timeline.setMinimumHeight(70)
+        ws.add_work(self._timeline, 76)
 
         self._player = MultiCameraPlayer(face_blur_enabled=state.blur_faces)
-        self._player.setMinimumHeight(300)
-        rl.addWidget(self._player)
+        ws.add_work(self._player, 500)
 
+        view_area = QWidget()
+        view_lay = QVBoxLayout(view_area)
+        view_lay.setContentsMargins(0, 0, 0, 0)
+        view_row = QHBoxLayout()
+        view_row.addWidget(QLabel("View:"))
         self._plot_type = QComboBox()
         self._plot_type.addItems(["Heart rate", "ECG", *SYNTHETIC_PPG_VIEWS])
         self._plot_type.currentIndexChanged.connect(self._show_selected_plot)
-        rl.addWidget(self._plot_type)
-
+        view_row.addWidget(self._plot_type, 1)
+        view_lay.addLayout(view_row)
         self._metrics_label = QLabel("")
         self._metrics_label.setWordWrap(True)
-        rl.addWidget(self._metrics_label)
-
+        view_lay.addWidget(self._metrics_label)
         self._plot = SignalPlot()
-        self._plot.setFixedHeight(420)
-        rl.addWidget(self._plot)
-        self._right_content.setMinimumHeight(850)
-
-        self._right_scroll = QScrollArea()
-        self._right_scroll.setWidgetResizable(True)
-        self._right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-        self._right_scroll.verticalScrollBar().setSingleStep(40)
-        self._right_scroll.verticalScrollBar().setPageStep(280)
-        self._right_scroll.setStyleSheet("QScrollBar:vertical { width: 18px; }")
-        self._right_scroll.setWidget(self._right_content)
-        splitter.addWidget(self._right_scroll)
-
-        configure_main_splitter(splitter, left, self._right_scroll)
+        self._plot.figure_export_context = self._figure_context
+        view_lay.addWidget(self._plot, 1)
+        ws.add_work(view_area, 340)
 
         self._timeline.playhead_moved.connect(self._on_playhead)
+        self._timeline.interval_selected.connect(self._on_timeline_segment)
         self._player.frame_changed.connect(self._on_frame_changed)
+        self._player.playing_changed.connect(self._on_playing_changed)
         self._player.export_frames_requested.connect(self._export_current_frames)
+        self._player.snapshot_requested.connect(self._export_snapshot)
+        self._plot.seek_requested.connect(self._on_plot_seek)
+        self._player.install_shortcuts(self)
+        from PyQt6.QtGui import QKeySequence, QShortcut
+        from PyQt6.QtCore import Qt
+        for key, step in (("PgUp", -1), ("PgDown", 1)):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(lambda s=step: self._step_segment(s))
 
         self.refresh_from_state()
 
@@ -409,9 +426,16 @@ class Mode4Widget(QWidget):
             if df is None or df.empty:
                 self._plot.clear()
                 return
+            self._plot.set_time_zero(getattr(self, "_seg_time_zero", None))
             self._plot.set_data(df, video_duration_sec=self._current_seg.duration_sec)
+            self._plot.set_intervals([])
             return
         self._show_signal_overview(df)
+
+    def _global_time_zero(self):
+        if self.state.last_signal_anchor_datetime or self.state.tracks:
+            return effective_signal_anchor(self.state)
+        return None
 
     def _show_signal_overview(self, df: Optional[pd.DataFrame]):
         """Display the full synced signal with segment regions shaded."""
@@ -424,27 +448,9 @@ class Mode4Widget(QWidget):
             max_end = max(s.end_sec for s in self._segments)
         else:
             max_end = 0
+        self._plot.set_time_zero(self._global_time_zero())
         self._plot.set_data(df, video_duration_sec=max_end)
-
-        # Overlay shaded regions for each segment
-        for seg in self._segments:
-            self._plot._ax.axvspan(
-                seg.start_sec, seg.end_sec,
-                alpha=0.15, color=seg.color,
-                label=seg.label,
-            )
-        # Avoid duplicate legend entries
-        handles, labels = self._plot._ax.get_legend_handles_labels()
-        seen = set()
-        unique_h, unique_l = [], []
-        for h, l in zip(handles, labels):
-            if l not in seen:
-                seen.add(l)
-                unique_h.append(h)
-                unique_l.append(l)
-        if unique_l:
-            self._plot._ax.legend(unique_h, unique_l, fontsize=7, loc="upper right")
-        self._plot._canvas.draw_idle()
+        self._plot.set_intervals(self._segments)
 
     def _set_overview_info(self) -> None:
         if self._segments:
@@ -470,6 +476,17 @@ class Mode4Widget(QWidget):
         self._show_selected_plot()
         self._set_overview_info()
 
+    def _segment_time_zero(self, seg: _SegmentInfo, meta: dict) -> Optional[pd.Timestamp]:
+        if meta.get("segment_start_datetime_utc"):
+            try:
+                return _utc_timestamp(meta["segment_start_datetime_utc"])
+            except (ValueError, TypeError):
+                pass
+        anchor = self._global_time_zero()
+        if anchor is not None:
+            return _utc_timestamp(anchor) + pd.Timedelta(seconds=seg.start_sec)
+        return None
+
     def _on_segment_selected(self, row: int):
         if row < 0:
             self._show_global_view()
@@ -479,6 +496,7 @@ class Mode4Widget(QWidget):
         seg = self._segments[row]
         self._current_seg = seg
         self._global_view_btn.setEnabled(True)
+        self._timeline.selected_index = row
 
         seg_dir = seg.dir_path
         if not seg_dir.exists():
@@ -500,12 +518,11 @@ class Mode4Widget(QWidget):
             self._player.set_cameras(labels)
             self._player.load_videos([str(f) for f in video_files])
         else:
-            labels = []
             self._player.set_cameras([])
-        camera_rows = max(1, (len(labels) + 1) // 2)
-        player_height = camera_rows * 190 + 70
-        self._player.setMinimumHeight(player_height)
-        self._right_content.setMinimumHeight(player_height + self._plot.height() + 140)
+        self._seg_time_zero = self._segment_time_zero(seg, meta)
+        self._player.set_clock_anchor(
+            self._seg_time_zero.to_pydatetime() if self._seg_time_zero is not None else None
+        )
 
         # --- Load signals: prefer per-segment files, fallback to synced slices ---
         self._seg_hr_df = self._load_segment_signal(
@@ -558,9 +575,10 @@ class Mode4Widget(QWidget):
 
         if synced_df is not None:
             try:
-                t0 = synced_df["timestamp_utc"].iloc[0]
-                start_ts = t0 + pd.Timedelta(seconds=seg.start_sec)
-                end_ts = t0 + pd.Timedelta(seconds=seg.end_sec)
+                start_ts = getattr(self, "_seg_time_zero", None)
+                if start_ts is None:
+                    start_ts = synced_df["timestamp_utc"].iloc[0] + pd.Timedelta(seconds=seg.start_sec)
+                end_ts = start_ts + pd.Timedelta(seconds=seg.end_sec - seg.start_sec)
                 sliced = synced_df[
                     (synced_df["timestamp_utc"] >= start_ts)
                     & (synced_df["timestamp_utc"] <= end_ts)
@@ -570,6 +588,50 @@ class Mode4Widget(QWidget):
             except Exception as exc:
                 log.error("Error slicing %s for segment %d: %s", files_key, seg.index, exc)
         return None
+
+    # ------------------------------------------------------------------
+    # Navigation
+    # ------------------------------------------------------------------
+
+    def _step_segment(self, step: int) -> None:
+        if not self._segments:
+            return
+        row = self._seg_list.currentRow()
+        row = 0 if row < 0 else max(0, min(len(self._segments) - 1, row + step))
+        self._seg_list.setCurrentRow(row)
+
+    def _on_timeline_segment(self, row: int) -> None:
+        if 0 <= row < len(self._segments) and row != self._seg_list.currentRow():
+            self._seg_list.setCurrentRow(row)
+
+    def _open_folder(self) -> None:
+        seg = self._current_seg
+        folder = seg.dir_path if seg is not None else (
+            Path(self.state.segments_manifest_path).parent if self.state.segments_manifest_path else None
+        )
+        if folder is None or not Path(folder).exists():
+            QMessageBox.information(self, "Open folder", "Select a segment first.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def _on_playing_changed(self, playing: bool) -> None:
+        if playing or not self._auto_advance.isChecked() or self._current_seg is None:
+            return
+        if self._player.total_frames and self._player.current_frame >= self._player.total_frames - 2:
+            row = self._seg_list.currentRow()
+            if row + 1 < len(self._segments):
+                self._seg_list.setCurrentRow(row + 1)
+                QTimer.singleShot(400, self._player.play)
+
+    def _on_plot_seek(self, sec: float) -> None:
+        if self._current_seg is not None:
+            self._player.seek_seconds(sec)
+            return
+        for row, seg in enumerate(self._segments):
+            if seg.start_sec <= sec <= seg.end_sec:
+                self._seg_list.setCurrentRow(row)
+                self._player.seek_seconds(sec - seg.start_sec)
+                return
 
     def _on_playhead(self, sec: float):
         cumulative = 0.0
@@ -596,6 +658,14 @@ class Mode4Widget(QWidget):
             self._timeline.set_playhead(cumulative + sec)
         self._plot.set_cursor(sec)
 
+    def _figure_context(self) -> dict:
+        seg = self._current_seg
+        context = {"output_directory": str(seg.dir_path) if seg is not None else (
+            str(Path(self.state.output_directory) / "figures") if self.state.output_directory else "")}
+        if seg is None:
+            context["intervals"] = [(s.index, s.label, s.start_sec, s.end_sec) for s in self._segments]
+        return context
+
     def _export_current_frames(self):
         seg = self._current_seg
         if seg is None:
@@ -614,6 +684,16 @@ class Mode4Widget(QWidget):
 
         capture_dir = written[0].parent
         self._mosaic_status.setText(f"Exported {len(written)} capture frame(s) to {capture_dir}")
+
+    def _export_snapshot(self):
+        seg = self._current_seg
+        if seg is None:
+            QMessageBox.information(self, "Info", "Select a segment first.")
+            return
+        message = export_snapshot_interactive(self, self._player, self._plot, str(seg.dir_path),
+                                              f"segment_{seg.index:04d}")
+        if message:
+            self._mosaic_status.setText(message)
 
     # ------------------------------------------------------------------
     # Mosaic export
@@ -635,26 +715,11 @@ class Mode4Widget(QWidget):
         labels = [f.stem for f in video_files]
 
         default_name = str(seg_dir / f"mosaic_{seg.index:04d}_{seg.label.replace(' ', '_')}.mp4")
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save mosaic video", default_name,
-            "MP4 video (*.mp4);;All files (*)",
-        )
-        if not path:
+        options = ask_mosaic_options(self, default_name, self.state.mosaic_preset, labels,
+                                     self._player.audio_camera)
+        if options is None:
             return
-
-        preset_choice, ok = QInputDialog.getItem(
-            self,
-            "Mosaic export preset",
-            "Speed vs quality:",
-            MOSAIC_PRESET_NAMES,
-            ({"speed": 0, "balanced": 1, "quality": 2}.get(
-                normalise_mosaic_preset(self.state.mosaic_preset), 1
-            )),
-            False,
-        )
-        if not ok:
-            return
-        preset_key = normalise_mosaic_preset(preset_choice)
+        path, preset_key, preset_choice, audio_index = options
         self.state.mosaic_preset = preset_key
 
         fps = self._player.get_fps() or 30.0
@@ -672,13 +737,15 @@ class Mode4Widget(QWidget):
             quality_preset=preset_key,
             ffmpeg_path=self.state.ffmpeg_path,
             blur_faces=self.state.blur_faces,
+            signal_time_zero=self._seg_time_zero,
+            audio_path=video_paths[audio_index] if 0 <= audio_index < len(video_paths) else "",
         )
         self._mosaic_worker.progress.connect(self._on_mosaic_progress)
         self._mosaic_worker.finished.connect(self._on_mosaic_finished)
         self._mosaic_btn.setEnabled(False)
         self._mosaic_cancel_btn.setEnabled(True)
         self._mosaic_progress.setValue(0)
-        self._mosaic_status.setText(f"Exporting ({preset_choice})\u2026")
+        self._mosaic_status.setText(f"Exporting ({preset_choice})…")
         self._mosaic_worker.start()
 
     def _cancel_mosaic(self):

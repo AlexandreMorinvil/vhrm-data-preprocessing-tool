@@ -32,7 +32,7 @@ class SignalPlotWindowTests(unittest.TestCase):
         self.plot.close()
 
     def assertVisibleRange(self, start_sec: float, end_sec: float) -> None:
-        actual_start, actual_end = self.plot._ax.get_xlim()
+        actual_start, actual_end = self.plot.x_range()
         self.assertAlmostEqual(actual_start, start_sec)
         self.assertAlmostEqual(actual_end, end_sec)
 
@@ -54,25 +54,25 @@ class SignalPlotWindowTests(unittest.TestCase):
 
     def test_adjusts_y_limits_automatically_and_manually(self) -> None:
         self.plot._on_range_selected(2.0, 12.0)
-        auto_min, auto_max = self.plot._ax.get_ylim()
+        auto_min, auto_max = self.plot.y_range()
         self.assertAlmostEqual(auto_min, -0.2875)
         self.assertAlmostEqual(auto_max, 0.5375)
 
         self.plot._set_zero_y_min()
-        y_min, y_max = self.plot._ax.get_ylim()
+        y_min, y_max = self.plot.y_range()
         self.assertEqual(y_min, 0.0)
         self.assertAlmostEqual(y_max, 0.5375)
 
         self.plot._set_hr_y_max()
-        self.assertEqual(self.plot._ax.get_ylim(), (0.0, 220.0))
+        self.assertEqual(self.plot.y_range(), (0.0, 220.0))
 
         self.plot._y_min.setValue(-2.0)
         self.plot._y_max.setValue(3.0)
-        self.assertEqual(self.plot._ax.get_ylim(), (-2.0, 3.0))
+        self.assertEqual(self.plot.y_range(), (-2.0, 3.0))
 
         self.plot._auto_y_min.setChecked(True)
         self.plot._auto_y_max.setChecked(True)
-        restored_min, restored_max = self.plot._ax.get_ylim()
+        restored_min, restored_max = self.plot.y_range()
         self.assertAlmostEqual(restored_min, -0.2875)
         self.assertAlmostEqual(restored_max, 0.5375)
 
@@ -96,11 +96,8 @@ class SignalPlotWindowTests(unittest.TestCase):
         lines = {line.get_label(): line for line in self.plot._signal_lines}
         self.assertTrue(lines["Polar_1"].get_visible())
         self.assertFalse(lines["Zephyr_1"].get_visible())
-        self.assertLess(self.plot._ax.get_ylim()[1], 100.0)
-        legend_labels = [
-            text.get_text() for text in self.plot._ax.get_legend().get_texts()
-        ]
-        self.assertEqual(legend_labels, ["Polar_1"])
+        self.assertLess(self.plot.y_range()[1], 100.0)
+        self.assertEqual(self.plot.legend_labels(), ["Polar_1"])
 
         self.plot.set_data(frame, video_duration_sec=10.0)
         redrawn_lines = {line.get_label(): line for line in self.plot._signal_lines}

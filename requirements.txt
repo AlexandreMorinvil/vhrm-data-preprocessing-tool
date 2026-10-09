@@ -1,4 +1,6 @@
-PyQt6==6.7.1
+PyQt6==6.9.1
+PyQt6-Qt6==6.9.1
+pyqtgraph==0.13.7
 opencv-python==4.10.0.84
 librosa==0.10.2
 pandas==2.2.2

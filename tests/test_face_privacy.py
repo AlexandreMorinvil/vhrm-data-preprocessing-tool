@@ -8,7 +8,14 @@ from app.face_privacy import _detect_faces, _expanded_region, anonymize_faces
 
 class FacePrivacyTests(unittest.TestCase):
     def test_expanded_region_is_clamped_to_frame(self) -> None:
-        self.assertEqual(_expanded_region((0, 0, 20, 20), 100, 80), (0, 0, 24, 24))
+        self.assertEqual(_expanded_region((0, 0, 20, 20), 100, 80, margin_ratio=0.22), (0, 0, 24, 24))
+        self.assertEqual(_expanded_region((90, 70, 20, 20), 100, 80), (84, 62, 100, 80))
+
+    def test_default_region_covers_forehead_more_than_chin(self) -> None:
+        x0, y0, x1, y1 = _expanded_region((100, 100, 100, 100), 1000, 1000)
+        self.assertEqual((x0, x1), (70, 230))
+        self.assertLess(y0, 70)
+        self.assertEqual(y1, 230)
 
     def test_anonymize_faces_changes_only_detected_region(self) -> None:
         row = np.arange(50, dtype=np.uint8)

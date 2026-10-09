@@ -255,8 +255,12 @@ def extract_audio(
     ffmpeg: str = "",
     log_callback=None,
     duration_sec: float | None = None,
+    start_sec: float = 0.0,
 ) -> str:
-    args = ["-i", input_path]
+    args: list[str] = []
+    if start_sec > 0:
+        args += ["-ss", str(start_sec)]
+    args += ["-i", input_path]
     if duration_sec is not None and duration_sec > 0:
         args += ["-t", str(duration_sec)]
     args += ["-vn", "-ac", "1", "-ar", "16000", "-f", "wav", output_path]

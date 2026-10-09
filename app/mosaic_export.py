@@ -17,7 +17,6 @@ import logging
 import math
 import subprocess
 import threading
-from pathlib import Path
 from typing import Callable, Optional
 
 import cv2
@@ -31,8 +30,9 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
 from .ffmpeg_utils import find_ffmpeg
-from .face_privacy import anonymize_faces
+from .face_privacy import FaceAnonymizer
 from .signals import is_aux_signal_column
+from .visual_export import SERIES_COLORS
 
 log = logging.getLogger(__name__)
 
@@ -124,8 +124,13 @@ def _build_signal_strip_background(
     video_duration_sec: float,
     strip_w: int,
     strip_h: int,
+    time_zero: Optional[pd.Timestamp] = None,
 ) -> tuple[np.ndarray, int, int]:
-    """Render static signal background once and return (image, plot_x0, plot_x1)."""
+    """Render static signal background once and return (image, plot_x0, plot_x1).
+
+    *time_zero* is the absolute time of the first output frame; when omitted
+    the first signal sample is used (legacy behaviour).
+    """
 
     dpi = 100
     fig = Figure(figsize=(strip_w / dpi, strip_h / dpi), dpi=dpi)
@@ -135,27 +140,31 @@ def _build_signal_strip_background(
     if signal_df is not None and not signal_df.empty:
         # Determine time axis (relative seconds from video start)
         if "timestamp_utc" in signal_df.columns:
-            t0 = signal_df["timestamp_utc"].iloc[0]
+            t0 = time_zero if time_zero is not None else signal_df["timestamp_utc"].iloc[0]
             rel_sec = (signal_df["timestamp_utc"] - t0).dt.total_seconds()
         else:
             rel_sec = np.linspace(0, video_duration_sec, len(signal_df))
 
         # Detect format
         if "sensor_id" in signal_df.columns:
-            for sid in signal_df["sensor_id"].unique():
+            for index, sid in enumerate(signal_df["sensor_id"].unique()):
                 sub = signal_df[signal_df["sensor_id"] == sid]
-                t0_sub = sub["timestamp_utc"].iloc[0]
+                t0_sub = time_zero if time_zero is not None else sub["timestamp_utc"].iloc[0]
                 rs = (sub["timestamp_utc"] - t0_sub).dt.total_seconds()
                 style = ("--" if sid == "averaged" else "-")
-                ax.plot(rs, sub["value"], label=str(sid), linewidth=0.8, linestyle=style)
+                ax.plot(rs, sub["value"], label=str(sid), linewidth=0.8, linestyle=style,
+                        color=SERIES_COLORS[index % len(SERIES_COLORS)])
         else:
             value_cols = [
                 c for c in signal_df.columns
                 if c != "timestamp_utc" and not is_aux_signal_column(str(c))
             ]
-            for col in value_cols:
+            for index, col in enumerate(value_cols):
                 style = ("--" if col == "averaged" else "-")
-                ax.plot(rel_sec, signal_df[col], label=col, linewidth=0.8, linestyle=style)
+                values = pd.to_numeric(signal_df[col], errors="coerce")
+                valid = values.notna()
+                ax.plot(rel_sec[valid], values[valid], label=col, linewidth=0.8, linestyle=style,
+                        color=SERIES_COLORS[index % len(SERIES_COLORS)])
 
         if len(signal_df.columns) > 2:
             ax.legend(fontsize=7, loc="upper right")
@@ -263,6 +272,8 @@ def export_mosaic(
     progress_callback: Optional[Callable[[int, int], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     blur_faces: bool = False,
+    signal_time_zero: Optional[pd.Timestamp] = None,
+    audio_path: str = "",
 ) -> str:
     """Render a mosaic video frame-by-frame and pipe to FFmpeg.
 
@@ -292,6 +303,11 @@ def export_mosaic(
         Called after each frame.
     cancel_check : callable() → bool
         Return True to abort.
+    signal_time_zero : pd.Timestamp, optional
+        Absolute time of video time 0 (the signal anchor). When omitted, the
+        first signal sample is treated as video time 0 (legacy behaviour).
+    audio_path : str, optional
+        Camera video whose audio track is added to the mosaic (same range).
 
     Returns
     -------
@@ -338,9 +354,17 @@ def export_mosaic(
 
     # --- Clip the signal to the requested range ---
     sig_clip = None
+    strip_zero = None
+    if signal_time_zero is not None:
+        zero = pd.Timestamp(signal_time_zero)
+        zero = zero.tz_localize("UTC") if zero.tzinfo is None else zero.tz_convert("UTC")
+        strip_zero = zero + pd.Timedelta(seconds=max(0.0, start_sec))
     if signal_df is not None and not signal_df.empty:
         sig_clip = signal_df.copy()
-        if "timestamp_utc" in sig_clip.columns:
+        if "timestamp_utc" in sig_clip.columns and strip_zero is not None:
+            _rel = (sig_clip["timestamp_utc"] - strip_zero).dt.total_seconds()
+            sig_clip = sig_clip[(_rel >= 0) & (_rel <= video_duration_sec)].copy()
+        elif "timestamp_utc" in sig_clip.columns:
             t0 = sig_clip["timestamp_utc"].iloc[0]
             # Compute relative seconds for the whole signal
             _rel = (sig_clip["timestamp_utc"] - t0).dt.total_seconds()
@@ -359,12 +383,19 @@ def export_mosaic(
         "-s", f"{out_w}x{out_h}",
         "-r", str(fps),
         "-i", "-",
+    ]
+    if audio_path:
+        cmd += ["-ss", f"{max(0.0, start_sec):.6f}", "-t", f"{total_frames / fps:.6f}",
+                "-i", audio_path, "-map", "0:v:0", "-map", "1:a:0?"]
+    cmd += [
         "-c:v", "libx264",
         "-preset", str(preset["x264_preset"]),
         "-crf", str(preset["crf"]),
         "-pix_fmt", "yuv420p",
-        output_path,
     ]
+    if audio_path:
+        cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
+    cmd += [output_path]
     log.info("Mosaic FFmpeg: %s", " ".join(cmd))
     proc = subprocess.Popen(
         cmd,
@@ -395,8 +426,9 @@ def export_mosaic(
 
     # Render the expensive matplotlib plot only once.
     signal_bg, signal_x0, signal_x1 = _build_signal_strip_background(
-        sig_clip, video_duration_sec, out_w, strip_h
+        sig_clip, video_duration_sec, out_w, strip_h, time_zero=strip_zero
     )
+    anonymizers = [FaceAnonymizer(fps=fps) for _ in caps] if blur_faces else []
 
     # Pre-allocate destination buffers to reduce per-frame allocations.
     grid_frame = np.zeros((grid_h, out_w, 3), dtype=np.uint8)
@@ -426,7 +458,7 @@ def export_mosaic(
                         ret, raw = caps[cam_idx].read()
                         if ret:
                             if blur_faces:
-                                raw = anonymize_faces(raw)
+                                raw = anonymizers[cam_idx].process(raw, current_sec)
                             lx, ly, lw, lh = cam_layouts[cam_idx]
                             if lw > 0 and lh > 0:
                                 resized = cv2.resize(raw, (lw, lh), interpolation=cv2.INTER_AREA)
@@ -503,6 +535,8 @@ class MosaicWorker(QThread):
         quality_preset: str = "balanced",
         ffmpeg_path: str = "",
         blur_faces: bool = False,
+        signal_time_zero=None,
+        audio_path: str = "",
         parent=None,
     ):
         super().__init__(parent)
@@ -518,6 +552,8 @@ class MosaicWorker(QThread):
         self._quality_preset = quality_preset
         self._ffmpeg_path = ffmpeg_path
         self._blur_faces = blur_faces
+        self._signal_time_zero = signal_time_zero
+        self._audio_path = audio_path
         self._cancelled = False
 
     def cancel(self):
@@ -545,6 +581,8 @@ class MosaicWorker(QThread):
                 progress_callback=self._on_progress,
                 cancel_check=lambda: self._cancelled,
                 blur_faces=self._blur_faces,
+                signal_time_zero=self._signal_time_zero,
+                audio_path=self._audio_path,
             )
             if self._cancelled:
                 self.finished.emit(False, "Cancelled.")

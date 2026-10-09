@@ -25,14 +25,26 @@ def compute_sync_offset(
     ffmpeg: str = "",
     max_offset_sec: float = 60.0,
     audio_duration_sec: float | None = 60.0,
+    reference_start_sec: float = 0.0,
+    target_start_sec: float = 0.0,
 ) -> float:
     with tempfile.TemporaryDirectory() as tmp:
         ref_wav = str(Path(tmp) / "ref.wav")
         tgt_wav = str(Path(tmp) / "tgt.wav")
-        extract_audio(reference_path, ref_wav, ffmpeg=ffmpeg,
-                       duration_sec=audio_duration_sec)
-        extract_audio(target_path, tgt_wav, ffmpeg=ffmpeg,
-                       duration_sec=audio_duration_sec)
+        extract_audio(
+            reference_path,
+            ref_wav,
+            ffmpeg=ffmpeg,
+            duration_sec=audio_duration_sec,
+            start_sec=reference_start_sec,
+        )
+        extract_audio(
+            target_path,
+            tgt_wav,
+            ffmpeg=ffmpeg,
+            duration_sec=audio_duration_sec,
+            start_sec=target_start_sec,
+        )
 
         ref_y, sr = _load_audio(ref_wav)
         tgt_y, _ = _load_audio(tgt_wav)
@@ -136,6 +148,7 @@ def compute_all_offsets(
     ffmpeg: str = "",
     max_offset_sec: float = 60.0,
     audio_duration_sec: float | None = 60.0,
+    audio_start_offsets_sec: list[float] | None = None,
     pairwise_refinement: bool = False,
     log_callback=None,
 ) -> list[float]:
@@ -143,17 +156,31 @@ def compute_all_offsets(
         return []
     if len(segment_first_per_camera) == 1:
         return [0.0]
+
+    if audio_start_offsets_sec is None:
+        audio_start_offsets_sec = [0.0] * len(segment_first_per_camera)
+    if len(audio_start_offsets_sec) != len(segment_first_per_camera):
+        raise ValueError(
+            "audio_start_offsets_sec must have one value per camera."
+        )
+
     if pairwise_refinement:
         relations: list[tuple[int, int, float]] = []
         total = len(segment_first_per_camera)
         for left in range(total):
             for right in range(left + 1, total):
-                off = compute_sync_offset(
+                off_clipped = compute_sync_offset(
                     segment_first_per_camera[left],
                     segment_first_per_camera[right],
                     ffmpeg=ffmpeg,
                     max_offset_sec=max_offset_sec,
                     audio_duration_sec=audio_duration_sec,
+                    reference_start_sec=audio_start_offsets_sec[left],
+                    target_start_sec=audio_start_offsets_sec[right],
+                )
+                # Convert clipped relation back to the original timeline.
+                off = off_clipped - (
+                    audio_start_offsets_sec[right] - audio_start_offsets_sec[left]
                 )
                 relations.append((left, right, off))
                 msg = f"Pairwise audio offset camera {left + 1}->{right + 1}: {off:.4f}s"
@@ -173,12 +200,15 @@ def compute_all_offsets(
 
     offsets = [0.0]
     for i in range(1, len(segment_first_per_camera)):
-        off = compute_sync_offset(
+        off_clipped = compute_sync_offset(
             segment_first_per_camera[0],
             segment_first_per_camera[i],
             ffmpeg=ffmpeg,
             max_offset_sec=max_offset_sec,
             audio_duration_sec=audio_duration_sec,
+            reference_start_sec=audio_start_offsets_sec[0],
+            target_start_sec=audio_start_offsets_sec[i],
         )
+        off = off_clipped - (audio_start_offsets_sec[i] - audio_start_offsets_sec[0])
         offsets.append(off)
     return offsets

@@ -47,6 +47,7 @@ class VideoTrack:
     duration_sec: float = 0.0
     start_datetime: Optional[str] = None
     sync_offset_sec: float = 0.0
+    sync_audio_start_offset_sec: float = 0.0
     time_correction_mode: str = "none"
     true_start_datetime: Optional[str] = None
     reference_video_time_sec: float = 0.0
@@ -328,6 +329,7 @@ def generate_sidecar(state: ProjectState) -> str:
             "codec": t.codec,
             "start_datetime_utc": t.start_datetime or "",
             "sync_offset_sec": t.sync_offset_sec,
+            "sync_audio_start_offset_sec": t.sync_audio_start_offset_sec,
             "time_correction_mode": t.time_correction_mode,
             "time_correction_offset_sec": t.time_correction_offset_sec,
             "true_start_datetime_utc": t.true_start_datetime,
@@ -427,6 +429,7 @@ def load_sidecar(path: str, state: ProjectState) -> None:
             duration_sec=cam.get("duration_sec", 0.0),
             start_datetime=cam.get("start_datetime_utc") or None,
             sync_offset_sec=cam.get("sync_offset_sec", 0.0),
+            sync_audio_start_offset_sec=cam.get("sync_audio_start_offset_sec", 0.0),
             time_correction_mode=cam.get("time_correction_mode", "none"),
             true_start_datetime=cam.get("true_start_datetime_utc") or None,
             reference_video_time_sec=cam.get("reference_video_time_sec", 0.0),
@@ -584,6 +587,24 @@ def compute_signal_anchor(
         )
 
     return anchor, warnings
+
+
+def effective_signal_anchor(state: ProjectState) -> Optional[datetime]:
+    """Absolute time of video time 0 used for the synchronized signals.
+
+    Prefers the anchor recorded when signals were last synchronized (the one
+    used to clip and export them), else the anchor derived from the tracks.
+    """
+    if state.last_signal_anchor_datetime:
+        try:
+            anchor = datetime.fromisoformat(state.last_signal_anchor_datetime)
+            return anchor if anchor.tzinfo else anchor.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    anchor, _warnings = compute_signal_anchor(state.tracks, state.time_coherence_tolerance_sec)
+    if anchor is not None and anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=timezone.utc)
+    return anchor
 
 
 def format_time_coherence_warnings(warnings: list[str]) -> str:

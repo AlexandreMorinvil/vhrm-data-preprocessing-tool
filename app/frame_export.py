@@ -90,3 +90,41 @@ def export_player_frames(player, output_root: str | Path, prefix: str = "capture
         failed = ", ".join(failures)
         raise RuntimeError(f"Exported {len(written)} frame(s), but failed for: {failed}")
     return written
+
+
+def export_player_snapshot(player, snapshot, output_root: str | Path, prefix: str = "snapshot",
+                           window_sec: float = 30.0) -> Path:
+    """Write one PNG with every camera frame at the playhead plus the signals."""
+    from .visual_export import SnapshotFrame, render_composite_snapshot, save_figure
+
+    fps = player.get_fps() or 30.0
+    cursor_sec = player.current_frame / fps if fps > 0 else 0.0
+    frames: list[SnapshotFrame] = []
+    for index, preview in enumerate(player.previews, start=1):
+        if not preview.video_path or not Path(preview.video_path).exists() or preview.frame_count <= 0:
+            continue
+        cap = cv2.VideoCapture(preview.video_path)
+        try:
+            frame_no = max(0, min(preview.current_frame, preview.frame_count - 1))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+            ok, frame = cap.read()
+        finally:
+            cap.release()
+        if not ok:
+            continue
+        if preview.face_blur_enabled:
+            frame = anonymize_faces(frame)
+        label = getattr(preview, "label_text", "") or f"Camera {index}"
+        frames.append(SnapshotFrame(label, frame))
+    if not frames and snapshot is None:
+        raise ValueError("Nothing to capture: no camera video or signal is loaded.")
+    fig = render_composite_snapshot(frames, snapshot, cursor_sec, window_sec)
+    out_dir = Path(output_root) / "synchronized_captures"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = f"{_safe_name(prefix, 'snapshot')}_{_format_cursor_time(cursor_sec)}_frame{player.current_frame:06d}"
+    path = out_dir / f"{name}.png"
+    index = 2
+    while path.exists():
+        path = out_dir / f"{name}_{index:02d}.png"
+        index += 1
+    return save_figure(fig, path)

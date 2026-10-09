@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from PyQt6.QtCore import Qt, QTime
+from PyQt6.QtCore import QSettings, Qt, QTime
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -17,16 +17,12 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
-    QLayout,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QScrollArea,
-    QSplitter,
     QStyle,
     QTimeEdit,
     QVBoxLayout,
@@ -34,7 +30,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..file_cleanup import cleanup_obsolete_paths
-from ..mosaic_export import MOSAIC_PRESET_NAMES, MosaicWorker, normalise_mosaic_preset
+from ..mosaic_export import MosaicWorker
 from ..signals import (
     get_loaders,
     load_signal_files,
@@ -46,14 +42,16 @@ from ..signals import (
 from ..state import (
     ProjectState,
     compute_signal_anchor,
+    effective_signal_anchor,
     format_time_coherence_warnings,
     generate_sidecar,
     load_sidecar,
     video_timeline_duration_sec,
 )
-from ..widgets.layout import configure_main_splitter
+from ..widgets.layout import ModeWorkspace
 from ..widgets.frame_preview import MultiCameraPlayer
 from ..widgets.signal_plot import SignalPlot
+from .common import ask_mosaic_options, export_frames_interactive, export_snapshot_interactive
 
 log = logging.getLogger(__name__)
 
@@ -120,27 +118,35 @@ class Mode2Widget(QWidget):
         self._hr_merged_df: Optional[pd.DataFrame] = None
         self._ecg_merged_df: Optional[pd.DataFrame] = None
         self._time_rows: list[dict] = []
+        self._settings = QSettings("VideoResearchTool", "VRT")
 
         root = QHBoxLayout(self)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        root.addWidget(splitter)
+        root.setContentsMargins(0, 0, 0, 0)
+        self._workspace = ModeWorkspace("signal_sync", self, left_width=640)
+        root.addWidget(self._workspace)
+        ws = self._workspace
 
-        left = QWidget()
-        ll = QVBoxLayout(left)
-        ll.setContentsMargins(4, 4, 4, 4)
-
-        load_grp = QGroupBox("Load project metadata")
-        load_lay = QVBoxLayout(load_grp)
-        meta_btn = QPushButton("Load from metadata file …")
+        load_box = QWidget()
+        load_lay = QVBoxLayout(load_box)
+        load_lay.setContentsMargins(0, 0, 0, 0)
+        meta_btn = QPushButton("Load from metadata file \u2026")
         meta_btn.clicked.connect(self._load_from_meta)
         load_lay.addWidget(meta_btn)
         self._load_status = QLabel("")
         self._load_status.setWordWrap(True)
         load_lay.addWidget(self._load_status)
-        ll.addWidget(load_grp)
+        ws.add_section("Load project metadata", load_box)
 
-        time_grp = QGroupBox("Camera time correction")
-        time_lay = QVBoxLayout(time_grp)
+        time_box = QWidget()
+        time_lay = QVBoxLayout(time_box)
+        time_lay.setContentsMargins(0, 0, 0, 0)
+        time_hint = QLabel(
+            "Tip: with \u201cReference point in video\u201d, find a visible clock or event in the "
+            "videos, then press \u201cUse playhead\u201d."
+        )
+        time_hint.setWordWrap(True)
+        time_hint.setStyleSheet("color: #8a8a8a;")
+        time_lay.addWidget(time_hint)
         self._time_grid = QGridLayout()
         time_lay.addLayout(self._time_grid)
         self._check_time_btn = QPushButton("Check coherence")
@@ -149,61 +155,51 @@ class Mode2Widget(QWidget):
         self._time_status = QLabel("")
         self._time_status.setWordWrap(True)
         time_lay.addWidget(self._time_status)
-        ll.addWidget(time_grp)
+        ws.add_section("Camera time correction", time_box)
 
+        sources_box = QWidget()
+        sources_lay = QVBoxLayout(sources_box)
+        sources_lay.setContentsMargins(0, 0, 0, 0)
         loader_names = [getattr(l, "display_name", type(l).__name__) for l in get_loaders()]
         info = QLabel(f"Available loaders: {', '.join(loader_names) or 'none'}")
         info.setWordWrap(True)
-        ll.addWidget(info)
-
-        sources_grp = QGroupBox("Source signal files")
-        sources_lay = QVBoxLayout(sources_grp)
+        info.setStyleSheet("color: #8a8a8a;")
+        sources_lay.addWidget(info)
 
         hr_grp = QGroupBox("Heart rate")
         hr_lay = QVBoxLayout(hr_grp)
         self._hr_file_list = QListWidget()
         self._hr_file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._hr_file_list.setMaximumHeight(110)
         hr_lay.addWidget(self._hr_file_list)
-        hr_btn = QPushButton("Add HR file …")
+        hr_buttons = QHBoxLayout()
+        hr_btn = QPushButton("Add HR file \u2026")
         hr_btn.clicked.connect(lambda: self._add_signal(self._hr_file_list, "HR"))
-        hr_lay.addWidget(hr_btn)
+        hr_buttons.addWidget(hr_btn)
         self._remove_hr_btn = self._make_remove_signal_button(self._hr_file_list)
-        hr_lay.addWidget(self._remove_hr_btn)
+        hr_buttons.addWidget(self._remove_hr_btn)
+        hr_lay.addLayout(hr_buttons)
         sources_lay.addWidget(hr_grp)
 
         ecg_grp = QGroupBox("ECG")
         ecg_lay = QVBoxLayout(ecg_grp)
         self._ecg_file_list = QListWidget()
         self._ecg_file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._ecg_file_list.setMaximumHeight(110)
         ecg_lay.addWidget(self._ecg_file_list)
-        ecg_btn = QPushButton("Add ECG file …")
+        ecg_buttons = QHBoxLayout()
+        ecg_btn = QPushButton("Add ECG file \u2026")
         ecg_btn.clicked.connect(lambda: self._add_signal(self._ecg_file_list, "ECG"))
-        ecg_lay.addWidget(ecg_btn)
+        ecg_buttons.addWidget(ecg_btn)
         self._remove_ecg_btn = self._make_remove_signal_button(self._ecg_file_list)
-        ecg_lay.addWidget(self._remove_ecg_btn)
+        ecg_buttons.addWidget(self._remove_ecg_btn)
+        ecg_lay.addLayout(ecg_buttons)
         sources_lay.addWidget(ecg_grp)
-        ll.addWidget(sources_grp)
-
-        synced_grp = QGroupBox("Generated synchronized files")
-        synced_grp.setStyleSheet(
-            "QGroupBox { font-weight: bold; border: 1px solid #5b8def; "
-            "margin-top: 8px; padding-top: 8px; }"
-        )
-        synced_lay = QGridLayout(synced_grp)
-        synced_lay.addWidget(QLabel("Heart rate"), 0, 0)
-        synced_lay.addWidget(QLabel("ECG"), 0, 1)
-        self._synced_hr_file_list = QListWidget()
-        self._synced_ecg_file_list = QListWidget()
-        self._synced_hr_file_list.setMinimumHeight(72)
-        self._synced_ecg_file_list.setMinimumHeight(72)
-        synced_lay.addWidget(self._synced_hr_file_list, 1, 0)
-        synced_lay.addWidget(self._synced_ecg_file_list, 1, 1)
-        ll.addWidget(synced_grp)
 
         self._load_btn = QPushButton("Load && synchronise HR / ECG")
-        self._load_btn.setStyleSheet("font-weight:bold; padding:8px;")
+        self._load_btn.setStyleSheet("font-weight:bold; padding:6px;")
         self._load_btn.clicked.connect(self._load_and_sync)
-        ll.addWidget(self._load_btn)
+        sources_lay.addWidget(self._load_btn)
 
         self._remove_legacy_csv_cb = QCheckBox(
             "Remove legacy combined synchronized CSV files after synchronization"
@@ -212,18 +208,35 @@ class Mode2Widget(QWidget):
             "Removes old signal_synced.csv, hr_synced.csv, and ecg_synced.csv files "
             "only after replacement per-sensor files are written successfully."
         )
-        ll.addWidget(self._remove_legacy_csv_cb)
+        sources_lay.addWidget(self._remove_legacy_csv_cb)
 
         self._skip_btn = QPushButton("Skip (no signal)")
         self._skip_btn.clicked.connect(self._skip)
-        ll.addWidget(self._skip_btn)
+        sources_lay.addWidget(self._skip_btn)
 
         self._status = QLabel("")
-        ll.addWidget(self._status)
+        self._status.setWordWrap(True)
+        sources_lay.addWidget(self._status)
+        ws.add_section("Source signal files", sources_box)
 
-        # --- Mosaic export ---
-        mosaic_grp = QGroupBox("Mosaic video export")
-        mosaic_lay = QVBoxLayout(mosaic_grp)
+        synced_grp = QWidget()
+        synced_lay = QGridLayout(synced_grp)
+        synced_lay.setContentsMargins(0, 0, 0, 0)
+        synced_lay.addWidget(QLabel("Heart rate"), 0, 0)
+        synced_lay.addWidget(QLabel("ECG"), 0, 1)
+        self._synced_hr_file_list = QListWidget()
+        self._synced_ecg_file_list = QListWidget()
+        self._synced_hr_file_list.setMinimumHeight(60)
+        self._synced_ecg_file_list.setMinimumHeight(60)
+        self._synced_hr_file_list.setMaximumHeight(100)
+        self._synced_ecg_file_list.setMaximumHeight(100)
+        synced_lay.addWidget(self._synced_hr_file_list, 1, 0)
+        synced_lay.addWidget(self._synced_ecg_file_list, 1, 1)
+        ws.add_section("Generated synchronized files", synced_grp)
+
+        mosaic_box = QWidget()
+        mosaic_lay = QVBoxLayout(mosaic_box)
+        mosaic_lay.setContentsMargins(0, 0, 0, 0)
         self._mosaic_btn = QPushButton("Export mosaic video \u2026")
         self._mosaic_btn.setStyleSheet("font-weight:bold; padding:6px;")
         self._mosaic_btn.clicked.connect(self._export_mosaic)
@@ -236,46 +249,42 @@ class Mode2Widget(QWidget):
         self._mosaic_progress.setTextVisible(True)
         mosaic_lay.addWidget(self._mosaic_progress)
         self._mosaic_status = QLabel("")
+        self._mosaic_status.setWordWrap(True)
         mosaic_lay.addWidget(self._mosaic_status)
-        ll.addWidget(mosaic_grp)
+        ws.add_section("Mosaic video export", mosaic_box, expanded=False)
         self._mosaic_worker: MosaicWorker | None = None
-
-        ll.addStretch()
-        left_scroll = QScrollArea()
-        left_scroll.setWidgetResizable(True)
-        left_scroll.setWidget(left)
-        splitter.addWidget(left_scroll)
-
-        self._right_content = QWidget()
-        rl = QVBoxLayout(self._right_content)
-        rl.setContentsMargins(4, 4, 4, 4)
-        rl.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        ws.finish_left()
 
         self._player = MultiCameraPlayer(face_blur_enabled=state.blur_faces)
-        self._player.setMinimumHeight(300)
-        rl.addWidget(self._player)
+        ws.add_work(self._player, 520)
 
-        self._plot_type = QComboBox()
-        self._plot_type.addItems(["Heart rate", "ECG"])
-        self._plot_type.currentIndexChanged.connect(self._show_selected_plot)
-        rl.addWidget(self._plot_type)
+        signal_area = QWidget()
+        sig_lay = QVBoxLayout(signal_area)
+        sig_lay.setContentsMargins(0, 0, 0, 0)
+        toggles = QHBoxLayout()
+        toggles.addWidget(QLabel("Show:"))
+        self._show_hr = QCheckBox("Heart rate")
+        self._show_ecg = QCheckBox("ECG")
+        for key, box in (("hr", self._show_hr), ("ecg", self._show_ecg)):
+            box.setChecked(self._settings.value(f"signal_sync/show_{key}", True, type=bool))
+            box.toggled.connect(lambda checked, k=key: (
+                self._settings.setValue(f"signal_sync/show_{k}", checked), self._show_selected_plot()))
+            toggles.addWidget(box)
+        toggles.addStretch()
+        sig_lay.addLayout(toggles)
         self._plot = SignalPlot()
-        self._plot.setFixedHeight(420)
-        rl.addWidget(self._plot)
-
-        self._right_scroll = QScrollArea()
-        self._right_scroll.setWidgetResizable(True)
-        self._right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-        self._right_scroll.verticalScrollBar().setSingleStep(40)
-        self._right_scroll.verticalScrollBar().setPageStep(280)
-        self._right_scroll.setStyleSheet("QScrollBar:vertical { width: 18px; }")
-        self._right_scroll.setWidget(self._right_content)
-        splitter.addWidget(self._right_scroll)
-
-        configure_main_splitter(splitter, left_scroll, self._right_scroll)
+        self._plot.figure_export_context = lambda: {
+            "output_directory": str(Path(self.state.output_directory) / "figures") if self.state.output_directory else "",
+        }
+        sig_lay.addWidget(self._plot, 1)
+        ws.add_work(signal_area, 360)
 
         self._player.frame_changed.connect(self._on_frame_changed)
+        self._player.position_changed.connect(self._plot.set_cursor)
+        self._plot.seek_requested.connect(self._player.seek_seconds)
+        self._player.export_frames_requested.connect(self._export_current_frames)
+        self._player.snapshot_requested.connect(self._export_snapshot)
+        self._player.install_shortcuts(self)
 
         self.refresh_from_state()
 
@@ -337,14 +346,11 @@ class Mode2Widget(QWidget):
         """Reload the player/plot from the current state.tracks."""
         labels = [t.camera_label for t in self.state.tracks]
         self._player.set_cameras(labels)
-        camera_rows = max(1, (len(labels) + 1) // 2)
-        player_height = camera_rows * 190 + 70
-        self._player.setMinimumHeight(player_height)
-        self._right_content.setMinimumHeight(player_height + self._plot.height() + 70)
         paths = [t.final_output_path for t in self.state.tracks]
         valid = [p for p in paths if p and Path(p).exists()]
         if valid:
             self._player.load_videos(valid)
+        self._player.set_clock_anchor(effective_signal_anchor(self.state) if self.state.tracks else None)
 
     def _load_synced_signal(self):
         """Load synced signal CSV from state if available."""
@@ -755,11 +761,17 @@ class Mode2Widget(QWidget):
         return signal_long_to_wide(merged, include_average=include_average)
 
     def _show_selected_plot(self):
-        df = self._hr_merged_df if self._plot_type.currentIndex() == 0 else self._ecg_merged_df
-        if df is None:
+        panels = []
+        if self._show_hr.isChecked() and self._hr_merged_df is not None:
+            panels.append(("Heart rate", self._hr_merged_df, "BPM"))
+        if self._show_ecg.isChecked() and self._ecg_merged_df is not None:
+            panels.append(("ECG", self._ecg_merged_df, "ECG"))
+        panels = [p for p in panels if "timestamp_utc" in p[1].columns and not p[1].empty]
+        if not panels:
             self._plot.clear()
             return
-        self._plot.set_data(df, video_duration_sec=video_timeline_duration_sec(self.state.tracks))
+        self._plot.set_time_zero(effective_signal_anchor(self.state) if self.state.tracks else None)
+        self._plot.set_panels(panels, video_duration_sec=video_timeline_duration_sec(self.state.tracks))
 
     def _skip(self):
         self.state.mode2_complete = True
@@ -785,33 +797,21 @@ class Mode2Widget(QWidget):
             out_dir = str(Path(valid[0]).parent)
 
         default_name = str(Path(out_dir) / "mosaic_full.mp4")
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save mosaic video", default_name,
-            "MP4 video (*.mp4);;All files (*)",
-        )
-        if not path:
+        labels = [t.camera_label for t in self.state.tracks]
+        options = ask_mosaic_options(self, default_name, self.state.mosaic_preset, labels,
+                                     self._player.audio_camera)
+        if options is None:
             return
-
-        preset_choice, ok = QInputDialog.getItem(
-            self,
-            "Mosaic export preset",
-            "Speed vs quality:",
-            MOSAIC_PRESET_NAMES,
-            ({"speed": 0, "balanced": 1, "quality": 2}.get(
-                normalise_mosaic_preset(self.state.mosaic_preset), 1
-            )),
-            False,
-        )
-        if not ok:
-            return
-        preset_key = normalise_mosaic_preset(preset_choice)
+        path, preset_key, preset_choice, audio_index = options
         self.state.mosaic_preset = preset_key
 
         t0 = self.state.tracks[0]
         fps = t0.fps or 30.0
         duration = video_timeline_duration_sec(self.state.tracks)
         total_frames = int(duration * fps) if duration > 0 else (t0.frame_count or 0)
-        labels = [t.camera_label for t in self.state.tracks]
+        audio_path = ""
+        if 0 <= audio_index < len(self.state.tracks):
+            audio_path = self.state.tracks[audio_index].final_output_path
 
         self._mosaic_worker = MosaicWorker(
             video_paths=valid,
@@ -824,6 +824,8 @@ class Mode2Widget(QWidget):
             quality_preset=preset_key,
             ffmpeg_path=self.state.ffmpeg_path,
             blur_faces=self.state.blur_faces,
+            signal_time_zero=effective_signal_anchor(self.state),
+            audio_path=audio_path,
         )
         self._mosaic_worker.progress.connect(self._on_mosaic_progress)
         self._mosaic_worker.finished.connect(self._on_mosaic_finished)
@@ -856,8 +858,14 @@ class Mode2Widget(QWidget):
         self._mosaic_worker = None
 
     def _on_frame_changed(self, frame_no: int):
-        if not self.state.tracks:
-            return
-        fps = self.state.tracks[0].fps or 30.0
-        time_sec = frame_no / fps
-        self._plot.set_cursor(time_sec)
+        """Kept for compatibility; the cursor follows ``position_changed``."""
+
+    def _export_current_frames(self):
+        message = export_frames_interactive(self, self._player, self.state.output_directory, "signal_sync")
+        if message:
+            self._mosaic_status.setText(message)
+
+    def _export_snapshot(self):
+        message = export_snapshot_interactive(self, self._player, self._plot, self.state.output_directory, "signal_sync")
+        if message:
+            self._mosaic_status.setText(message)

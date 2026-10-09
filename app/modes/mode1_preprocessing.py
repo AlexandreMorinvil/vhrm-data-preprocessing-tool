@@ -2,16 +2,13 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone
-from functools import partial
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
-    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -24,10 +21,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QScrollArea,
-    QSizePolicy,
     QSpinBox,
-    QSplitter,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -45,7 +39,8 @@ from ..ffmpeg_utils import (
 from ..state import ProjectState, VideoTrack, parse_dji_datetime, dji_datetime_str
 from ..state import generate_sidecar
 from ..widgets.frame_preview import MultiCameraPlayer
-from ..widgets.layout import configure_main_splitter
+from ..widgets.layout import ModeWorkspace
+from .common import export_frames_interactive, export_snapshot_interactive
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +68,15 @@ class _MetadataPanel(QGroupBox):
             self._rows[k] = lbl
 
 
+def _segment_item(path: str) -> QListWidgetItem:
+    dt = parse_dji_datetime(Path(path).stem)
+    text = Path(path).name if dt is None else f"{Path(path).name}   ({dt.strftime('%Y-%m-%d %H:%M:%S')})"
+    item = QListWidgetItem(text)
+    item.setData(Qt.ItemDataRole.UserRole, path)
+    item.setToolTip(path if dt is None else f"{path}\nRecording start from DJI file name: {dt.isoformat()}")
+    return item
+
+
 class _CameraGroup(QGroupBox):
     segments_changed = pyqtSignal()
 
@@ -98,7 +102,19 @@ class _CameraGroup(QGroupBox):
         self._list = QListWidget()
         self._list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self._list.setToolTip("Segments are joined in this order (drag or use Up/Down to reorder).")
+        self._list.setMaximumHeight(130)
+        self._list.model().rowsMoved.connect(lambda *_: self.segments_changed.emit())
         layout.addWidget(self._list)
+
+        order_row = QHBoxLayout()
+        up_btn = QPushButton("Move up")
+        up_btn.clicked.connect(lambda: self._move_selected(-1))
+        down_btn = QPushButton("Move down")
+        down_btn.clicked.connect(lambda: self._move_selected(1))
+        order_row.addWidget(up_btn)
+        order_row.addWidget(down_btn)
+        layout.addLayout(order_row)
 
         self._label_edit = QLineEdit()
         self._label_edit.setPlaceholderText("Camera label (e.g. front, left)")
@@ -110,6 +126,20 @@ class _CameraGroup(QGroupBox):
             "Useful when this camera ends earlier than the rest."
         )
         layout.addWidget(self._not_limiting_cb)
+
+        offset_row = QHBoxLayout()
+        offset_row.addWidget(QLabel("Audio sync start offset (s):"))
+        self._sync_start_offset_spin = QDoubleSpinBox()
+        self._sync_start_offset_spin.setRange(0.0, 36000.0)
+        self._sync_start_offset_spin.setDecimals(2)
+        self._sync_start_offset_spin.setSingleStep(0.5)
+        self._sync_start_offset_spin.setValue(0.0)
+        self._sync_start_offset_spin.setToolTip(
+            "Skip this many seconds at the start of this camera before\n"
+            "extracting audio used for synchronization."
+        )
+        offset_row.addWidget(self._sync_start_offset_spin)
+        layout.addLayout(offset_row)
 
     @property
     def label(self) -> str:
@@ -128,10 +158,7 @@ class _CameraGroup(QGroupBox):
     def segment_paths(self, paths: list[str]):
         self._list.clear()
         for p in paths:
-            item = QListWidgetItem(Path(p).name)
-            item.setData(Qt.ItemDataRole.UserRole, p)
-            item.setToolTip(p)
-            self._list.addItem(item)
+            self._list.addItem(_segment_item(p))
 
     @property
     def limits_common_duration(self) -> bool:
@@ -141,6 +168,14 @@ class _CameraGroup(QGroupBox):
     def limits_common_duration(self, value: bool):
         self._not_limiting_cb.setChecked(not value)
 
+    @property
+    def sync_audio_start_offset_sec(self) -> float:
+        return float(self._sync_start_offset_spin.value())
+
+    @sync_audio_start_offset_sec.setter
+    def sync_audio_start_offset_sec(self, value: float):
+        self._sync_start_offset_spin.setValue(max(0.0, float(value)))
+
     def _add_segments(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, f"Select segments for Camera {self.camera_index + 1}",
@@ -149,11 +184,20 @@ class _CameraGroup(QGroupBox):
         if files:
             files.sort()
             for p in files:
-                item = QListWidgetItem(Path(p).name)
-                item.setData(Qt.ItemDataRole.UserRole, p)
-                item.setToolTip(p)
-                self._list.addItem(item)
+                self._list.addItem(_segment_item(p))
             self.segments_changed.emit()
+
+    def _move_selected(self, step: int):
+        rows = sorted(self._list.row(item) for item in self._list.selectedItems())
+        if not rows:
+            return
+        if step < 0 and rows[0] == 0 or step > 0 and rows[-1] == self._list.count() - 1:
+            return
+        for row in (rows if step < 0 else reversed(rows)):
+            item = self._list.takeItem(row)
+            self._list.insertItem(row + step, item)
+            item.setSelected(True)
+        self.segments_changed.emit()
 
     def _remove_selected(self):
         for item in self._list.selectedItems():
@@ -172,15 +216,10 @@ class Mode1Widget(QWidget):
         self._worker: Optional[FFmpegWorker] = None
 
         root = QHBoxLayout(self)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        root.addWidget(splitter)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(4, 4, 4, 4)
+        root.setContentsMargins(0, 0, 0, 0)
+        self._workspace = ModeWorkspace("preprocessing", self)
+        root.addWidget(self._workspace)
+        left_layout = self._workspace.left_layout
 
         setup_group = QGroupBox("Setup")
         setup_lay = QFormLayout(setup_group)
@@ -267,25 +306,18 @@ class Mode1Widget(QWidget):
 
         self._log_area = QTextEdit()
         self._log_area.setReadOnly(True)
-        self._log_area.setMaximumHeight(120)
+        self._log_area.setMaximumHeight(160)
         left_layout.addWidget(self._log_area)
 
-        left_layout.addStretch()
-        scroll.setWidget(left)
-        splitter.addWidget(scroll)
-
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(4, 4, 4, 4)
+        self._metadata_panel = _MetadataPanel("Video metadata")
+        left_layout.addWidget(self._metadata_panel)
+        self._workspace.finish_left()
 
         self._player = MultiCameraPlayer(face_blur_enabled=state.blur_faces)
-        right_layout.addWidget(self._player)
-
-        self._metadata_panel = _MetadataPanel("Video metadata")
-        right_layout.addWidget(self._metadata_panel)
-        splitter.addWidget(right)
-
-        configure_main_splitter(splitter, scroll, right, 2, 3)
+        self._workspace.add_work(self._player, 700)
+        self._player.export_frames_requested.connect(self._export_current_frames)
+        self._player.snapshot_requested.connect(self._export_snapshot)
+        self._player.install_shortcuts(self)
 
         self._rebuild_camera_groups()
         self._restore_from_state()
@@ -301,7 +333,15 @@ class Mode1Widget(QWidget):
             self._out_dir_edit.setText(d)
 
     def _rebuild_camera_groups(self):
-        old_data = [(g.label, g.segment_paths, g.limits_common_duration) for g in self._camera_groups]
+        old_data = [
+            (
+                g.label,
+                g.segment_paths,
+                g.limits_common_duration,
+                g.sync_audio_start_offset_sec,
+            )
+            for g in self._camera_groups
+        ]
         for g in self._camera_groups:
             g.setParent(None)
             g.deleteLater()
@@ -313,6 +353,7 @@ class Mode1Widget(QWidget):
                 g.label = old_data[i][0]
                 g.segment_paths = old_data[i][1]
                 g.limits_common_duration = old_data[i][2]
+                g.sync_audio_start_offset_sec = old_data[i][3]
             g.segments_changed.connect(self._preview_first_segments)
             self._camera_area.addWidget(g)
             self._camera_groups.append(g)
@@ -320,11 +361,14 @@ class Mode1Widget(QWidget):
         self._player.set_cameras(labels)
 
     def _restore_from_state(self):
+        if self.state.tracks and len(self.state.tracks) != self._num_cameras_spin.value():
+            self._num_cameras_spin.setValue(min(self._num_cameras_spin.maximum(), len(self.state.tracks)))
         for i, track in enumerate(self.state.tracks):
             if i < len(self._camera_groups):
                 self._camera_groups[i].label = track.camera_label
                 self._camera_groups[i].segment_paths = track.segment_paths
                 self._camera_groups[i].limits_common_duration = track.limits_common_duration
+                self._camera_groups[i].sync_audio_start_offset_sec = track.sync_audio_start_offset_sec
         if self.state.tracks:
             paths = [t.final_output_path or t.concatenated_path for t in self.state.tracks]
             valid = [p for p in paths if p and Path(p).exists()]
@@ -332,6 +376,7 @@ class Mode1Widget(QWidget):
                 labels = [t.camera_label for t in self.state.tracks]
                 self._player.set_cameras(labels)
                 self._player.load_videos(valid)
+                self._update_metadata()
 
     def _preview_first_segments(self):
         """Load the first segment of each camera into the preview player."""
@@ -340,6 +385,16 @@ class Mode1Widget(QWidget):
         paths = [g.segment_paths[0] if g.segment_paths else "" for g in self._camera_groups]
         if any(paths):
             self._player.load_videos(paths)
+
+    def _export_current_frames(self):
+        message = export_frames_interactive(self, self._player, self._out_dir_edit.text().strip(), "preprocessing")
+        if message:
+            self._status_label.setText(message)
+
+    def _export_snapshot(self):
+        message = export_snapshot_interactive(self, self._player, None, self._out_dir_edit.text().strip(), "preprocessing")
+        if message:
+            self._status_label.setText(message)
 
     def _log(self, msg: str):
         self._log_area.append(msg)
@@ -477,6 +532,7 @@ class Mode1Widget(QWidget):
                     height=vinfo.get("height", 0),
                     codec=vinfo.get("codec", ""),
                     duration_sec=vinfo.get("duration", 0),
+                    sync_audio_start_offset_sec=cam.sync_audio_start_offset_sec,
                     limits_common_duration=cam.limits_common_duration,
                 )
                 track.set_start_datetime(first_dt)
@@ -513,6 +569,7 @@ class Mode1Widget(QWidget):
                 height=vinfo.get("height", 0),
                 codec=vinfo.get("codec", ""),
                 duration_sec=vinfo.get("duration", 0),
+                sync_audio_start_offset_sec=cam.sync_audio_start_offset_sec,
                 limits_common_duration=cam.limits_common_duration,
             )
             track.set_start_datetime(first_dt)
@@ -549,9 +606,11 @@ class Mode1Widget(QWidget):
         # --- Audio sync (55–70%) ---------------------------------------------
         worker.progress.emit(55, "Synchronising audio …")
         first_segments = [cam.segment_paths[0] for cam in cameras]
+        audio_start_offsets = [cam.sync_audio_start_offset_sec for cam in cameras]
         from ..audio_sync import compute_all_offsets
         offsets = compute_all_offsets(first_segments, ffmpeg=ffmpeg,
                                         audio_duration_sec=sync_audio_duration,
+                        audio_start_offsets_sec=audio_start_offsets,
                                         pairwise_refinement=sync_pairwise_refinement,
                                         log_callback=lambda m: worker.log_message.emit(m))
         for i, off in enumerate(offsets):

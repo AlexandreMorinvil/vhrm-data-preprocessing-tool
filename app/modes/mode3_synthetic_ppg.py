@@ -10,14 +10,11 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QScrollArea,
-    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -26,13 +23,15 @@ from ..file_cleanup import cleanup_obsolete_paths
 from ..signals import is_aux_signal_column, read_synced_signal_csv, read_synced_signal_csvs
 from ..state import (
     ProjectState,
+    effective_signal_anchor,
     generate_sidecar,
     video_timeline_duration_sec,
 )
 from ..synthetic_ppg import SyntheticPpgResult, generate_synthetic_ppg
 from ..widgets.frame_preview import MultiCameraPlayer
-from ..widgets.layout import configure_main_splitter
+from ..widgets.layout import ModeWorkspace
 from ..widgets.signal_plot import SignalPlot
+from .common import export_frames_interactive, export_snapshot_interactive
 
 log = logging.getLogger(__name__)
 
@@ -238,15 +237,14 @@ class SyntheticPpgWidget(QWidget):
         self._sensor_hr: pd.DataFrame | None = None
 
         root = QHBoxLayout(self)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        root.addWidget(splitter)
+        root.setContentsMargins(0, 0, 0, 0)
+        self._workspace = ModeWorkspace("synthetic_ppg", self)
+        root.addWidget(self._workspace)
+        ws = self._workspace
 
-        controls = QWidget()
-        controls_layout = QVBoxLayout(controls)
-        controls_layout.setContentsMargins(4, 4, 4, 4)
-
-        source_group = QGroupBox("ECG source")
-        source_layout = QFormLayout(source_group)
+        source_box = QWidget()
+        source_layout = QFormLayout(source_box)
+        source_layout.setContentsMargins(0, 0, 0, 0)
         self._source = QComboBox()
         source_layout.addRow("Synchronized ECG:", self._source)
         self._source_note = QLabel(
@@ -257,10 +255,11 @@ class SyntheticPpgWidget(QWidget):
         self._hr_reference_note = QLabel("")
         self._hr_reference_note.setWordWrap(True)
         source_layout.addRow("HR timestamps:", self._hr_reference_note)
-        controls_layout.addWidget(source_group)
+        ws.add_section("ECG source", source_box)
 
-        settings_group = QGroupBox("Generation settings")
-        settings_layout = QFormLayout(settings_group)
+        settings_box = QWidget()
+        settings_layout = QFormLayout(settings_box)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
         self._fs = self._spin(20.0, 1000.0, 125.0, 1.0, 1)
         self._low_hz = self._spin(0.1, 100.0, 5.0, 0.5, 1)
         self._high_hz = self._spin(0.2, 200.0, 25.0, 0.5, 1)
@@ -271,10 +270,13 @@ class SyntheticPpgWidget(QWidget):
         settings_layout.addRow("ECG band-pass high (Hz):", self._high_hz)
         settings_layout.addRow("Minimum R-peak distance (s):", self._peak_distance)
         settings_layout.addRow("Prominence factor:", self._prominence)
-        controls_layout.addWidget(settings_group)
+        ws.add_section("Generation settings", settings_box)
 
+        run_box = QWidget()
+        controls_layout = QVBoxLayout(run_box)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
         self._generate_button = QPushButton("Generate synthetic PPG")
-        self._generate_button.setStyleSheet("font-weight:bold; padding:8px;")
+        self._generate_button.setStyleSheet("font-weight:bold; padding:6px;")
         self._generate_button.clicked.connect(self._generate)
         controls_layout.addWidget(self._generate_button)
         self._skip_button = QPushButton("Skip synthetic PPG")
@@ -286,40 +288,45 @@ class SyntheticPpgWidget(QWidget):
         self._status = QLabel("")
         self._status.setWordWrap(True)
         controls_layout.addWidget(self._status)
-        self._metrics = QLabel("")
-        self._metrics.setWordWrap(True)
-        controls_layout.addWidget(self._metrics)
-        controls_layout.addStretch()
+        ws.add_section("Run", run_box)
+        ws.finish_left()
 
-        left_scroll = QScrollArea()
-        left_scroll.setWidgetResizable(True)
-        left_scroll.setWidget(controls)
-        splitter.addWidget(left_scroll)
-
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(4, 4, 4, 4)
         self._player = MultiCameraPlayer(face_blur_enabled=state.blur_faces)
-        self._player.setMinimumHeight(300)
-        right_layout.addWidget(self._player)
+        ws.add_work(self._player, 460)
+        view_area = QWidget()
+        right_layout = QVBoxLayout(view_area)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        view_row = QHBoxLayout()
+        view_row.addWidget(QLabel("View:"))
         self._view = QComboBox()
         self._view.addItems(SYNTHETIC_PPG_VIEWS)
         self._view.currentIndexChanged.connect(self._show_selected_plot)
-        right_layout.addWidget(self._view)
+        view_row.addWidget(self._view, 1)
+        right_layout.addLayout(view_row)
+        self._metrics = QLabel("")
+        self._metrics.setWordWrap(True)
+        self._metrics.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        right_layout.addWidget(self._metrics)
         self._plot = SignalPlot()
-        self._plot.setFixedHeight(420)
-        right_layout.addWidget(self._plot)
-        right.setMinimumHeight(800)
-
-        right_scroll = QScrollArea()
-        right_scroll.setWidgetResizable(True)
-        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        right_scroll.setWidget(right)
-        splitter.addWidget(right_scroll)
-        configure_main_splitter(splitter, left_scroll, right_scroll)
+        self._plot.figure_export_context = lambda: {
+            "output_directory": str(Path(self.state.output_directory) / "figures") if self.state.output_directory else "",
+        }
+        right_layout.addWidget(self._plot, 1)
+        ws.add_work(view_area, 380)
 
         self._player.frame_changed.connect(self._on_frame_changed)
+        self._player.position_changed.connect(self._plot.set_cursor)
+        self._plot.seek_requested.connect(self._player.seek_seconds)
+        self._player.export_frames_requested.connect(
+            lambda: self._set_status(export_frames_interactive(self, self._player, self.state.output_directory, "synthetic_ppg")))
+        self._player.snapshot_requested.connect(
+            lambda: self._set_status(export_snapshot_interactive(self, self._player, self._plot, self.state.output_directory, "synthetic_ppg")))
+        self._player.install_shortcuts(self)
         self.refresh_from_state()
+
+    def _set_status(self, message) -> None:
+        if message:
+            self._status.setText(message)
 
     @staticmethod
     def _spin(
@@ -362,6 +369,7 @@ class SyntheticPpgWidget(QWidget):
         valid_paths = [path for path in paths if path and Path(path).exists()]
         if valid_paths:
             self._player.load_videos(valid_paths)
+        self._player.set_clock_anchor(effective_signal_anchor(self.state) if self.state.tracks else None)
 
     def _load_artifacts(self) -> None:
         self._ppg = _read_timestamped_csv(self.state.synthetic_ppg_path)
@@ -477,6 +485,7 @@ class SyntheticPpgWidget(QWidget):
         if frame is None or frame.empty:
             self._plot.clear()
         else:
+            self._plot.set_time_zero(effective_signal_anchor(self.state) if self.state.tracks else None)
             self._plot.set_data(
                 frame,
                 video_duration_sec=video_timeline_duration_sec(self.state.tracks),
@@ -484,7 +493,4 @@ class SyntheticPpgWidget(QWidget):
         self._metrics.setText(metric_text)
 
     def _on_frame_changed(self, frame_number: int) -> None:
-        if not self.state.tracks:
-            return
-        fps = self.state.tracks[0].fps or 30.0
-        self._plot.set_cursor(frame_number / fps)
+        """Kept for compatibility; the cursor follows ``position_changed``."""
