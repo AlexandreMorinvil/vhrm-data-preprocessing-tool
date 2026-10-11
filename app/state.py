@@ -107,6 +107,7 @@ class LabelInterval:
 class ProjectState:
     project_path: str = ""
     output_directory: str = ""
+    metadata_path: str = ""
     num_cameras: int = 2
     tracks: list[VideoTrack] = field(default_factory=list)
     signal_paths: list[str] = field(default_factory=list)
@@ -204,7 +205,7 @@ class ProjectState:
 
 
 _PATH_KEYS = {
-    "project_path", "output_directory", "concatenated_path",
+    "project_path", "output_directory", "metadata_path", "concatenated_path",
     "trimstart_path", "final_output_path", "ffmpeg_path",
     "synced_signal_path", "synced_hr_path", "synced_ecg_path",
     "synthetic_ppg_path", "synthetic_ppg_hr_path", "synthetic_ppg_hrv_path",
@@ -389,6 +390,7 @@ def generate_sidecar(state: ProjectState) -> str:
         json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     log.info("Wrote sidecar: %s", sidecar_path)
+    state.metadata_path = sidecar_path
     return sidecar_path
 
 
@@ -484,6 +486,7 @@ def load_sidecar(path: str, state: ProjectState) -> None:
         setattr(state, field_name, str(base_dir / name) if name else "")
 
     state.output_directory = str(base_dir)
+    state.metadata_path = str(p.resolve())
     state.mode1_complete = True
     state.time_coherence_tolerance_sec = raw.get(
         "time_coherence_tolerance_sec", state.time_coherence_tolerance_sec

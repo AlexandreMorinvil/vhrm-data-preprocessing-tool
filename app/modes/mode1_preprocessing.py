@@ -322,6 +322,10 @@ class Mode1Widget(QWidget):
         self._rebuild_camera_groups()
         self._restore_from_state()
 
+    def refresh_camera_names(self) -> None:
+        for group, track in zip(self._camera_groups, self.state.tracks):
+            group.label = track.camera_label
+
     def _browse_ffmpeg(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select ffmpeg executable")
         if path:

@@ -514,7 +514,11 @@ class Mode4Widget(QWidget):
 
         video_files = sorted(seg_dir.glob("cam*.*"))
         if video_files:
-            labels = [f.stem for f in video_files]
+            camera_labels = {
+                camera.get("video_file"): camera.get("label")
+                for camera in meta.get("cameras", [])
+            }
+            labels = [camera_labels.get(f.name) or f.stem for f in video_files]
             self._player.set_cameras(labels)
             self._player.load_videos([str(f) for f in video_files])
         else:

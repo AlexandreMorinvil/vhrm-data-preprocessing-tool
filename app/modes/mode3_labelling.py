@@ -455,6 +455,9 @@ class Mode3Widget(QWidget):
             self._load_signals()
         self._refresh_time_summary()
 
+    def refresh_camera_names(self) -> None:
+        self._refresh_time_summary()
+
     def _refresh_label_lists(self) -> None:
         current = self._label_combo.currentText()
         self._lib_list.blockSignals(True)

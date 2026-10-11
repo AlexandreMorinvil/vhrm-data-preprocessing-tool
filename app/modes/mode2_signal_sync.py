@@ -294,6 +294,12 @@ class Mode2Widget(QWidget):
         self._load_synced_signal()
         self._refresh_time_correction_ui()
 
+    def refresh_camera_names(self) -> None:
+        for row, track in enumerate(self.state.tracks, start=1):
+            item = self._time_grid.itemAtPosition(row, 0)
+            if item is not None and isinstance(item.widget(), QLabel):
+                item.widget().setText(track.camera_label)
+
     def _refresh_signal_file_lists(self):
         self._hr_file_list.clear()
         self._ecg_file_list.clear()

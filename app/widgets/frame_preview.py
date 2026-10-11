@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Optional
@@ -402,6 +403,17 @@ class FramePreview(QFrame):
         self._position_ms = 0
         self._still = None
         self._drop_masks()
+
+    def retarget_video(self, path: str, label: str) -> None:
+        """Update a renamed file without re-probing unchanged video metadata."""
+        self.deactivate()
+        self._video_path = path
+        self._label_text = label
+        self._label.setText(label)
+        self.setToolTip(
+            f"{Path(path).name}\n{self._frame_count} frames | {self._fps:.3f} fps | "
+            f"{self._frame_size.width()}x{self._frame_size.height()}"
+        )
 
     def activate(self) -> None:
         """Open decoders for the loaded file (only while visible)."""
@@ -881,6 +893,32 @@ class MultiCameraPlayer(QWidget):
         self._extra_widget.show()
 
     # ------------------------------------------------------------------ cameras
+    def suspend_for_camera_rename(self) -> None:
+        """Release file handles without destroying previews or waiting on AI."""
+        self._camera_rename_suspended = True
+        self._deactivate_media()
+        self._privacy_timer.stop()
+        self._privacy_debounce.stop()
+        self._disconnect_privacy_sinks()
+        self._latest_frames.clear()
+
+    def resume_after_camera_rename(self, path_changes: dict[str, str], labels: list[str]) -> None:
+        """Keep the same view, cached video properties and playback position."""
+        paths = {os.path.normcase(path): target for path, target in path_changes.items()}
+        for preview in self._previews:
+            old_path = preview.video_path
+            new_path = paths.get(os.path.normcase(str(Path(old_path).resolve())), old_path) if old_path else ""
+            label = preview.label_text
+            if new_path != old_path:
+                match = re.match(r"cam(\d+)_", Path(new_path).name)
+                if match and 0 < int(match[1]) <= len(labels):
+                    label = labels[int(match[1]) - 1]
+                preview.retarget_video(new_path, label)
+        self._rebuild_audio_combo()
+        self._camera_rename_suspended = False
+        if self._media_should_be_active():
+            self._activate_media()
+
     def set_cameras(self, labels: list[str]) -> None:
         self.stop()
         for preview in self._previews:
@@ -1102,6 +1140,8 @@ class MultiCameraPlayer(QWidget):
         return self._visible_media
 
     def _activate_media(self) -> None:
+        if getattr(self, "_camera_rename_suspended", False):
+            return
         for preview in self._previews:
             preview.note_position_ms(self._position_ms)
             preview.activate()
@@ -1477,7 +1517,8 @@ class MultiCameraPlayer(QWidget):
         return self._privacy_worker
 
     def _submit_privacy_frames(self) -> None:
-        if not self._face_blur_enabled or not self._use_qt:
+        if (getattr(self, "_camera_rename_suspended", False)
+                or not self._face_blur_enabled or not self._use_qt):
             return
         worker = self._ensure_privacy_worker()
         for index, frame in list(self._latest_frames.items()):
@@ -1487,7 +1528,8 @@ class MultiCameraPlayer(QWidget):
             worker.submit(index, QVideoFrame(frame), t_sec, self._privacy_generation, self._playing)
 
     def _on_privacy_regions(self, camera: int, _generation: int, payload) -> None:
-        if not self._face_blur_enabled or camera >= len(self._previews):
+        if (getattr(self, "_camera_rename_suspended", False)
+                or not self._face_blur_enabled or camera >= len(self._previews)):
             return
         rects, patches = payload
         self._previews[camera].set_privacy_masks(rects, patches)

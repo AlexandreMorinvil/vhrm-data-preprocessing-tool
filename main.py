@@ -5,7 +5,7 @@ import logging
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings
+from PyQt6.QtCore import QSettings, QThread, QTimer
 from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
@@ -147,6 +147,10 @@ class MainWindow(QMainWindow):
         save_as_act.setShortcut(QKeySequence("Ctrl+Shift+S"))
         save_as_act.triggered.connect(self._save_project_as)
         file_menu.addAction(save_as_act)
+
+        rename_act = QAction("&Rename cameras …", self)
+        rename_act.triggered.connect(self._rename_cameras)
+        file_menu.addAction(rename_act)
 
         file_menu.addSeparator()
         quit_act = QAction("&Quit", self)
@@ -363,6 +367,71 @@ class MainWindow(QMainWindow):
         self._update_project_label()
         self.statusBar().showMessage(f"Saved to {path}", 3000)
         return True
+
+    def _rename_cameras(self):
+        from app.camera_rename_worker import CameraRenameWorker
+        from app.widgets.camera_rename_dialog import CameraRenameDialog
+        from app.widgets.camera_rename_progress import CameraRenameProgressDialog
+
+        if not self.state.tracks:
+            QMessageBox.information(self, "Rename cameras", "Load project metadata or preprocess cameras first.")
+            return
+        for widget in self._mode_widgets:
+            if widget is not None and any(
+                isinstance(value, QThread) and value.isRunning()
+                for value in vars(widget).values()
+            ):
+                QMessageBox.warning(self, "Rename cameras", "Wait for preprocessing or exports to finish before renaming cameras.")
+                return
+        dialog = CameraRenameDialog(self.state, self)
+        if not dialog.exec():
+            return
+        labels = dialog.labels()
+        if labels == [track.camera_label for track in self.state.tracks]:
+            return
+        worker = CameraRenameWorker(self.state, labels, self)
+        progress = CameraRenameProgressDialog(self)
+        worker.progress.connect(progress.update_progress)
+        progress.cancel_requested.connect(worker.cancel)
+        worker.finished.connect(progress.finish)
+        players = self._players()
+
+        def begin():
+            # Show the progress dialog before releasing Windows video handles.
+            try:
+                for player in players:
+                    player.suspend_for_camera_rename()
+            except Exception as exc:
+                worker.error = str(exc)
+                progress.finish()
+                return
+            worker.start()
+
+        QTimer.singleShot(0, begin)
+        progress.exec()  # Nested Qt event loop remains responsive throughout.
+        try:
+            if not worker.error and not worker.was_cancelled:
+                for current, updated in zip(self.state.tracks, worker.state.tracks):
+                    current.__dict__.update(updated.__dict__)
+                if self.state.project_path:
+                    self._saved_snapshot = self._state_snapshot()
+            for player in players:
+                player.resume_after_camera_rename(worker.path_changes, labels)
+            if not worker.error and not worker.was_cancelled:
+                # Refresh only camera text, not signal data or whole modes.
+                for widget in self._mode_widgets:
+                    refresh = getattr(widget, "refresh_camera_names", None)
+                    if refresh is not None:
+                        refresh()
+            if worker.error:
+                QMessageBox.critical(self, "Camera rename failed", worker.error)
+            elif worker.was_cancelled:
+                self.statusBar().showMessage("Camera rename cancelled; original files restored.", 7000)
+            else:
+                self.statusBar().showMessage(f"Camera names updated; {worker.count} file(s) renamed.", 7000)
+        finally:
+            worker.deleteLater()
+            progress.deleteLater()
 
     def _reload_modes(self):
         for player in self._players():

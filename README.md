@@ -48,6 +48,25 @@ automatically. Seeking and frame stepping are frame-accurate.
 - The window button (or **Ctrl+Shift+W**) moves the cameras to a separate window,
   for example on a second screen; the controls stay in the main window.
 
+## Renaming cameras
+
+After preprocessing or importing project metadata, choose **File > Rename cameras…**
+from any section. Edit the camera names and click **Rename**. The application
+renames final videos, existing labelled camera clips and individual captured-frame
+filenames, updates their JSON
+metadata and path references, and saves the current project if it already has a
+project file. Original recordings, sensor CSVs and interval labels are unchanged.
+Imported metadata is updated in place, even if it has a custom filename.
+
+Names must be unique and valid Windows filename text. Existing destination files
+are never overwritten; failed operations restore the previous files and metadata.
+Wait for preprocessing and exports to finish before renaming. Camera previews are
+paused during renaming. A progress dialog shows the current file and stage; **Cancel**
+restores previous filenames and metadata before closing. File operations run in
+the background; existing plots, signal data and playback position are retained
+without rebuilding the section or re-probing videos. Text already rendered into mosaic videos or captured images
+is not editable; re-export those visualizations to use the new names.
+
 ## Graphs and timeline
 
 Signals are shown as stacked panels (for example heart rate above ECG) sharing
