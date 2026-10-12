@@ -76,6 +76,40 @@ class SignalPlotWindowTests(unittest.TestCase):
         self.assertAlmostEqual(restored_min, -0.2875)
         self.assertAlmostEqual(restored_max, 0.5375)
 
+    def test_box_selection_focuses_time_and_y_and_can_be_undone(self) -> None:
+        view_box = self.plot._panels[0].plot.getViewBox()
+        self.plot._on_range_selected(5.0, 15.0)
+        self.assertVisibleRange(5.0, 15.0)
+        auto_y = self.plot.y_range()
+
+        self.plot._on_range_selected(8.0, 12.0, (-0.1, 0.4), view_box)
+        self.assertVisibleRange(8.0, 12.0)
+        self.assertEqual(self.plot.y_range(), (-0.1, 0.4))
+        self.assertFalse(self.plot._auto_y_min.isChecked())
+        self.assertFalse(self.plot._auto_y_max.isChecked())
+
+        self.plot._undo_zoom()
+        self.assertVisibleRange(5.0, 15.0)
+        self.assertEqual(self.plot.y_range(), auto_y)
+        self.assertTrue(self.plot._auto_y_min.isChecked())
+
+        self.plot._undo_zoom()
+        self.assertVisibleRange(0.0, 20.0)
+        self.assertFalse(self.plot._undo_zoom_btn.isEnabled())
+
+    def test_full_range_resets_box_y_zoom_and_is_undoable(self) -> None:
+        view_box = self.plot._panels[0].plot.getViewBox()
+        self.plot._on_range_selected(8.0, 12.0, (-0.1, 0.4), view_box)
+
+        self.plot._show_full_range()
+        self.assertVisibleRange(0.0, 20.0)
+        self.assertTrue(self.plot._auto_y_min.isChecked())
+        self.assertTrue(self.plot._auto_y_max.isChecked())
+
+        self.plot._undo_zoom()
+        self.assertVisibleRange(8.0, 12.0)
+        self.assertEqual(self.plot.y_range(), (-0.1, 0.4))
+
     def test_toggles_individual_signal_visibility(self) -> None:
         frame = pd.DataFrame({
             "timestamp_utc": pd.to_datetime([

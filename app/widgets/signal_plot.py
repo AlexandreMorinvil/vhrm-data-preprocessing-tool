@@ -1,8 +1,11 @@
 """Interactive signal plot (pyqtgraph) with stacked, time-linked panels.
 
-Mouse: wheel = zoom time, drag = pan time, click = move the playhead,
-Ctrl+drag = zoom to the dragged range, Shift+drag = draw a new label interval
-(when enabled). The red cursor can be dragged to scrub the videos.
+Mouse: wheel = zoom time, drag = pan time (or select a region to focus on when
+"Select zoom" is on), click = move the playhead, Ctrl+drag = select a region to
+focus on, Shift+drag = draw a new label interval (when enabled). A selection
+that is mostly horizontal only sets the time window; a taller box also zooms
+that panel's y-axis. "Undo zoom" returns to the previous focus. The red cursor
+can be dragged to scrub the videos.
 
 Each panel has its own y-axis (never two scales on one axis). The x-axis is
 the video timeline in seconds; with a time reference (the signal anchor),
@@ -18,13 +21,14 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
-from PyQt6.QtCore import QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QObject, QRectF, QSettings, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
+    QGraphicsRectItem,
     QHBoxLayout,
     QLabel,
     QMenu,
@@ -48,12 +52,34 @@ pg.setConfigOptions(antialias=False, useOpenGL=False)
 SERIES_COLORS_LIGHT = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948")
 SERIES_COLORS_DARK = ("#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767")
 TIME_AXIS_MODES = ("video", "seconds", "clock")
+SELECT_ZOOM_SETTING = "signal_plot/select_zoom"
+ZOOM_Y_MIN_PIXELS = 16  # selections shorter than this only set the time window
+ZOOM_MIN_PIXELS = 4
+VIEW_HISTORY_LIMIT = 50
+
+
+class _SelectZoomNotifier(QObject):
+    """Keeps the "Select zoom" toggle in sync across every plot."""
+
+    changed = pyqtSignal(bool)
+
+
+_select_zoom_notifier = _SelectZoomNotifier()
 
 
 def series_color(index: int, dark: Optional[bool] = None) -> str:
     dark = theme.current().name == "dark" if dark is None else dark
     palette = SERIES_COLORS_DARK if dark else SERIES_COLORS_LIGHT
     return palette[index % len(palette)]
+
+
+def _load_select_zoom() -> bool:
+    return QSettings("VideoResearchTool", "VRT").value(SELECT_ZOOM_SETTING, True, type=bool)
+
+
+def _save_select_zoom(enabled: bool) -> None:
+    QSettings("VideoResearchTool", "VRT").setValue(SELECT_ZOOM_SETTING, bool(enabled))
+    _select_zoom_notifier.changed.emit(bool(enabled))
 
 
 # ---------------------------------------------------------------------------
@@ -121,13 +147,14 @@ class TimeAxisItem(pg.AxisItem):
 
 
 class _SignalViewBox(pg.ViewBox):
-    """ViewBox with click-to-seek, Ctrl-drag zoom and Shift-drag interval drawing."""
+    """ViewBox with click-to-seek, drag-to-zoom selection and Shift-drag interval drawing."""
 
     def __init__(self, owner: "SignalPlot", *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._owner = owner
         self._band: Optional[pg.LinearRegionItem] = None
-        self._band_mode = ""
+        self._zoom_box: Optional[QGraphicsRectItem] = None
+        self._drag_mode = ""
         self.setMouseEnabled(x=True, y=False)
 
     def mouseClickEvent(self, ev):
@@ -137,22 +164,43 @@ class _SignalViewBox(pg.ViewBox):
         else:
             super().mouseClickEvent(ev)
 
-    def mouseDragEvent(self, ev, axis=None):
+    def _drag_mode_for(self, ev, axis) -> str:
+        if ev.button() != Qt.MouseButton.LeftButton or axis is not None:
+            return ""
         modifiers = ev.modifiers()
-        wants_band = ev.button() == Qt.MouseButton.LeftButton and (
-            modifiers & Qt.KeyboardModifier.ControlModifier
-            or (modifiers & Qt.KeyboardModifier.ShiftModifier and self._owner.interval_drawing_enabled)
-        )
-        if not wants_band and self._band is None:
+        if modifiers & Qt.KeyboardModifier.ShiftModifier and self._owner.interval_drawing_enabled:
+            return "interval"
+        if modifiers & Qt.KeyboardModifier.ControlModifier or self._owner.select_zoom_enabled:
+            return "zoom"
+        return ""
+
+    def mouseDragEvent(self, ev, axis=None):
+        if ev.isStart():
+            self._drag_mode = self._drag_mode_for(ev, axis)
+        if not self._drag_mode:
             super().mouseDragEvent(ev, axis)
             return
         ev.accept()
-        start = float(self.mapSceneToView(ev.buttonDownScenePos()).x())
-        current = float(self.mapSceneToView(ev.scenePos()).x())
-        lo, hi = sorted((start, current))
+        down, now = ev.buttonDownScenePos(), ev.scenePos()
+        start, current = self.mapSceneToView(down), self.mapSceneToView(now)
+        lo, hi = sorted((float(start.x()), float(current.x())))
+        if self._drag_mode == "interval":
+            self._drag_interval(ev, lo, hi)
+        else:
+            use_y = abs(now.y() - down.y()) >= ZOOM_Y_MIN_PIXELS
+            if use_y:
+                y_lo, y_hi = sorted((float(start.y()), float(current.y())))
+            else:
+                y_lo, y_hi = (float(v) for v in self.viewRange()[1])
+            self._drag_zoom(ev, lo, hi, y_lo, y_hi)
+            if ev.isFinish() and abs(now.x() - down.x()) >= ZOOM_MIN_PIXELS:
+                self._owner._on_range_selected(lo, hi, (y_lo, y_hi) if use_y else None, self)
+        if ev.isFinish():
+            self._drag_mode = ""
+
+    def _drag_interval(self, ev, lo: float, hi: float) -> None:
         if ev.isStart():
-            self._band_mode = "zoom" if modifiers & Qt.KeyboardModifier.ControlModifier else "interval"
-            color = QColor(theme.current().accent if self._band_mode == "zoom" else "#ffd54a")
+            color = QColor("#ffd54a")
             color.setAlpha(60)
             self._band = pg.LinearRegionItem((lo, hi), movable=False, brush=pg.mkBrush(color))
             self.addItem(self._band, ignoreBounds=True)
@@ -162,11 +210,25 @@ class _SignalViewBox(pg.ViewBox):
             if self._band is not None:
                 self.removeItem(self._band)
                 self._band = None
-            if self._band_mode == "zoom":
-                self._owner._on_range_selected(lo, hi)
-            elif hi - lo > 0:
+            if hi - lo > 0:
                 self._owner.interval_drawn.emit(lo, hi)
-            self._band_mode = ""
+
+    def _drag_zoom(self, ev, lo: float, hi: float, y_lo: float, y_hi: float) -> None:
+        if ev.isStart():
+            accent = theme.current().accent
+            fill = QColor(accent)
+            fill.setAlpha(50)
+            self._zoom_box = QGraphicsRectItem()
+            self._zoom_box.setPen(pg.mkPen(accent, width=1, style=Qt.PenStyle.DashLine))
+            self._zoom_box.setBrush(pg.mkBrush(fill))
+            self._zoom_box.setZValue(100)
+            self.addItem(self._zoom_box, ignoreBounds=True)
+        if self._zoom_box is not None:
+            self._zoom_box.setRect(QRectF(lo, y_lo, hi - lo, y_hi - y_lo))
+            self._owner._show_selection_readout(lo, hi)
+        if ev.isFinish() and self._zoom_box is not None:
+            self.removeItem(self._zoom_box)
+            self._zoom_box = None
 
 
 class _Panel:
@@ -183,6 +245,7 @@ class _Panel:
         self.auto_max = True
         self.y_min = 0.0
         self.y_max = 1.0
+        self.y_from_zoom = False  # y limits were set by a box selection
 
 
 class _LineHandle:
@@ -234,6 +297,7 @@ class SignalPlot(QWidget):
         self._updating_y_controls = False
         self._syncing_view = False
         self._syncing_x = False
+        self._view_history: list[tuple[float, float, dict[str, tuple]]] = []
         self.figure_export_context = None  # callable returning extra export context
 
         layout = QVBoxLayout(self)
@@ -272,6 +336,24 @@ class SignalPlot(QWidget):
         self._full_range_btn.setToolTip("Show the complete signal")
         self._full_range_btn.clicked.connect(self._show_full_range)
         controls.addWidget(self._full_range_btn)
+        self._select_zoom_btn = QToolButton()
+        self._select_zoom_btn.setText("Select zoom")
+        self._select_zoom_btn.setCheckable(True)
+        self._select_zoom_btn.setToolTip(
+            "When on, drag on a graph to select the region to focus on (otherwise dragging pans).\n"
+            "A mostly horizontal drag sets the time window; a taller box also zooms that panel's y-axis.\n"
+            "Ctrl+drag selects a region at any time."
+        )
+        self._select_zoom_btn.setChecked(_load_select_zoom())
+        self._select_zoom_btn.toggled.connect(_save_select_zoom)
+        _select_zoom_notifier.changed.connect(self._on_select_zoom_changed)
+        controls.addWidget(self._select_zoom_btn)
+        self._undo_zoom_btn = QToolButton()
+        self._undo_zoom_btn.setText("Undo zoom")
+        self._undo_zoom_btn.setToolTip("Return to the previous focus region")
+        self._undo_zoom_btn.setEnabled(False)
+        self._undo_zoom_btn.clicked.connect(self._undo_zoom)
+        controls.addWidget(self._undo_zoom_btn)
         self._axis_mode = QComboBox()
         self._axis_mode.addItem("Video time", "video")
         self._axis_mode.addItem("Seconds", "seconds")
@@ -350,6 +432,7 @@ class SignalPlot(QWidget):
 
         self._set_window_controls_enabled(False)
         self._update_y_control_states()
+        self._on_select_zoom_changed(self._select_zoom_btn.isChecked())
         self._build_empty()
 
     @staticmethod
@@ -384,6 +467,7 @@ class SignalPlot(QWidget):
             if old is not None:
                 panel.auto_min, panel.auto_max = old.auto_min, old.auto_max
                 panel.y_min, panel.y_max = old.y_min, old.y_max
+                panel.y_from_zoom = old.y_from_zoom
             self._panels.append(panel)
         self._video_start_sec = float(video_start_sec)
         self._video_duration_sec = float(video_duration_sec)
@@ -403,6 +487,10 @@ class SignalPlot(QWidget):
             self._apply_time_window()
 
     @property
+    def select_zoom_enabled(self) -> bool:
+        return self._select_zoom_btn.isChecked()
+
+    @property
     def panel_count(self) -> int:
         return len(self._panels)
 
@@ -411,6 +499,7 @@ class SignalPlot(QWidget):
         self._data_start_sec = 0.0
         self._data_end_sec = 0.0
         self._window_start_sec = 0.0
+        self._clear_view_history()
         self._set_window_controls_enabled(False)
         self._range_label.setText("Full range")
         self._sync_signal_controls([])
@@ -733,6 +822,7 @@ class SignalPlot(QWidget):
             panel.auto_max = self._auto_y_max.isChecked()
             panel.y_min = self._y_min.value()
             panel.y_max = self._y_max.value()
+            panel.y_from_zoom = False
         self._update_y_control_states()
         self._apply_y_scale()
 
@@ -853,22 +943,92 @@ class SignalPlot(QWidget):
         self._apply_time_window()
 
     def _show_full_range(self) -> None:
+        """Show the complete signal and drop y-zooms made by box selections."""
+        zoomed = [panel for panel in self._panels if panel.y_from_zoom]
+        if not zoomed and self._visible_duration() >= self._full_duration() - 1e-6:
+            return
+        self._push_view_history()
+        for panel in zoomed:
+            panel.auto_min = panel.auto_max = True
+            panel.y_from_zoom = False
         self._window_start_sec = self._data_start_sec
         self._updating_window_controls = True
         self._window_duration.setValue(self._full_duration())
         self._updating_window_controls = False
         self._apply_time_window()
+        self._load_y_controls()
 
-    def _on_range_selected(self, start_sec: float, end_sec: float) -> None:
+    def _on_range_selected(self, start_sec: float, end_sec: float,
+                           y_range: Optional[tuple[float, float]] = None,
+                           view_box: Optional[pg.ViewBox] = None) -> None:
+        """Focus on a selected region: its time span, plus its y span on that panel if given."""
         start_sec = max(self._data_start_sec, min(start_sec, self._data_end_sec))
         end_sec = max(self._data_start_sec, min(end_sec, self._data_end_sec))
         if end_sec - start_sec < 0.01:
             return
+        panel_index = self._panel_index_of(view_box)
+        self._push_view_history()
+        if y_range is not None and panel_index is not None and y_range[1] > y_range[0]:
+            panel = self._panels[panel_index]
+            panel.auto_min = panel.auto_max = False
+            panel.y_min, panel.y_max = y_range
+            panel.y_from_zoom = True
+            self._active_panel = panel_index
+            self._y_panel.blockSignals(True)
+            self._y_panel.setCurrentIndex(panel_index)
+            self._y_panel.blockSignals(False)
         self._window_start_sec = start_sec
         self._updating_window_controls = True
         self._window_duration.setValue(end_sec - start_sec)
         self._updating_window_controls = False
         self._apply_time_window()
+        self._load_y_controls()
+
+    def _panel_index_of(self, view_box: Optional[pg.ViewBox]) -> Optional[int]:
+        for index, panel in enumerate(self._panels):
+            if view_box is not None and panel.plot is not None and panel.plot.getViewBox() is view_box:
+                return index
+        return None
+
+    # ------------------------------------------------------------------ zoom history
+    def _push_view_history(self) -> None:
+        y_states = {
+            panel.title: (panel.auto_min, panel.auto_max, panel.y_min, panel.y_max, panel.y_from_zoom)
+            for panel in self._panels
+        }
+        self._view_history.append((self._window_start_sec, self._visible_duration(), y_states))
+        del self._view_history[:-VIEW_HISTORY_LIMIT]
+        self._undo_zoom_btn.setEnabled(True)
+
+    def _clear_view_history(self) -> None:
+        self._view_history.clear()
+        self._undo_zoom_btn.setEnabled(False)
+
+    def _undo_zoom(self) -> None:
+        if not self._view_history or not self._panels:
+            return
+        start_sec, duration, y_states = self._view_history.pop()
+        for panel in self._panels:
+            state = y_states.get(panel.title)
+            if state is not None:
+                panel.auto_min, panel.auto_max, panel.y_min, panel.y_max, panel.y_from_zoom = state
+        self._window_start_sec = start_sec
+        self._updating_window_controls = True
+        self._window_duration.setValue(min(duration, self._full_duration()))
+        self._updating_window_controls = False
+        self._apply_time_window()
+        self._load_y_controls()
+        self._undo_zoom_btn.setEnabled(bool(self._view_history))
+
+    def _on_select_zoom_changed(self, enabled: bool) -> None:
+        if self._select_zoom_btn.isChecked() != enabled:
+            self._select_zoom_btn.blockSignals(True)
+            self._select_zoom_btn.setChecked(enabled)
+            self._select_zoom_btn.blockSignals(False)
+        if enabled:
+            self._graphics.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self._graphics.unsetCursor()
 
     def _full_duration(self) -> float:
         return max(0.01, self._data_end_sec - self._data_start_sec)
@@ -936,6 +1096,12 @@ class SignalPlot(QWidget):
         self._range_label.setText(f"{format_hms_ms(self._window_start_sec)} – {format_hms_ms(end_sec)}")
 
     # ------------------------------------------------------------------ interaction
+    def _show_selection_readout(self, start_sec: float, end_sec: float) -> None:
+        self._readout.setText(
+            f"Selection: {format_hms_ms(max(0.0, start_sec))} – {format_hms_ms(max(0.0, end_sec))}"
+            f"   ({end_sec - start_sec:.2f} s)"
+        )
+
     def _on_cursor_dragged(self, line: pg.InfiniteLine) -> None:
         self.seek_requested.emit(float(line.value()))
 

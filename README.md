@@ -72,8 +72,14 @@ is not editable; re-export those visualizations to use the new names.
 Signals are shown as stacked panels (for example heart rate above ECG) sharing
 one time axis with the timeline, and each panel has its own y-axis.
 
-- Mouse wheel zooms time, dragging pans, clicking moves the playhead, and the
-  red cursor can be dragged to scrub the videos. **Ctrl+drag** zooms to a range.
+- Mouse wheel zooms time, clicking moves the playhead, and the red cursor can be
+  dragged to scrub the videos.
+- With **Select zoom** on (the default), drag on a graph to select the region
+  to focus on; with it off, dragging pans and **Ctrl+drag** selects. A mostly
+  horizontal drag sets only the time window (its start and duration show below
+  the graph while dragging); a taller box also zooms that panel's y-axis.
+  **Undo zoom** steps back through previous focus regions, and **Full range**
+  shows the whole signal and restores automatic y-scaling for box-zoomed panels.
 - The graphs and the timeline stay aligned and follow the playhead while zoomed
   (**Follow playhead**).
 - Hovering a graph shows the time, the value of each visible signal, and the
