@@ -39,7 +39,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..dataset_templates import PART_LABELS, CameraTemplate, DatasetTemplate, apply_labels
+from ..dataset_templates import PART_LABELS, CameraTemplate, DatasetTemplate, apply_labels, rename_label
 from ..file_cleanup import cleanup_obsolete_paths
 from ..face_privacy import export_anonymized_video_segment
 from ..ffmpeg_utils import FFmpegWorker, trim_video, find_ffmpeg
@@ -196,13 +196,16 @@ class Mode3Widget(QWidget):
         self._lib_list = QListWidget()
         self._lib_list.setMaximumHeight(170)
         self._lib_list.currentRowChanged.connect(self._on_library_row)
+        self._lib_list.itemDoubleClicked.connect(lambda _item: self._rename_label())
+        self._lib_list.setToolTip("Double-click a label to rename it on every interval.")
         lib_lay.addWidget(self._lib_list)
         lbtn_row = QHBoxLayout()
         add_lb = QPushButton("Add label")
         add_lb.clicked.connect(self._add_label)
         lbtn_row.addWidget(add_lb)
         rename_lb = QPushButton("Rename")
-        rename_lb.clicked.connect(self._rename_label)
+        rename_lb.setToolTip("Rename the selected label on every interval that uses it.")
+        rename_lb.clicked.connect(lambda: self._rename_label())
         lbtn_row.addWidget(rename_lb)
         rm_lb = QPushButton("Remove")
         rm_lb.clicked.connect(self._remove_label)
@@ -401,6 +404,7 @@ class Mode3Widget(QWidget):
         self._timeline.interval_deleted.connect(self._on_interval_deleted)
         self._timeline.interval_selected.connect(self._on_interval_selected)
         self._timeline.interval_relabelled.connect(self._on_interval_relabelled)
+        self._timeline.label_rename_requested.connect(self._rename_label)
         self._timeline.interval_resized.connect(self._on_interval_resized)
         self._timeline.subdivide_requested.connect(self._on_subdivide_single)
         self._timeline.mosaic_requested.connect(self._on_mosaic_interval)
@@ -685,28 +689,36 @@ class Mode3Widget(QWidget):
             self._refresh_label_lists()
             self._label_combo.setCurrentText(text)
 
-    def _rename_label(self):
-        row = self._lib_list.currentRow()
-        if row < 0 or row >= len(self.state.labels_library):
-            QMessageBox.information(self, "Rename label", "Select a label in the library first.")
-            return
-        old = self.state.labels_library[row]
-        new, ok = QInputDialog.getText(self, "Rename label", f"New name for “{old}”:", text=old)
+    def _rename_label(self, old: Optional[str] = None):
+        """Rename a label everywhere; defaults to the label selected in the library."""
+        if old is None:
+            row = self._lib_list.currentRow()
+            if row < 0 or row >= len(self.state.labels_library):
+                QMessageBox.information(self, "Rename label", "Select a label in the library first.")
+                return
+            old = self.state.labels_library[row]
+        count = sum(1 for interval in self.state.intervals if interval.label == old)
+        new, ok = QInputDialog.getText(
+            self, "Rename label",
+            f"New name for “{old}” (used by {count} interval(s)):", text=old)
         new = new.strip() if ok else ""
         if not new or new == old:
             return
         if new in self.state.labels_library:
-            QMessageBox.warning(self, "Rename label", f"“{new}” already exists.")
-            return
+            answer = QMessageBox.question(
+                self, "Merge labels",
+                f"“{new}” already exists. Merge “{old}” into it?\n"
+                f"All {count} interval(s) labelled “{old}” will become “{new}”.")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        was_current = self._label_combo.currentText() == old
         self._push_undo()
-        self.state.labels_library[row] = new
-        renamed = 0
-        for interval in self.state.intervals:
-            if interval.label == old:
-                interval.label = new
-                renamed += 1
+        renamed = rename_label(self.state, old, new)
         self._refresh_label_lists()
+        if was_current:
+            self._label_combo.setCurrentText(new)
         self._sync_timeline()
+        self._select(self._selected)  # refresh the editor so it shows the new name
         self._status.setText(f"Renamed “{old}” to “{new}” ({renamed} interval(s) updated).")
 
     def _remove_label(self):

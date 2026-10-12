@@ -207,6 +207,36 @@ class LabellingWorkflowTests(unittest.TestCase):
         self.assertEqual((state.intervals[-1].start_sec, state.intervals[-1].end_sec), (60.0, 64.5))
         self.assertIsNone(widget._pending_start)
 
+    def test_rename_label_updates_every_interval_and_editor(self) -> None:
+        from unittest import mock
+
+        widget, state = self._widget()
+        widget._on_interval_created(50.0, 55.0)  # current label: library[0]
+        old = state.labels_library[0]
+        widget._lib_list.setCurrentRow(0)
+        widget._select(state.intervals[0])
+        with mock.patch("app.modes.mode3_labelling.QInputDialog.getText", return_value=("Rest", True)):
+            widget._rename_label()
+        self.assertEqual(state.labels_library[0], "Rest")
+        self.assertNotIn(old, [iv.label for iv in state.intervals])
+        self.assertEqual(widget._current_label(), "Rest")
+        self.assertEqual(widget._ed_label.currentText(), "Rest")
+        widget._undo_action()
+        self.assertEqual(widget.state.labels_library[0], old)
+
+    def test_rename_label_onto_existing_merges_after_confirmation(self) -> None:
+        from unittest import mock
+
+        from PyQt6.QtWidgets import QMessageBox
+
+        widget, state = self._widget()
+        yes = QMessageBox.StandardButton.Yes
+        with mock.patch("app.modes.mode3_labelling.QInputDialog.getText", return_value=("Baseline", True)):
+            with mock.patch("app.modes.mode3_labelling.QMessageBox.question", return_value=yes):
+                widget._rename_label("Squat")
+        self.assertEqual([iv.label for iv in state.intervals], ["Baseline", "Baseline"])
+        self.assertNotIn("Squat", state.labels_library)
+
 
 if __name__ == "__main__":
     unittest.main()

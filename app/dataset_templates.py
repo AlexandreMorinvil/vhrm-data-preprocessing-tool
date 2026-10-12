@@ -157,6 +157,28 @@ def apply_labels(state: ProjectState, labels: list[str]) -> list[str]:
     return kept
 
 
+def rename_label(state: ProjectState, old: str, new: str) -> int:
+    """Rename label *old* to *new* in the library and on every interval.
+
+    If *new* is already in the library the two labels are merged: *old* is
+    dropped and its intervals take *new*. Returns the number of intervals
+    relabelled.
+    """
+    library = state.labels_library
+    if old in library:
+        if new in library:
+            library.remove(old)
+        else:
+            library[library.index(old)] = new
+    elif new not in library:
+        library.append(new)
+    renamed = 0
+    for interval in state.intervals:
+        if interval.label == old:
+            interval.label = new
+            renamed += 1
+    return renamed
+
 
 class TemplateStore(QObject):
     """Templates saved in the user's application settings."""

@@ -72,6 +72,7 @@ class TimelineWidget(QWidget):
     interval_selected = pyqtSignal(int)
     interval_deleted = pyqtSignal(int)
     interval_relabelled = pyqtSignal(int, str)
+    label_rename_requested = pyqtSignal(str)          # rename a label on every interval
     interval_resized = pyqtSignal(int, float, float)   # idx, new_start, new_end (resize or move)
     interval_activated = pyqtSignal(int)               # double-click
     subdivide_requested = pyqtSignal(int)
@@ -661,6 +662,7 @@ class TimelineWidget(QWidget):
             if self._label_choices:
                 relabel_menu.addSeparator()
             actions[relabel_menu.addAction("Other…")] = ("relabel", None)
+            actions[menu.addAction(f"Rename “{iv.label}” everywhere…")] = ("rename-all", iv.label)
         actions[menu.addAction("Go to start")] = ("seek", iv.start_sec)
         actions[menu.addAction("Go to end")] = ("seek", iv.end_sec)
         actions[menu.addAction("Zoom to interval")] = ("zoom", None)
@@ -695,6 +697,8 @@ class TimelineWidget(QWidget):
             if ok and new_label:
                 iv.label = new_label
                 self.interval_relabelled.emit(idx, new_label)
+        elif kind == "rename-all":
+            self.label_rename_requested.emit(value)
         elif kind == "seek":
             self.playhead_moved.emit(value)
         elif kind == "zoom":

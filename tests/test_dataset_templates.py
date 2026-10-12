@@ -16,6 +16,7 @@ from app.dataset_templates import (
     TemplateStore,
     apply_labels,
     describe,
+    rename_label,
 )
 from app.state import LabelInterval, ProjectState
 
@@ -109,6 +110,30 @@ class ApplyLabelsTests(unittest.TestCase):
         self.assertEqual(state.labels_library, ["Rest", "Squat", "Old"])
         self.assertEqual(kept, ["Old"])
 
+
+class RenameLabelTests(unittest.TestCase):
+    def _state(self):
+        return ProjectState(labels_library=["Rest", "Squat"], intervals=[
+            LabelInterval("Rest", 0.0, 1.0), LabelInterval("Squat", 1.0, 2.0), LabelInterval("Rest", 2.0, 3.0),
+        ])
+
+    def test_renames_library_entry_in_place_and_every_interval(self) -> None:
+        state = self._state()
+        self.assertEqual(rename_label(state, "Rest", "Baseline"), 2)
+        self.assertEqual(state.labels_library, ["Baseline", "Squat"])
+        self.assertEqual([iv.label for iv in state.intervals], ["Baseline", "Squat", "Baseline"])
+
+    def test_renaming_onto_existing_label_merges(self) -> None:
+        state = self._state()
+        self.assertEqual(rename_label(state, "Squat", "Rest"), 1)
+        self.assertEqual(state.labels_library, ["Rest"])
+        self.assertEqual({iv.label for iv in state.intervals}, {"Rest"})
+
+    def test_label_missing_from_library_is_added(self) -> None:
+        state = self._state()
+        state.intervals.append(LabelInterval("Typo", 3.0, 4.0))
+        self.assertEqual(rename_label(state, "Typo", "Lunge"), 1)
+        self.assertEqual(state.labels_library, ["Rest", "Squat", "Lunge"])
 
 
 class TemplateScreenTests(_IsolatedStore):
