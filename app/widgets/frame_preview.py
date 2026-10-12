@@ -941,6 +941,12 @@ class MultiCameraPlayer(QWidget):
         self._relayout(force=True)
         self._update_label()
 
+    def set_camera_labels(self, labels: list[str]) -> None:
+        """Rename the camera captions in place, keeping loaded videos."""
+        for preview, label in zip(self._previews, labels):
+            preview.set_label(label)
+        self._rebuild_audio_combo()
+
     def load_videos(self, paths: list[str]) -> None:
         for index, path in enumerate(paths):
             if index < len(self._previews):

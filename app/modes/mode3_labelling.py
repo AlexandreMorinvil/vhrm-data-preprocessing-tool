@@ -39,6 +39,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..dataset_templates import PART_LABELS, CameraTemplate, DatasetTemplate, apply_labels
 from ..file_cleanup import cleanup_obsolete_paths
 from ..face_privacy import export_anonymized_video_segment
 from ..ffmpeg_utils import FFmpegWorker, trim_video, find_ffmpeg
@@ -64,6 +65,7 @@ from ..widgets.frame_preview import MultiCameraPlayer
 from ..widgets.layout import ModeWorkspace
 from ..widgets.signal_plot import SignalPlot
 from ..widgets.subdivide_dialog import SubdivideDialog
+from ..widgets.template_bar import TemplateBar
 from ..widgets.timeline import IntervalItem, TimelineWidget, colour_for_label
 from .common import ask_mosaic_options, export_frames_interactive, export_snapshot_interactive
 
@@ -186,6 +188,11 @@ class Mode3Widget(QWidget):
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #8a8a8a;")
         lib_lay.addWidget(hint)
+        self._template_bar = TemplateBar(self._capture_template, (PART_LABELS,))
+        self._template_bar.setToolTip("Replace the label library with a saved template's labels.")
+        self._template_bar.apply_requested.connect(self._apply_template)
+        self._template_bar.message.connect(lambda text: self._status.setText(text))
+        lib_lay.addWidget(self._template_bar)
         self._lib_list = QListWidget()
         self._lib_list.setMaximumHeight(170)
         self._lib_list.currentRowChanged.connect(self._on_library_row)
@@ -708,6 +715,30 @@ class Mode3Widget(QWidget):
             return
         self.state.labels_library.pop(row)
         self._refresh_label_lists()
+
+    def _capture_template(self) -> DatasetTemplate:
+        cameras = [
+            CameraTemplate(
+                label=track.camera_label,
+                limits_common_duration=track.limits_common_duration,
+                sync_audio_start_offset_sec=track.sync_audio_start_offset_sec,
+            )
+            for track in self.state.tracks
+        ]
+        return DatasetTemplate(name="", cameras=cameras or None,
+                               labels=list(self.state.labels_library))
+
+    def _apply_template(self, template: DatasetTemplate) -> None:
+        if template.labels is None:
+            return
+        self._push_undo()
+        kept = apply_labels(self.state, template.labels)
+        self._refresh_label_lists()
+        self._sync_timeline()
+        text = f"Applied labels of “{template.name}”."
+        if kept:
+            text += " Kept labels still used by intervals: " + ", ".join(kept) + "."
+        self._status.setText(text)
 
     def _on_library_row(self, row: int) -> None:
         if 0 <= row < self._label_combo.count():

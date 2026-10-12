@@ -67,6 +67,32 @@ the background; existing plots, signal data and playback position are retained
 without rebuilding the section or re-probing videos. Text already rendered into mosaic videos or captured images
 is not editable; re-export those visualizations to use the new names.
 
+## Dataset templates
+
+Save the setup you repeat for every dataset and fill it in with one click.
+A template can hold:
+
+- **Cameras** — number of cameras, their names, **Not limiting size** and the
+  per-camera **Audio sync start offset**;
+- **Labels** — the label library used in Labelling;
+- **Audio sync & cleanup options** — audio sync duration, pairwise refinement
+  and automatic deletion of intermediate files.
+
+The **Template** row is at the top of **Preprocessing > Setup** (applies
+cameras, options and labels) and in **Labelling > Label library** (applies
+labels only). Pick a template and click **Apply**, or click **Save…** to store
+the current setup as a new template or update an existing one. When updating,
+parts you leave unchecked keep their saved values, so you can, for example,
+update only the labels of a template from the Labelling section. Applying labels
+replaces the library; labels still used by intervals are kept, and **Ctrl+Z**
+undoes it in Labelling.
+
+The **⋯** button renames or deletes a template, or marks it **Use for new
+projects** (shown with ★): new projects then start with that template's
+cameras, labels and options. Opened projects are never changed automatically.
+Templates are stored per user in the application settings and shared by all
+projects. Segments, output folders and signal files are not part of templates.
+
 ## Graphs and timeline
 
 Signals are shown as stacked panels (for example heart rate above ECG) sharing

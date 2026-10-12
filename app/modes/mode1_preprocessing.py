@@ -27,6 +27,16 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..dataset_templates import (
+    PART_CAMERAS,
+    PART_LABELS,
+    PART_PREPROCESSING,
+    CameraTemplate,
+    DatasetTemplate,
+    PreprocessingOptions,
+    apply_labels,
+    template_store,
+)
 from ..file_cleanup import remove_or_archive
 from ..ffmpeg_utils import (
     FFmpegWorker,
@@ -40,6 +50,7 @@ from ..state import ProjectState, VideoTrack, parse_dji_datetime, dji_datetime_s
 from ..state import generate_sidecar
 from ..widgets.frame_preview import MultiCameraPlayer
 from ..widgets.layout import ModeWorkspace
+from ..widgets.template_bar import TemplateBar
 from .common import export_frames_interactive, export_snapshot_interactive
 
 log = logging.getLogger(__name__)
@@ -150,6 +161,11 @@ class _CameraGroup(QGroupBox):
         self._label_edit.setText(text)
 
     @property
+    def label_text(self) -> str:
+        """The typed name, empty when the default "Camera N" is used."""
+        return self._label_edit.text().strip()
+
+    @property
     def segment_paths(self) -> list[str]:
         return [self._list.item(i).data(Qt.ItemDataRole.UserRole)
                 for i in range(self._list.count())]
@@ -223,6 +239,16 @@ class Mode1Widget(QWidget):
 
         setup_group = QGroupBox("Setup")
         setup_lay = QFormLayout(setup_group)
+
+        self._template_bar = TemplateBar(
+            self._capture_template, (PART_CAMERAS, PART_PREPROCESSING, PART_LABELS)
+        )
+        self._template_bar.setToolTip(
+            "Saved dataset setups: camera count and names, labels, audio sync options."
+        )
+        self._template_bar.apply_requested.connect(self._apply_template)
+        self._template_bar.message.connect(self._status_text)
+        setup_lay.addRow("Template:", self._template_bar)
 
         self._ffmpeg_edit = QLineEdit(state.ffmpeg_path or find_ffmpeg())
         browse_ff = QPushButton("…")
@@ -321,6 +347,70 @@ class Mode1Widget(QWidget):
 
         self._rebuild_camera_groups()
         self._restore_from_state()
+        self._apply_default_template()
+
+    # ------------------------------------------------------------------ templates
+    def _capture_template(self) -> DatasetTemplate:
+        return DatasetTemplate(
+            name="",
+            cameras=[
+                CameraTemplate(
+                    label=g.label_text,
+                    limits_common_duration=g.limits_common_duration,
+                    sync_audio_start_offset_sec=g.sync_audio_start_offset_sec,
+                )
+                for g in self._camera_groups
+            ],
+            labels=list(self.state.labels_library),
+            preprocessing=PreprocessingOptions(
+                sync_audio_duration_sec=float(self._sync_duration_spin.value()),
+                sync_pairwise_refinement=self._sync_pairwise_refinement_cb.isChecked(),
+                delete_intermediates=self._delete_intermediates_cb.isChecked(),
+            ),
+        )
+
+    def _apply_template(self, template: DatasetTemplate, announce: bool = True) -> None:
+        if template.cameras:
+            count = min(len(template.cameras), self._num_cameras_spin.maximum())
+            rebuilt = count != self._num_cameras_spin.value()
+            # Changing the count rebuilds the groups; added segments are kept.
+            self._num_cameras_spin.setValue(count)
+            for group, cam in zip(self._camera_groups, template.cameras):
+                group.label = cam.label
+                group.limits_common_duration = cam.limits_common_duration
+                group.sync_audio_start_offset_sec = cam.sync_audio_start_offset_sec
+            if rebuilt and any(g.segment_paths for g in self._camera_groups):
+                self._preview_first_segments()
+            else:
+                self._player.set_camera_labels([g.label for g in self._camera_groups])
+        if template.preprocessing is not None:
+            opts = template.preprocessing
+            self._sync_duration_spin.setValue(opts.sync_audio_duration_sec)
+            self._sync_pairwise_refinement_cb.setChecked(opts.sync_pairwise_refinement)
+            self._delete_intermediates_cb.setChecked(opts.delete_intermediates)
+        kept: list[str] = []
+        if template.labels is not None:
+            kept = apply_labels(self.state, template.labels)
+        if announce:
+            text = f"Applied template “{template.name}”."
+            if kept:
+                text += " Kept labels still used by intervals: " + ", ".join(kept) + "."
+            self._status_text(text)
+
+    def _apply_default_template(self) -> None:
+        """Pre-fill cameras and options of a brand-new project.
+
+        Labels of the default template are set when the project is created
+        (see MainWindow), so labels edited in other sections are not replaced.
+        """
+        if self.state.project_path or self.state.tracks:
+            return
+        default = template_store().default()
+        if default is not None:
+            self._apply_template(default.without([PART_LABELS]), announce=False)
+
+    def _status_text(self, text: str) -> None:
+        self._status_label.setText(text)
 
     def refresh_camera_names(self) -> None:
         for group, track in zip(self._camera_groups, self.state.tracks):

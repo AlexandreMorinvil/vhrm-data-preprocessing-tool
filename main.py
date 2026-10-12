@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app import theme
+from app.dataset_templates import apply_labels, template_store
 from app.face_privacy import FacePrivacySettings, get_privacy_settings, set_privacy_settings
 from app.state import ProjectState
 
@@ -103,7 +104,7 @@ class MainWindow(QMainWindow):
                 set_privacy_settings(FacePrivacySettings.from_dict(json.loads(privacy)))
             except (TypeError, ValueError):
                 log.warning("Ignoring invalid stored privacy settings")
-        self.state = ProjectState(
+        self.state = self._fresh_state(
             archive_removed_files=self._settings.value(
                 "archive_removed_files", False, type=bool
             ),
@@ -315,10 +316,22 @@ class MainWindow(QMainWindow):
             return self._save_project()
         return True
 
+    @staticmethod
+    def _fresh_state(**options) -> ProjectState:
+        """A new project, starting with the default template's labels if any.
+
+        The Preprocessing section fills in the template's cameras and options.
+        """
+        state = ProjectState(**options)
+        default = template_store().default()
+        if default is not None and default.labels is not None:
+            apply_labels(state, default.labels)
+        return state
+
     def _new_project(self):
         if not self._confirm_discard():
             return
-        self.state = ProjectState(
+        self.state = self._fresh_state(
             archive_removed_files=self._archive_removed_action.isChecked(),
             blur_faces=self._blur_faces_action.isChecked(),
         )
