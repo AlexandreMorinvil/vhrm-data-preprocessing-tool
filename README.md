@@ -294,6 +294,10 @@ the offset from the video itself.
    exported segment, updates the metadata sidecar and appends the change to
    `<output>/ppg_alignment/alignment.json`. Videos are not modified. Save the
    project afterwards. Applying again replaces the offset (it does not add up).
+7. **Remove offset …** returns to the original camera timing (it applies 0 s).
+   Every apply cuts the slices again from the project-level signals, so the
+   result never depends on earlier applications: removing the offset restores
+   the segments exactly, and to change the offset you simply apply the new value.
 
 **Import offset …** reads the offset applied in another project, for example
 the same participant's baseline session (its `ppg_alignment/alignment.json`,

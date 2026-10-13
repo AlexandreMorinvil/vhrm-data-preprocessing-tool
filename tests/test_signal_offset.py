@@ -104,6 +104,30 @@ class SignalOffsetTests(unittest.TestCase):
         record = json.loads((self.root / "ppg_alignment" / "alignment.json").read_text(encoding="utf-8"))
         self.assertEqual([entry[OFFSET_KEY] for entry in record["history"]], [1.5, -0.25])
 
+    def _segment_snapshot(self) -> dict[str, bytes]:
+        files = {path.relative_to(self.segment).as_posix(): path.read_bytes()
+                 for path in sorted(self.segment.rglob("*.csv"))}
+        meta = read_segment_meta(self.segment)
+        files["timing"] = json.dumps({key: meta.get(key) for key in (
+            "signal_anchor_datetime_utc", "segment_start_datetime_utc", "segment_end_datetime_utc",
+            OFFSET_KEY, "hr_files", "ppg_files")}).encode()
+        return files
+
+    def test_removing_the_offset_restores_the_files_exactly(self) -> None:
+        apply_signal_offset(self.state, 0.0)  # files as exported with the camera timing
+        original = self._segment_snapshot()
+        original_sidecar = json.loads(self.sidecar.read_text(encoding="utf-8"))["signal_anchor_datetime_utc"]
+
+        apply_signal_offset(self.state, 1.5)
+        apply_signal_offset(self.state, -0.25)
+        self.assertNotEqual(self._segment_snapshot(), original)
+        apply_signal_offset(self.state, 0.0, "offset removed")
+
+        self.assertEqual(self._segment_snapshot(), original)
+        self.assertEqual(json.loads(self.sidecar.read_text(encoding="utf-8"))["signal_anchor_datetime_utc"],
+                         original_sidecar)
+        self.assertEqual(effective_signal_anchor(self.state), ANCHOR)
+
     def test_reference_start_ignores_the_applied_offset(self) -> None:
         before = segment_reference_start(read_segment_meta(self.segment), self.interval, self.state)
         apply_signal_offset(self.state, 2.0)

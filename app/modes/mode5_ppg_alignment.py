@@ -318,6 +318,13 @@ class PpgAlignmentWidget(QWidget):
         self._apply_btn.clicked.connect(self._apply_offset)
         io_row.addWidget(self._apply_btn)
         offset_lay.addLayout(io_row)
+        self._remove_btn = QPushButton("Remove offset …")
+        self._remove_btn.setToolTip(
+            "Return to the original camera timing (applies 0 s). To change the offset, simply\n"
+            "apply the new value: applying replaces the previous offset."
+        )
+        self._remove_btn.clicked.connect(self._remove_offset)
+        offset_lay.addWidget(self._remove_btn)
         self._apply_status = QLabel("")
         self._apply_status.setWordWrap(True)
         offset_lay.addWidget(self._apply_status)
@@ -801,14 +808,35 @@ class PpgAlignmentWidget(QWidget):
         )
         if not ok:
             return
+        self._start_apply(self._offset, note, self._estimate_record())
+
+    def _remove_offset(self) -> None:
+        if self._apply_worker is not None:
+            return
+        current = self.state.video_signal_offset_sec
+        if abs(current) <= 1e-4:
+            QMessageBox.information(self, "Remove offset", "No offset is applied to this project.")
+            return
+        segments = sum(1 for s in self._segments if (s.folder / "meta.json").exists())
+        reply = QMessageBox.question(
+            self, "Remove offset",
+            f"Remove the applied offset ({current:+.3f} s) and return to the camera timing?\n\n"
+            f"This rewrites the HR, ECG and synthetic PPG files and the timing in meta.json of "
+            f"{segments} exported segment(s) and updates the metadata sidecar, exactly as Apply "
+            "does with 0 s. Videos are not modified.",
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._start_apply(0.0, "offset removed (camera timing)", {})
+
+    def _start_apply(self, offset: float, note: str, estimate: dict) -> None:
         self._player.stop()
-        estimate = self._estimate_record()
-        worker = FFmpegWorker(self._apply_job, offset=self._offset, note=note, estimate=estimate)
+        worker = FFmpegWorker(self._apply_job, offset=offset, note=note, estimate=estimate)
         worker.progress.connect(lambda value, message: (self._progress.setValue(value),
                                                         self._apply_status.setText(message)))
         worker.finished.connect(self._on_apply_finished)
         self._apply_worker = worker
         self._apply_btn.setEnabled(False)
+        self._remove_btn.setEnabled(False)
         self._apply_status.setText("Applying…")
         worker.start()
 
@@ -822,6 +850,7 @@ class PpgAlignmentWidget(QWidget):
     def _on_apply_finished(self, ok: bool, message: str) -> None:
         self._apply_worker = None
         self._apply_btn.setEnabled(True)
+        self._remove_btn.setEnabled(True)
         report = self._apply_report
         self._apply_report = None
         if not ok or report is None:
@@ -839,6 +868,8 @@ class PpgAlignmentWidget(QWidget):
         for segment in self._segments:
             segment.meta = read_segment_meta(segment.folder)
         self._update_applied_label()
+        if abs(self._offset - report.offset_sec) > 1e-4:  # after removing the offset, show what is applied now
+            self._set_offset(report.offset_sec, "applied")
 
     # ------------------------------------------------------------------ estimation
     def _start_estimate(self, all_segments: bool) -> None:

@@ -129,7 +129,11 @@ def apply_signal_offset(
     estimate: Optional[dict] = None,
     progress: Optional[Callable[[int, int], None]] = None,
 ) -> ApplyReport:
-    """Make *offset_sec* the project's video/signal offset everywhere (see module doc)."""
+    """Make *offset_sec* the project's video/signal offset everywhere (see module doc).
+
+    Every slice is cut again from the project-level signals, so the result does not
+    depend on earlier applications: applying 0 s restores the camera timing exactly.
+    """
     offset_sec = round(float(offset_sec), 4)
     report = ApplyReport(offset_sec=offset_sec)
     previous_offset = state.video_signal_offset_sec
