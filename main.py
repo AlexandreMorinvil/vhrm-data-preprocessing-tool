@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMenuBar,
     QMessageBox,
+    QSizePolicy,
     QStackedWidget,
     QStatusBar,
     QTabBar,
@@ -32,7 +33,10 @@ _PROJECT_FILTER = "VRT Project (*.vrt);;All files (*)"
 _MAX_RECENT = 8
 _MODE_NAMES = (
     "1. Preprocessing", "2. Signal sync", "3. Synthetic PPG", "4. Labelling", "5. PPG alignment", "6. Review",
+    "7. Artifacts",
 )
+# The last sections sit on a separate tab bar at the right of the toolbar.
+_RIGHT_MODE_COUNT = 1
 
 _DARK_QSS = """
 QWidget { background: #1e1e1e; color: #d4d4d4; font-size: 13px; }
@@ -55,14 +59,15 @@ QSpinBox::down-arrow, QDoubleSpinBox::down-arrow, QTimeEdit::down-arrow { image:
 QSlider::groove:horizontal { height: 6px; background: #444; border-radius: 3px; }
 QSlider::sub-page:horizontal { background: #0e5a9e; border-radius: 3px; }
 QSlider::handle:horizontal { width: 14px; margin: -4px 0; background: #1c8ae6; border-radius: 7px; }
-QListWidget, QTableWidget { background: #252526; alternate-background-color: #2a2a2b; }
-QListWidget::item:selected, QTableWidget::item:selected { background: #0e5a9e; color: #ffffff; }
+QListWidget, QTableWidget, QTreeWidget { background: #252526; alternate-background-color: #2a2a2b; }
+QListWidget::item:selected, QTableWidget::item:selected, QTreeWidget::item:selected { background: #0e5a9e; color: #ffffff; }
 QHeaderView::section { background: #2d2d30; color: #cccccc; border: 0; border-right: 1px solid #3a3a3a; padding: 3px; }
 QTextEdit { background: #1b1b1b; }
 QProgressBar { text-align: center; border: 1px solid #555; background: #2d2d30; }
 QProgressBar::chunk { background: #0078d4; }
 QTabBar::tab { background: #2d2d30; padding: 6px 16px; border: 1px solid #444; }
 QTabBar::tab:selected { background: #0078d4; color: #ffffff; }
+QTabBar[inactive="true"]::tab:selected { background: #2d2d30; color: #d4d4d4; }
 QSplitter::handle { background: #2b2b2b; }
 QSplitter::handle:hover { background: #0e5a9e; }
 QScrollBar:vertical { background: #1e1e1e; width: 12px; }
@@ -78,6 +83,7 @@ _LIGHT_QSS = """
 QWidget { font-size: 13px; }
 QTabBar::tab { padding: 6px 16px; }
 QTabBar::tab:selected { background: #0078d4; color: #ffffff; }
+QTabBar[inactive="true"]::tab:selected { background: palette(button); color: palette(button-text); }
 QSplitter::handle:hover { background: #0078d4; }
 """
 
@@ -120,8 +126,7 @@ class MainWindow(QMainWindow):
         self._build_statusbar()
 
         self._apply_theme(str(self._settings.value("theme", "dark")))
-        self._mode_tabs.setCurrentIndex(0)
-        self._on_tab_changed(0)
+        self._select_mode(0)
 
     # ------------------------------------------------------------------ menus
     def _build_menus(self):
@@ -219,11 +224,24 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         self.addToolBar(tb)
 
+        left_count = len(_MODE_NAMES) - _RIGHT_MODE_COUNT
         self._mode_tabs = QTabBar()
-        for name in _MODE_NAMES:
+        for name in _MODE_NAMES[:left_count]:
             self._mode_tabs.addTab(name)
-        self._mode_tabs.currentChanged.connect(self._on_tab_changed)
+        self._right_tabs = QTabBar()
+        for name in _MODE_NAMES[left_count:]:
+            self._right_tabs.addTab(name)
+        # tabBarClicked also fires for the tab that is already current in a
+        # bar, which is how a section is reselected after using the other bar.
+        for bar, first in ((self._mode_tabs, 0), (self._right_tabs, left_count)):
+            bar.currentChanged.connect(lambda i, f=first: i >= 0 and self._select_mode(f + i))
+            bar.tabBarClicked.connect(lambda i, f=first: i >= 0 and self._select_mode(f + i))
         tb.addWidget(self._mode_tabs)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+        tb.addWidget(self._right_tabs)
+        self._mode_index = 0
 
     def _build_central(self):
         self._stack = QStackedWidget()
@@ -269,11 +287,33 @@ class MainWindow(QMainWindow):
         elif index == 5:
             from app.modes.mode4_review import Mode4Widget
             w = Mode4Widget(self.state)
+        elif index == 6:
+            from app.modes.mode7_artifacts import ArtifactsWidget
+            w = ArtifactsWidget(self.state, busy_check=self._background_task_running)
         else:
             w = QWidget()
         self._mode_widgets[index] = w
         self._stack.addWidget(w)
         return True
+
+    def _select_mode(self, index: int):
+        """Show section *index* and highlight its tab in whichever bar holds it."""
+        left_count = self._mode_tabs.count()
+        for bar, first in ((self._mode_tabs, 0), (self._right_tabs, left_count)):
+            local = index - first
+            active = 0 <= local < bar.count()
+            bar.blockSignals(True)
+            if active:
+                bar.setCurrentIndex(local)
+            bar.setProperty("inactive", not active)
+            bar.style().unpolish(bar)
+            bar.style().polish(bar)
+            bar.update()
+            bar.blockSignals(False)
+        if index == self._mode_index and self._mode_widgets[index] is not None:
+            return
+        self._mode_index = index
+        self._on_tab_changed(index)
 
     def _on_tab_changed(self, index: int):
         created = self._ensure_mode_widget(index)
@@ -394,13 +434,9 @@ class MainWindow(QMainWindow):
         if not self.state.tracks:
             QMessageBox.information(self, "Rename cameras", "Load project metadata or preprocess cameras first.")
             return
-        for widget in self._mode_widgets:
-            if widget is not None and any(
-                isinstance(value, QThread) and value.isRunning()
-                for value in vars(widget).values()
-            ):
-                QMessageBox.warning(self, "Rename cameras", "Wait for preprocessing or exports to finish before renaming cameras.")
-                return
+        if self._background_task_running():
+            QMessageBox.warning(self, "Rename cameras", "Wait for preprocessing or exports to finish before renaming cameras.")
+            return
         dialog = CameraRenameDialog(self.state, self)
         if not dialog.exec():
             return
@@ -451,6 +487,15 @@ class MainWindow(QMainWindow):
             worker.deleteLater()
             progress.deleteLater()
 
+    def _background_task_running(self) -> bool:
+        return any(
+            widget is not None and any(
+                isinstance(value, QThread) and value.isRunning()
+                for value in vars(widget).values()
+            )
+            for widget in self._mode_widgets
+        )
+
     def _reload_modes(self):
         for player in self._players():
             player.shutdown()
@@ -459,7 +504,7 @@ class MainWindow(QMainWindow):
                 self._stack.removeWidget(w)
                 w.deleteLater()
         self._mode_widgets = [None] * len(_MODE_NAMES)
-        self._on_tab_changed(self._mode_tabs.currentIndex())
+        self._on_tab_changed(self._mode_index)
 
     def _update_project_label(self):
         path = self.state.project_path
@@ -591,7 +636,7 @@ class MainWindow(QMainWindow):
             self, "About",
             "Video Research Tool\n\n"
             "Multi-camera DJI video preprocessing, signal synchronisation, "
-            "synthetic PPG generation, labelling, PPG alignment and review browser.\n\n"
+            "synthetic PPG generation, labelling, PPG alignment, review browser and artifact clean-up.\n\n"
             "Synthetic PPG generation adapts PPGSynth by Tang et al. under "
             "GNU GPL v3. See THIRD_PARTY_NOTICES.md and LICENSES/PPGSynth-GPL-3.0.txt.\n\n"
             "This program comes with absolutely no warranty. Built with PyQt6."

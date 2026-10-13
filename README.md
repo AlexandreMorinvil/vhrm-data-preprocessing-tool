@@ -196,6 +196,10 @@ Press **F1** for the full list of shortcuts.
    videos and the signals (see [PPG alignment](#ppg-alignment)).
 6. **Review** — load a manifest CSV to browse through exported segments,
    including synthetic PPG when it was generated and exported.
+7. **Artifacts** (tab on the right of the toolbar) — once the dataset is
+   reviewed, delete the processing artifacts or move them out of the dataset,
+   and move them back if needed
+   (see [Cleaning up artifacts](#cleaning-up-artifacts)).
 
 Synthetic outputs are grouped in the `synthetic_ppg/` directory inside the
 project output directory:
@@ -323,6 +327,68 @@ Conventions and notes:
   lost) and the window or segment should be changed.
 - After exercise the pulse transit time changes, so segments of one session can
   differ by about 0.1–0.2 s; estimate the offset on calm segments.
+
+## Cleaning up artifacts
+
+The last section, **7. Artifacts**, removes the files the pipeline needed but
+the finished dataset does not. It works on the project output folder (the one
+that contains `labelled_segments/`); choose another folder with **…**.
+
+- **Full-length videos** — the synchronised, trimmed full-session videos
+  (`cam1_<label>_final.mp4`) in the root of the output folder. The clips inside
+  `labelled_segments/` are never touched.
+- **PPG alignment files** — everything in `ppg_alignment/` (face-trace cache,
+  ROI videos, `alignment.json`). The applied offset stays in every segment's
+  `meta.json` and in the metadata sidecar.
+- **Intermediate videos** — `cam*_concat` / `cam*_trimstart` videos, when
+  intermediates were kept during preprocessing.
+
+Choose the categories, then either **Move to an artifacts folder** or **Delete
+permanently**. Moving recreates the dataset layout in the artifacts folder:
+videos at its root and `ppg_alignment/...` in `ppg_alignment/`. The folder is
+created in **Location** (by default next to the dataset folder; the last
+location chosen is remembered) and is named `<dataset folder>_artifacts`
+unless you type another **Folder name**. It must lie outside the dataset.
+Existing files there are only replaced after confirmation. Moving within one
+drive is instant; to another drive the files are copied with progress and the
+originals are removed once the copy is complete (**Cancel** leaves the current
+file in the dataset). Folders emptied by the clean-up are removed.
+
+A move also writes `artifacts_manifest.json` at the root of the artifacts
+folder: the dataset the files came from, and each file's size and category.
+
+The right-hand pane lists every file concerned with its size and destination;
+files that already exist at the destination are marked.
+Labelled segments, signals, synthetic PPG, metadata and the project file always
+stay in the dataset. Once the full-length videos are gone, Preprocessing,
+Labelling and PPG alignment can no longer play the full session, and the
+labelled segments cannot be exported again, so clean up after the review.
+To import an alignment offset from a cleaned-up project, pick the
+`alignment.json` in its artifacts folder or a segment `meta.json`.
+
+### Restoring moved artifacts
+
+Choose **Restore from an artifacts folder (move back)**. **Location** and
+**Folder name** then designate the artifacts folder to read — by default the one
+a move from this dataset would have used — or pick it with **Choose artifacts
+folder …**. The category boxes now count the files in the artifacts folder, and
+each file goes back to the same place in the dataset. Files that are not
+artifacts (and leftovers of an interrupted copy) are listed as *left in place*
+and are not moved. Validation, shown above the list and again before starting:
+
+- errors (restore refused): the dataset or the artifacts folder is missing, one
+  folder lies inside the other, nothing is selected, or the dataset drive lacks
+  the free space for the files that must be copied;
+- warnings (confirmation required): the manifest is missing, the files were moved
+  out of another dataset (or the dataset has moved since), a file's size changed
+  since it was moved, files recorded in the manifest are gone, or a full-length
+  video does not belong to the open project;
+- files that already exist in the dataset: **Replace** them or **Skip existing**.
+
+Nothing is ever restored into `labelled_segments/`. Restored files are removed
+from the manifest; when the artifacts folder ends up empty it is deleted.
+Camera views that lost their video in a move made during the same session show
+it again after the restore; otherwise reopen the project.
 
 ## Adding a signal loader
 

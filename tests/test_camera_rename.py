@@ -305,6 +305,7 @@ class CameraRenameUiTests(unittest.TestCase):
         self.addCleanup(window.close)
         window.state = state
         window._mode_widgets = [SimpleNamespace(refresh_camera_names=refresh)]
+        window._background_task_running = lambda: MainWindow._background_task_running(window)
         window._players = lambda: [player]
         window._reload_modes = Mock()
         window.statusBar = lambda: Mock()
@@ -382,6 +383,7 @@ class CameraRenameUiTests(unittest.TestCase):
         self.addCleanup(window.close)
         window.state = ProjectState(tracks=[VideoTrack(camera_label="Wrong")])
         window._mode_widgets = []
+        window._background_task_running = lambda: MainWindow._background_task_running(window)
         player = Mock()
         window._players = lambda: [player]
         window._reload_modes = Mock()
@@ -432,6 +434,7 @@ class CameraRenameUiTests(unittest.TestCase):
         self.addCleanup(window.close)
         window.state = ProjectState(tracks=[VideoTrack(camera_label="Wrong")])
         window._mode_widgets = []
+        window._background_task_running = lambda: MainWindow._background_task_running(window)
         player = Mock()
         window._players = lambda: [player]
         window._reload_modes = Mock()
