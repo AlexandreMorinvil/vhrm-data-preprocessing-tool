@@ -273,7 +273,30 @@ def get_frame_count(path: str, ffprobe: str = "") -> int:
     return info.get("frame_count", 0)
 
 
-class FFmpegWorker(QThread):
+class ExitSafeThread(QThread):
+    """QThread whose subclass emits its own ``finished(bool, str)`` from inside ``run()``.
+
+    That signal reaches the GUI thread while ``run()`` is still returning. A handler
+    that drops the last reference to the worker would delete a running QThread, which
+    aborts the application ("QThread: Destroyed while thread is still running"). The
+    thread therefore keeps itself referenced until it has really exited.
+    """
+
+    _running: set["ExitSafeThread"] = set()
+
+    def start(self, *args) -> None:
+        if self not in ExitSafeThread._running:
+            ExitSafeThread._running.add(self)
+            self.finished.connect(self._release_after_exit)
+        super().start(*args)
+
+    def _release_after_exit(self, _ok=None, _message=None) -> None:
+        self.wait()  # run() returns right after emitting finished
+        self.finished.disconnect(self._release_after_exit)
+        ExitSafeThread._running.discard(self)
+
+
+class FFmpegWorker(ExitSafeThread):
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(bool, str)
     log_message = pyqtSignal(str)

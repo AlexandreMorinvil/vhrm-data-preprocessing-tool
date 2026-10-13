@@ -30,7 +30,9 @@ log = logging.getLogger(__name__)
 
 _PROJECT_FILTER = "VRT Project (*.vrt);;All files (*)"
 _MAX_RECENT = 8
-_MODE_NAMES = ("1. Preprocessing", "2. Signal sync", "3. Synthetic PPG", "4. Labelling", "5. Review")
+_MODE_NAMES = (
+    "1. Preprocessing", "2. Signal sync", "3. Synthetic PPG", "4. Labelling", "5. PPG alignment", "6. Review",
+)
 
 _DARK_QSS = """
 QWidget { background: #1e1e1e; color: #d4d4d4; font-size: 13px; }
@@ -227,7 +229,7 @@ class MainWindow(QMainWindow):
         self._stack = QStackedWidget()
         self.setCentralWidget(self._stack)
 
-        self._mode_widgets: list[QWidget] = [None, None, None, None, None]
+        self._mode_widgets: list[QWidget] = [None] * len(_MODE_NAMES)
 
     def _build_statusbar(self):
         sb = QStatusBar()
@@ -262,6 +264,9 @@ class MainWindow(QMainWindow):
             from app.modes.mode3_labelling import Mode3Widget
             w = Mode3Widget(self.state)
         elif index == 4:
+            from app.modes.mode5_ppg_alignment import PpgAlignmentWidget
+            w = PpgAlignmentWidget(self.state)
+        elif index == 5:
             from app.modes.mode4_review import Mode4Widget
             w = Mode4Widget(self.state)
         else:
@@ -453,7 +458,7 @@ class MainWindow(QMainWindow):
             if w is not None:
                 self._stack.removeWidget(w)
                 w.deleteLater()
-        self._mode_widgets = [None, None, None, None, None]
+        self._mode_widgets = [None] * len(_MODE_NAMES)
         self._on_tab_changed(self._mode_tabs.currentIndex())
 
     def _update_project_label(self):
@@ -586,7 +591,7 @@ class MainWindow(QMainWindow):
             self, "About",
             "Video Research Tool\n\n"
             "Multi-camera DJI video preprocessing, signal synchronisation, "
-            "synthetic PPG generation, labelling, and review browser.\n\n"
+            "synthetic PPG generation, labelling, PPG alignment and review browser.\n\n"
             "Synthetic PPG generation adapts PPGSynth by Tang et al. under "
             "GNU GPL v3. See THIRD_PARTY_NOTICES.md and LICENSES/PPGSynth-GPL-3.0.txt.\n\n"
             "This program comes with absolutely no warranty. Built with PyQt6."

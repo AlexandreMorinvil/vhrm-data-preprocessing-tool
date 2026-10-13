@@ -22,14 +22,14 @@ from typing import Callable, Optional
 import cv2
 import numpy as np
 import pandas as pd
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import pyqtSignal
 
 import matplotlib
 matplotlib.use("Agg")
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
-from .ffmpeg_utils import find_ffmpeg
+from .ffmpeg_utils import ExitSafeThread, find_ffmpeg
 from .face_privacy import FaceAnonymizer
 from .signals import is_aux_signal_column
 from .visual_export import SERIES_COLORS
@@ -515,7 +515,7 @@ def export_mosaic(
 # QThread worker
 # ---------------------------------------------------------------------------
 
-class MosaicWorker(QThread):
+class MosaicWorker(ExitSafeThread):
     """Async worker for mosaic export with progress and cancel support."""
     progress = pyqtSignal(int, int)       # current_frame, total_frames
     finished = pyqtSignal(bool, str)      # success, message

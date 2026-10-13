@@ -142,6 +142,11 @@ class ProjectState:
     time_coherence_tolerance_sec: float = 1.0
     last_signal_anchor_datetime: Optional[str] = None
     last_time_coherence_warnings: list[str] = field(default_factory=list)
+    # Fine video/signal sync correction (PPG alignment step). Positive values
+    # place the signals later on the video timeline. It is already included in
+    # last_signal_anchor_datetime.
+    video_signal_offset_sec: float = 0.0
+    video_signal_offset_note: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -363,9 +368,7 @@ def generate_sidecar(state: ProjectState) -> str:
             if state.synthetic_ppg_source_ecg_path else ""
         ),
     }
-    anchor_dt, warnings = compute_signal_anchor(
-        state.tracks, state.time_coherence_tolerance_sec
-    )
+    anchor_dt, warnings = project_signal_anchor(state)
     anchor_iso = state.last_signal_anchor_datetime or (anchor_dt.isoformat() if anchor_dt else None)
     coherence_warnings = state.last_time_coherence_warnings or warnings
 
@@ -382,6 +385,8 @@ def generate_sidecar(state: ProjectState) -> str:
         "ecg_time_range_sec": [0.0, common_dur] if ecg_synced_names else None,
         "signal_paths": [Path(p).name for p in state.hr_signal_paths],
         "signal_anchor_datetime_utc": anchor_iso,
+        "video_signal_offset_sec": state.video_signal_offset_sec,
+        "video_signal_offset_note": state.video_signal_offset_note,
         "time_coherence_tolerance_sec": state.time_coherence_tolerance_sec,
         "time_coherence_warnings": coherence_warnings,
     }
@@ -493,6 +498,8 @@ def load_sidecar(path: str, state: ProjectState) -> None:
     )
     state.last_signal_anchor_datetime = raw.get("signal_anchor_datetime_utc")
     state.last_time_coherence_warnings = raw.get("time_coherence_warnings", [])
+    state.video_signal_offset_sec = float(raw.get("video_signal_offset_sec") or 0.0)
+    state.video_signal_offset_note = str(raw.get("video_signal_offset_note") or "")
 
     state.mode2_complete = bool(
         any(Path(path).exists() for path in state.synced_hr_paths)
@@ -592,11 +599,24 @@ def compute_signal_anchor(
     return anchor, warnings
 
 
+def project_signal_anchor(state: ProjectState) -> tuple[Optional[datetime], list[str]]:
+    """Signal anchor from the camera start times, corrected by the video/signal offset.
+
+    A positive ``video_signal_offset_sec`` places the signals later on the video
+    timeline, which is an earlier anchor.
+    """
+    anchor, warnings = compute_signal_anchor(state.tracks, state.time_coherence_tolerance_sec)
+    if anchor is not None and state.video_signal_offset_sec:
+        anchor = anchor - timedelta(seconds=state.video_signal_offset_sec)
+    return anchor, warnings
+
+
 def effective_signal_anchor(state: ProjectState) -> Optional[datetime]:
     """Absolute time of video time 0 used for the synchronized signals.
 
     Prefers the anchor recorded when signals were last synchronized (the one
     used to clip and export them), else the anchor derived from the tracks.
+    Both include the video/signal offset.
     """
     if state.last_signal_anchor_datetime:
         try:
@@ -604,7 +624,7 @@ def effective_signal_anchor(state: ProjectState) -> Optional[datetime]:
             return anchor if anchor.tzinfo else anchor.replace(tzinfo=timezone.utc)
         except ValueError:
             pass
-    anchor, _warnings = compute_signal_anchor(state.tracks, state.time_coherence_tolerance_sec)
+    anchor, _warnings = project_signal_anchor(state)
     if anchor is not None and anchor.tzinfo is None:
         anchor = anchor.replace(tzinfo=timezone.utc)
     return anchor

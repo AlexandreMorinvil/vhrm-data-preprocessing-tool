@@ -41,11 +41,11 @@ from ..signals import (
 )
 from ..state import (
     ProjectState,
-    compute_signal_anchor,
     effective_signal_anchor,
     format_time_coherence_warnings,
     generate_sidecar,
     load_sidecar,
+    project_signal_anchor,
     video_timeline_duration_sec,
 )
 from ..widgets.layout import ModeWorkspace
@@ -610,10 +610,7 @@ class Mode2Widget(QWidget):
 
     def _time_anchor_and_warnings(self):
         self._apply_time_correction_ui()
-        anchor, warnings = compute_signal_anchor(
-            self.state.tracks,
-            self.state.time_coherence_tolerance_sec,
-        )
+        anchor, warnings = project_signal_anchor(self.state)
         return anchor, warnings
 
     def _check_time_coherence(self):

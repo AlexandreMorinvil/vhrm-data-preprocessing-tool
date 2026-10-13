@@ -192,7 +192,9 @@ Press **F1** for the full list of shortcuts.
    **Export HR to existing segments** after adding or synchronizing the respective
    signal. These exports use the imported intervals directly without asking for
    the manifest again.
-5. **Review** — load a manifest CSV to browse through exported segments,
+5. **PPG alignment** — measure and correct the remaining offset between the
+   videos and the signals (see [PPG alignment](#ppg-alignment)).
+6. **Review** — load a manifest CSV to browse through exported segments,
    including synthetic PPG when it was generated and exported.
 
 Synthetic outputs are grouped in the `synthetic_ppg/` directory inside the
@@ -248,6 +250,75 @@ settings on the current frame of each camera. Compared with earlier versions:
 Blurred clips are necessarily re-encoded (H.264, CRF 20). The on-screen preview
 samples a few frames per second, so its masks can trail very fast motion
 slightly; exports are processed frame by frame.
+
+## PPG alignment
+
+Camera start times come from the file names (1 s resolution) plus manual time
+corrections, so the signals can be several seconds early or late relative to
+the video. For waveform-level work (training rPPG models on the synthetic PPG)
+the pulse must line up within a fraction of a heartbeat. This section measures
+the offset from the video itself.
+
+1. Pick a labelled segment where the face is clearly visible and the
+   participant is still (a resting or baseline segment), and the camera to use
+   (the front camera by default).
+2. **Estimate this segment** tracks the face (YuNet), averages the skin-coloured
+   pixels of the inner face box in every frame and turns the colour into a pulse
+   waveform with POS, CHROM or Green. A 60 s clip takes about 10 s with hardware
+   decoding. Results are cached in `<output>/ppg_alignment/cache/`.
+   **Estimate all** does the same for every segment.
+3. The graph overlays the estimated rPPG (blue) and the synthetic PPG (orange)
+   shifted by the current offset. Below it, the correlation for every offset of
+   the search range (default ±10 s) is computed on the shaded window; drag its
+   edges (grab them anywhere near the dashed line, or by the round handle
+   pointing outward), or use **Window: visible range**, to keep a calm part of
+   the segment.
+4. Choose the offset:
+   - **Best in range** jumps to the highest correlation;
+   - **◀ Previous peak / Next peak ▶** move to the neighbouring correlation peak
+     (the pulse is nearly periodic, so peaks repeat about one heartbeat apart);
+     **Nearest** snaps to the closest peak;
+   - switch the graph's **Mouse drag** toggle to **Shift PPG** and drag the
+     curves (or Shift+drag in either mode), drag the marker or click a peak in
+     the correlation plot, or type a value.
+
+   The toggle starts in **Zoom**: dragging selects the region to focus on, as in
+   the other graphs (a taller box also zooms the y-axis), **Undo zoom** steps
+   back and **Full range** shows everything. Ctrl+drag pans and the wheel zooms
+   time in both modes.
+5. Check other segments: the offset is kept when you change segment, so you can
+   see whether it also aligns them.
+6. **Apply to project …** stores the offset and rewrites the HR, ECG and
+   synthetic PPG slices and the timing (`signal_anchor_datetime_utc`,
+   `segment_start/end_datetime_utc`, `video_signal_offset_sec`) of every
+   exported segment, updates the metadata sidecar and appends the change to
+   `<output>/ppg_alignment/alignment.json`. Videos are not modified. Save the
+   project afterwards. Applying again replaces the offset (it does not add up).
+
+**Import offset …** reads the offset applied in another project, for example
+the same participant's baseline session (its `ppg_alignment/alignment.json`,
+metadata sidecar, a segment `meta.json` or the `.vrt`), so you can inspect it on
+this project's segments before applying it. Sessions recorded the same day do
+not always share an offset — each project's camera time correction is set
+separately — so always check the correlation plot of the target session:
+**Nearest** refines an imported value that is close, and a different best peak
+means the sessions differ.
+
+Conventions and notes:
+
+- A positive offset places the signals later on the video timeline; the
+  corrected anchor is `camera anchor − offset`. Signal sync, Labelling exports
+  and the sidecar all include it.
+- Every method returns a waveform with the polarity of a contact PPG (it rises
+  with blood volume). Raw POS has the opposite sign and is inverted; aligning to
+  raw POS would place the PPG half a heartbeat off.
+- The **Show** row under the transport bar selects the cameras and the face ROI
+  video (the region used, with non-skin pixels dimmed) to play.
+- The heart rate of the rPPG and of the synthetic PPG are shown for the window;
+  when they differ, the estimate is unreliable there (motion, lighting, face
+  lost) and the window or segment should be changed.
+- After exercise the pulse transit time changes, so segments of one session can
+  differ by about 0.1–0.2 s; estimate the offset on calm segments.
 
 ## Adding a signal loader
 

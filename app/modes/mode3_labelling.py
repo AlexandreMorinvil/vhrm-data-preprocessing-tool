@@ -6,7 +6,6 @@ import json
 import logging
 import math
 import os
-import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -48,17 +47,23 @@ from ..signals import (
     load_signal_files,
     read_synced_signal_csvs,
     signal_long_to_wide,
-    write_synced_signal_csvs,
 )
 from ..state import (
     LabelInterval,
     ProjectState,
-    compute_signal_anchor,
     effective_signal_anchor,
     format_time_coherence_warnings,
     load_labelled_segments_manifest,
     load_sidecar,
+    project_signal_anchor,
     video_timeline_duration_sec,
+)
+from ..segment_signals import (
+    SYNTHETIC_ARTIFACT_FIELDS as _SYNTHETIC_ARTIFACT_FIELDS,
+    export_signal_slice,
+    export_synthetic_artifact_slices,
+    segment_timing_fields,
+    synthetic_artifact_sources,
 )
 from ..timefmt import format_hms_ms
 from ..widgets.frame_preview import MultiCameraPlayer
@@ -72,12 +77,6 @@ from .common import ask_mosaic_options, export_frames_interactive, export_snapsh
 log = logging.getLogger(__name__)
 
 _META_FILTER = "Metadata sidecar (*.json);;All files (*)"
-_SYNTHETIC_ARTIFACT_FIELDS = (
-    "synthetic_ppg_path",
-    "synthetic_ppg_hr_path",
-    "synthetic_ppg_hrv_path",
-    "synthetic_rr_path",
-)
 _UNDO_LIMIT = 100
 
 
@@ -497,10 +496,7 @@ class Mode3Widget(QWidget):
 
             # Clip to video time range if tracks are available
             if self.state.tracks:
-                dt_start, coherence_warnings = compute_signal_anchor(
-                    self.state.tracks,
-                    self.state.time_coherence_tolerance_sec,
-                )
+                dt_start, coherence_warnings = project_signal_anchor(self.state)
                 if coherence_warnings:
                     QMessageBox.warning(
                         self,
@@ -607,7 +603,7 @@ class Mode3Widget(QWidget):
                 return datetime.fromisoformat(self.state.last_signal_anchor_datetime)
             except ValueError:
                 pass
-        anchor, _warnings = compute_signal_anchor(self.state.tracks, self.state.time_coherence_tolerance_sec)
+        anchor, _warnings = project_signal_anchor(self.state)
         return anchor
 
     def _show_selected_plot(self):
@@ -1302,10 +1298,7 @@ class Mode3Widget(QWidget):
             except ValueError:
                 signal_anchor = None
         if signal_anchor is None:
-            signal_anchor, coherence_warnings = compute_signal_anchor(
-                self.state.tracks,
-                self.state.time_coherence_tolerance_sec,
-            )
+            signal_anchor, coherence_warnings = project_signal_anchor(self.state)
         if coherence_warnings:
             QMessageBox.warning(
                 self,
@@ -1488,14 +1481,9 @@ class Mode3Widget(QWidget):
                 "ppg_files": ppg_files,
                 "synced_hr_paths": synced_hr_rel,
                 "synced_ecg_paths": synced_ecg_rel,
-                "signal_anchor_datetime_utc": signal_anchor.isoformat() if signal_anchor else None,
-                "segment_start_datetime_utc": (
-                    (signal_anchor + timedelta(seconds=iv.start_sec)).isoformat()
-                    if signal_anchor else None
-                ),
-                "segment_end_datetime_utc": (
-                    (signal_anchor + timedelta(seconds=iv.end_sec)).isoformat()
-                    if signal_anchor else None
+                **segment_timing_fields(
+                    signal_anchor, iv,
+                    self.state.video_signal_offset_sec, self.state.video_signal_offset_note,
                 ),
                 "time_coherence_tolerance_sec": self.state.time_coherence_tolerance_sec,
                 "time_coherence_warnings": coherence_warnings,
@@ -1561,52 +1549,14 @@ class Mode3Widget(QWidget):
 
     @staticmethod
     def _export_signal_slice(df, anchor, interval, destination: Path, primary_column: str) -> list[str]:
-        if df is None or df.empty or anchor is None:
-            return []
-        start = pd.Timestamp(anchor + timedelta(seconds=interval.start_sec))
-        end = pd.Timestamp(anchor + timedelta(seconds=interval.end_sec))
-        sub = df[(df["timestamp_utc"] >= start) & (df["timestamp_utc"] <= end)]
-        if sub.empty:
-            return []
-        return [
-            Path(path).name
-            for path in write_synced_signal_csvs(sub, destination, primary_column)
-        ]
+        return export_signal_slice(df, anchor, interval, destination, primary_column)
 
     def _export_synthetic_artifact_slices(
         self, anchor: datetime, interval: LabelInterval, segment_directory: Path
     ) -> dict[str, str]:
-        sources = {
-            field_name: Path(path)
-            for field_name in _SYNTHETIC_ARTIFACT_FIELDS
-            if (path := getattr(self.state, field_name))
-            if path and Path(path).exists()
-        }
-        if not sources:
-            return {}
-
-        destination = segment_directory / "synthetic_ppg"
-        if destination.exists():
-            shutil.rmtree(destination)
-        destination.mkdir(parents=True)
-        start = pd.Timestamp(anchor + timedelta(seconds=interval.start_sec))
-        end = pd.Timestamp(anchor + timedelta(seconds=interval.end_sec))
-        exported: dict[str, str] = {}
-        for field_name, source in sources.items():
-            frame = pd.read_csv(source)
-            if "timestamp_utc" not in frame.columns:
-                log.warning("Synthetic artifact has no timestamp_utc column: %s", source)
-                continue
-            timestamps = pd.to_datetime(
-                frame["timestamp_utc"], format="mixed", utc=True, errors="coerce"
-            )
-            sliced = frame[(timestamps >= start) & (timestamps <= end)]
-            if sliced.empty:
-                continue
-            relative_path = Path("synthetic_ppg") / source.name
-            sliced.to_csv(segment_directory / relative_path, index=False)
-            exported[field_name] = relative_path.as_posix()
-        return exported
+        return export_synthetic_artifact_slices(
+            synthetic_artifact_sources(self.state), anchor, interval, segment_directory
+        )
 
     def _export_all_signal_slices(
         self, anchor: datetime, interval: LabelInterval, segment_directory: Path
@@ -1670,6 +1620,11 @@ class Mode3Widget(QWidget):
             for field_name in _SYNTHETIC_ARTIFACT_FIELDS:
                 meta.pop(field_name, None)
             meta.update(signal_meta["synthetic_artifacts"])
+            # The slices were cut with the current anchor; record the same timing.
+            meta.update(segment_timing_fields(
+                anchor, interval,
+                self.state.video_signal_offset_sec, self.state.video_signal_offset_note,
+            ))
             if self._remove_legacy_csv_cb.isChecked() and signal_meta["hr_files"]:
                 try:
                     cleaned_legacy_count += cleanup_obsolete_paths(
