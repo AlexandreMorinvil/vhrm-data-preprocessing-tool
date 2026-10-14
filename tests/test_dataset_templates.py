@@ -168,17 +168,20 @@ class TemplateScreenTests(_IsolatedStore):
         self.assertEqual(captured.labels, ["Rest", "Squat"])
         self.assertEqual(captured.preprocessing, PreprocessingOptions(30.0, True, False))
 
-    def test_default_template_fills_new_projects_only(self) -> None:
+    def test_default_template_fills_only_while_no_cameras_are_loaded(self) -> None:
         self.store.save(_template())
         self.store.set_default("Gym")
         fresh = self._preprocessing()
         self.assertEqual([g.label for g in fresh._camera_groups], ["front", "side"])
-        # Labels are set when the project is created, not by this screen.
+        # Labels are set when the application starts, not by this screen.
         self.assertEqual(fresh.state.labels_library, ProjectState().labels_library)
 
-        opened = self._preprocessing(ProjectState(project_path="study.vrt", num_cameras=4))
-        self.assertEqual(opened._num_cameras_spin.value(), 4)
-        self.assertEqual([g.label_text for g in opened._camera_groups], ["", "", "", ""])
+        from app.state import VideoTrack
+
+        loaded = self._preprocessing(ProjectState(
+            num_cameras=4, tracks=[VideoTrack(camera_index=i) for i in range(4)]))
+        self.assertEqual(loaded._num_cameras_spin.value(), 4)
+        self.assertEqual([g.label_text for g in loaded._camera_groups], ["", "", "", ""])
 
     def test_labelling_applies_labels_with_undo(self) -> None:
         from app.modes.mode3_labelling import Mode3Widget
@@ -208,7 +211,7 @@ class TemplateScreenTests(_IsolatedStore):
         self.assertEqual(saved.labels, ["Walk"])
         self.assertEqual(saved.cameras, _template().cameras)
 
-    def test_new_project_starts_with_default_labels(self) -> None:
+    def test_startup_state_has_default_labels(self) -> None:
         from main import MainWindow
 
         self.assertEqual(MainWindow._fresh_state().labels_library, ProjectState().labels_library)

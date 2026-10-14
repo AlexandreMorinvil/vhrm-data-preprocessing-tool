@@ -9,7 +9,6 @@ from PyQt6.QtCore import QSettings, QThread, QTimer
 from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
-    QFileDialog,
     QLabel,
     QMainWindow,
     QMenuBar,
@@ -25,12 +24,10 @@ from PyQt6.QtWidgets import (
 from app import theme
 from app.dataset_templates import apply_labels, template_store
 from app.face_privacy import FacePrivacySettings, get_privacy_settings, set_privacy_settings
-from app.state import ProjectState
+from app.state import ProjectState, load_sidecar
 
 log = logging.getLogger(__name__)
 
-_PROJECT_FILTER = "VRT Project (*.vrt);;All files (*)"
-_MAX_RECENT = 8
 _MODE_NAMES = (
     "1. Preprocessing", "2. Signal sync", "3. Synthetic PPG", "4. Labelling", "5. PPG alignment", "6. Review",
     "7. Artifacts",
@@ -118,7 +115,6 @@ class MainWindow(QMainWindow):
             ),
             blur_faces=self._settings.value("blur_faces", False, type=bool),
         )
-        self._saved_snapshot = self._state_snapshot()
 
         self._build_menus()
         self._build_toolbar()
@@ -135,26 +131,9 @@ class MainWindow(QMainWindow):
         file_menu = mb.addMenu("&File")
         new_act = QAction("&New project", self)
         new_act.setShortcut(QKeySequence("Ctrl+N"))
+        new_act.setToolTip("Clear every section to process another set of videos.")
         new_act.triggered.connect(self._new_project)
         file_menu.addAction(new_act)
-
-        open_act = QAction("&Open project …", self)
-        open_act.setShortcut(QKeySequence("Ctrl+O"))
-        open_act.triggered.connect(self._open_project)
-        file_menu.addAction(open_act)
-
-        self._recent_menu = file_menu.addMenu("Open &recent")
-        self._rebuild_recent_menu()
-
-        save_act = QAction("&Save project", self)
-        save_act.setShortcut(QKeySequence("Ctrl+S"))
-        save_act.triggered.connect(self._save_project)
-        file_menu.addAction(save_act)
-
-        save_as_act = QAction("Save project &as …", self)
-        save_as_act.setShortcut(QKeySequence("Ctrl+Shift+S"))
-        save_as_act.triggered.connect(self._save_project_as)
-        file_menu.addAction(save_as_act)
 
         rename_act = QAction("&Rename cameras …", self)
         rename_act.triggered.connect(self._rename_cameras)
@@ -252,9 +231,6 @@ class MainWindow(QMainWindow):
     def _build_statusbar(self):
         sb = QStatusBar()
         self.setStatusBar(sb)
-        self._project_label = QLabel("")
-        sb.addPermanentWidget(self._project_label)
-        self._update_project_label()
         from app.widgets.frame_preview import multimedia_backend_available
 
         if not multimedia_backend_available():
@@ -292,6 +268,9 @@ class MainWindow(QMainWindow):
             w = ArtifactsWidget(self.state, busy_check=self._background_task_running)
         else:
             w = QWidget()
+        requested = getattr(w, "dataset_requested", None)
+        if requested is not None:
+            requested.connect(self._load_dataset)
         self._mode_widgets[index] = w
         self._stack.addWidget(w)
         return True
@@ -334,36 +313,10 @@ class MainWindow(QMainWindow):
 
         return self.findChildren(MultiCameraPlayer)
 
-    # ------------------------------------------------------------------ project
-    def _state_snapshot(self) -> str:
-        data = self.state.to_dict()
-        for key in ("active_mode", "archive_removed_files", "blur_faces"):
-            data.pop(key, None)
-        return json.dumps(data, sort_keys=True, default=str)
-
-    def _has_unsaved_changes(self) -> bool:
-        return self._state_snapshot() != self._saved_snapshot
-
-    def _confirm_discard(self) -> bool:
-        if not self._has_unsaved_changes():
-            return True
-        reply = QMessageBox.question(
-            self, "Unsaved changes",
-            "The project has unsaved changes (for example labels or signal settings).\n"
-            "Save them before continuing?",
-            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
-            | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Save,
-        )
-        if reply == QMessageBox.StandardButton.Cancel:
-            return False
-        if reply == QMessageBox.StandardButton.Save:
-            return self._save_project()
-        return True
-
+    # ------------------------------------------------------------------ state
     @staticmethod
     def _fresh_state(**options) -> ProjectState:
-        """A new project, starting with the default template's labels if any.
+        """An empty state, with the default template's labels if any.
 
         The Preprocessing section fills in the template's cameras and options.
         """
@@ -374,57 +327,68 @@ class MainWindow(QMainWindow):
         return state
 
     def _new_project(self):
-        if not self._confirm_discard():
+        if not self._confirm_start_over("New project", ask_if_loaded=True):
             return
-        self.state = self._fresh_state(
+        self._start_over(self._empty_state())
+        self.statusBar().showMessage("New project: ready for another set of videos.", 5000)
+
+    def _load_dataset(self, path: str):
+        """Clear every section, then load the dataset described by sidecar *path*."""
+        if not self._confirm_start_over("Load another dataset", ask_if_loaded=False):
+            return
+        state = self._empty_state()
+        try:
+            load_sidecar(path, state)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to load metadata:\n{exc}")
+            return
+        self._start_over(state)
+        self.statusBar().showMessage(
+            f"Loaded {len(state.tracks)} camera(s) from {Path(path).parent.name}.", 5000
+        )
+
+    def _empty_state(self) -> ProjectState:
+        return self._fresh_state(
             archive_removed_files=self._archive_removed_action.isChecked(),
             blur_faces=self._blur_faces_action.isChecked(),
         )
-        self._saved_snapshot = self._state_snapshot()
-        self._reload_modes()
-        self.setWindowTitle("Video Research Tool — New project")
-        self._update_project_label()
 
-    def _open_project(self, path: str = ""):
-        if not self._confirm_discard():
-            return
-        if not path:
-            path, _ = QFileDialog.getOpenFileName(self, "Open project", "", _PROJECT_FILTER)
-        if path:
-            try:
-                self.state = ProjectState.load(path)
-                self.state.archive_removed_files = self._archive_removed_action.isChecked()
-                self.state.blur_faces = self._blur_faces_action.isChecked()
-                self._saved_snapshot = self._state_snapshot()
-                self._reload_modes()
-                self.setWindowTitle(f"Video Research Tool — {Path(path).stem}")
-                self._add_recent(path)
-                self._update_project_label()
-            except Exception as exc:
-                QMessageBox.critical(self, "Error", f"Failed to open project:\n{exc}")
+    def _confirm_start_over(self, title: str, ask_if_loaded: bool) -> bool:
+        """Whether the current state may be discarded.
 
-    def _save_project(self) -> bool:
-        if self.state.project_path:
-            self.state.save(self.state.project_path)
-            self._saved_snapshot = self._state_snapshot()
-            self._add_recent(self.state.project_path)
-            self.statusBar().showMessage("Saved.", 3000)
-            return True
-        return self._save_project_as()
-
-    def _save_project_as(self) -> bool:
-        path, _ = QFileDialog.getSaveFileName(self, "Save project as", "", _PROJECT_FILTER)
-        if not path:
+        Always asks when Labelling has intervals that were never exported (they
+        exist nowhere else); with *ask_if_loaded*, also when anything is loaded.
+        """
+        if self._background_task_running():
+            QMessageBox.warning(self, title, "Wait for preprocessing or exports to finish first.")
             return False
-        if not path.endswith(".vrt"):
-            path += ".vrt"
-        self.state.save(path)
-        self._saved_snapshot = self._state_snapshot()
-        self.setWindowTitle(f"Video Research Tool — {Path(path).stem}")
-        self._add_recent(path)
-        self._update_project_label()
-        self.statusBar().showMessage(f"Saved to {path}", 3000)
-        return True
+        unexported = sum(1 for interval in self.state.intervals if not interval.folder)
+        loaded = bool(self.state.tracks or self.state.intervals
+                      or self.state.hr_signal_paths or self.state.ecg_signal_paths)
+        if not unexported and not (ask_if_loaded and loaded):
+            return True
+        text = "Everything loaded is cleared from every section. Files on disk are not changed."
+        if unexported:
+            text += (f"\n\n{unexported} interval(s) drawn in Labelling were not exported "
+                     "and will be lost.")
+        reply = QMessageBox.question(
+            self, title, text + "\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
+    def _start_over(self, state: ProjectState):
+        """Use *state* and rebuild every section, so none keeps data of the old one."""
+        self.state = state
+        for player in self._players():
+            player.shutdown()
+        for widget in self._mode_widgets:
+            if widget is not None:
+                self._stack.removeWidget(widget)
+                widget.deleteLater()
+        self._mode_widgets = [None] * len(_MODE_NAMES)
+        self._on_tab_changed(self._mode_index)
 
     def _rename_cameras(self):
         from app.camera_rename_worker import CameraRenameWorker
@@ -467,8 +431,6 @@ class MainWindow(QMainWindow):
             if not worker.error and not worker.was_cancelled:
                 for current, updated in zip(self.state.tracks, worker.state.tracks):
                     current.__dict__.update(updated.__dict__)
-                if self.state.project_path:
-                    self._saved_snapshot = self._state_snapshot()
             for player in players:
                 player.resume_after_camera_rename(worker.path_changes, labels)
             if not worker.error and not worker.was_cancelled:
@@ -495,46 +457,6 @@ class MainWindow(QMainWindow):
             )
             for widget in self._mode_widgets
         )
-
-    def _reload_modes(self):
-        for player in self._players():
-            player.shutdown()
-        for i, w in enumerate(self._mode_widgets):
-            if w is not None:
-                self._stack.removeWidget(w)
-                w.deleteLater()
-        self._mode_widgets = [None] * len(_MODE_NAMES)
-        self._on_tab_changed(self._mode_index)
-
-    def _update_project_label(self):
-        path = self.state.project_path
-        self._project_label.setText(f"Project: {Path(path).name}" if path else "Project: (unsaved)")
-
-    def _recent_paths(self) -> list[str]:
-        value = self._settings.value("recent_projects", [])
-        if isinstance(value, str):
-            value = [value]
-        return [p for p in (value or []) if p]
-
-    def _add_recent(self, path: str):
-        path = str(Path(path).resolve())
-        recent = [p for p in self._recent_paths() if p != path]
-        recent.insert(0, path)
-        self._settings.setValue("recent_projects", recent[:_MAX_RECENT])
-        self._rebuild_recent_menu()
-
-    def _rebuild_recent_menu(self):
-        self._recent_menu.clear()
-        recent = self._recent_paths()
-        if not recent:
-            action = self._recent_menu.addAction("(none)")
-            action.setEnabled(False)
-            return
-        for path in recent:
-            action = self._recent_menu.addAction(Path(path).name)
-            action.setToolTip(path)
-            action.setEnabled(Path(path).exists())
-            action.triggered.connect(lambda _c=False, p=path: self._open_project(p))
 
     # ------------------------------------------------------------------ view
     def _apply_theme(self, name: str):
@@ -644,9 +566,6 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ close
     def closeEvent(self, event):
-        if not self._confirm_discard():
-            event.ignore()
-            return
         self._settings.setValue("main/geometry", self.saveGeometry())
         for player in self._players():
             player.shutdown()

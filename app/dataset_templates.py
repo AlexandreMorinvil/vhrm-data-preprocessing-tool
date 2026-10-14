@@ -1,7 +1,7 @@
 """Reusable dataset setups (cameras, labels, preprocessing options).
 
 Templates are stored once per user in the application settings, so they are
-available in every project. Each part of a template is optional: ``None``
+available for every dataset. Each part of a template is optional: ``None``
 means "not part of this template", which lets a template hold only labels, or
 only cameras, and lets a later save update one part without touching the rest.
 """
@@ -242,7 +242,7 @@ class TemplateStore(QObject):
         self._commit()
 
     def set_default(self, name: str) -> None:
-        """Use *name* for new projects ("" for none)."""
+        """Use *name* at startup ("" for none)."""
         if name and name not in self._templates:
             raise KeyError(name)
         self._default = name

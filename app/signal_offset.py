@@ -233,12 +233,12 @@ def write_alignment_record(directory: Path, offset_sec: float, note: str,
 
 
 def read_offset_file(path: str | Path) -> tuple[float, str]:
-    """Read an offset from an alignment record, a metadata sidecar, a segment
-    ``meta.json`` or a ``.vrt`` project file."""
+    """Read an offset from an alignment record, a metadata sidecar or a segment
+    ``meta.json``."""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(data, dict) or OFFSET_KEY not in data:
         raise ValueError(
             f"{Path(path).name} has no '{OFFSET_KEY}'. Choose an alignment.json, a metadata "
-            "sidecar, a segment meta.json or a project (.vrt) where an offset was applied."
+            "sidecar or a segment meta.json where an offset was applied."
         )
     return float(data[OFFSET_KEY] or 0.0), str(data.get(OFFSET_NOTE_KEY) or "")

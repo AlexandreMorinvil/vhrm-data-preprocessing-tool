@@ -54,8 +54,8 @@ After preprocessing or importing project metadata, choose **File > Rename camera
 from any section. Edit the camera names and click **Rename**. The application
 renames final videos, existing labelled camera clips and individual captured-frame
 filenames, updates their JSON
-metadata and path references, and saves the current project if it already has a
-project file. Original recordings, sensor CSVs and interval labels are unchanged.
+metadata and path references. Original recordings, sensor CSVs and interval
+labels are unchanged.
 Imported metadata is updated in place, even if it has a custom filename.
 
 Names must be unique and valid Windows filename text. Existing destination files
@@ -87,11 +87,12 @@ update only the labels of a template from the Labelling section. Applying labels
 replaces the library; labels still used by intervals are kept, and **Ctrl+Z**
 undoes it in Labelling.
 
-The **⋯** button renames or deletes a template, or marks it **Use for new
-projects** (shown with ★): new projects then start with that template's
-cameras, labels and options. Opened projects are never changed automatically.
+The **⋯** button renames or deletes a template, or marks it **Use at
+startup** (shown with ★): the application then starts with that template's
+labels, and Preprocessing with its cameras and options while no cameras are
+loaded. Loaded metadata is never changed automatically.
 Templates are stored per user in the application settings and shared by all
-projects. Segments, output folders and signal files are not part of templates.
+datasets. Segments, output folders and signal files are not part of templates.
 
 ## Graphs and timeline
 
@@ -296,8 +297,8 @@ the offset from the video itself.
    synthetic PPG slices and the timing (`signal_anchor_datetime_utc`,
    `segment_start/end_datetime_utc`, `video_signal_offset_sec`) of every
    exported segment, updates the metadata sidecar and appends the change to
-   `<output>/ppg_alignment/alignment.json`. Videos are not modified. Save the
-   project afterwards. Applying again replaces the offset (it does not add up).
+   `<output>/ppg_alignment/alignment.json`. Videos are not modified. Applying
+   again replaces the offset (it does not add up).
 7. **Remove offset …** returns to the original camera timing (it applies 0 s).
    Every apply cuts the slices again from the project-level signals, so the
    result never depends on earlier applications: removing the offset restores
@@ -305,7 +306,7 @@ the offset from the video itself.
 
 **Import offset …** reads the offset applied in another project, for example
 the same participant's baseline session (its `ppg_alignment/alignment.json`,
-metadata sidecar, a segment `meta.json` or the `.vrt`), so you can inspect it on
+metadata sidecar or a segment `meta.json`), so you can inspect it on
 this project's segments before applying it. Sessions recorded the same day do
 not always share an offset — each project's camera time correction is set
 separately — so always check the correlation plot of the target session:
@@ -359,7 +360,7 @@ folder: the dataset the files came from, and each file's size and category.
 
 The right-hand pane lists every file concerned with its size and destination;
 files that already exist at the destination are marked.
-Labelled segments, signals, synthetic PPG, metadata and the project file always
+Labelled segments, signals, synthetic PPG and metadata always
 stay in the dataset. Once the full-length videos are gone, Preprocessing,
 Labelling and PPG alignment can no longer play the full session, and the
 labelled segments cannot be exported again, so clean up after the review.
@@ -388,7 +389,7 @@ and are not moved. Validation, shown above the list and again before starting:
 Nothing is ever restored into `labelled_segments/`. Restored files are removed
 from the manifest; when the artifacts folder ends up empty it is deleted.
 Camera views that lost their video in a move made during the same session show
-it again after the restore; otherwise reopen the project.
+it again after the restore; otherwise load the project metadata again.
 
 ## Adding a signal loader
 
@@ -396,9 +397,24 @@ Place a new Python module in `app/signals/`.  Implement the `SignalLoader` ABC
 with `can_load(path) -> bool` and `load(path) -> pd.DataFrame`.  The module is
 auto-discovered at startup via `pkgutil`.
 
-## Project files
+## New project and switching datasets
 
-Projects are saved as `.vrt` JSON files with relative paths for portability.
+**File > New project** (Ctrl+N) clears every section — cameras, signals,
+intervals, plots and players — so another set of videos can be processed.
+Loading the metadata of another dataset in any section does the same, then
+loads that dataset everywhere; loading the metadata of the dataset already open
+only refreshes it. New project asks for confirmation when something is loaded;
+switching datasets asks only when intervals drawn in Labelling were never
+exported. Files on disk are never changed.
+
+## What is saved
+
+There is no project file. Each dataset is described by `project_meta.json` in
+its output folder, written by Preprocessing and updated by Signal sync,
+Synthetic PPG and PPG alignment; load it in any section with **Load project
+metadata**. Exported labelled segments are listed in their `manifest.csv`.
+Intervals drawn in Labelling are kept only until the application closes, so
+export them before quitting.
 
 ## PPGSynth license
 

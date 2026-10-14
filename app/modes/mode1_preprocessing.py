@@ -398,12 +398,12 @@ class Mode1Widget(QWidget):
             self._status_text(text)
 
     def _apply_default_template(self) -> None:
-        """Pre-fill cameras and options of a brand-new project.
+        """Pre-fill cameras and options while no cameras are loaded yet.
 
-        Labels of the default template are set when the project is created
+        Labels of the default template are set when the application starts
         (see MainWindow), so labels edited in other sections are not replaced.
         """
-        if self.state.project_path or self.state.tracks:
+        if self.state.tracks:
             return
         default = template_store().default()
         if default is not None:

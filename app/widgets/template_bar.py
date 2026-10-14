@@ -71,9 +71,9 @@ class TemplateSaveDialog(QDialog):
         self._note = QLabel("")
         self._note.setWordWrap(True)
         layout.addWidget(self._note)
-        self._default_cb = QCheckBox("Use this template for new projects")
+        self._default_cb = QCheckBox("Use this template at startup")
         self._default_cb.setToolTip(
-            "New projects start with this template's cameras, labels and options."
+            "The application starts with this template's cameras, labels and options."
         )
         layout.addWidget(self._default_cb)
 
@@ -160,7 +160,7 @@ class TemplateBar(QWidget):
         self._more_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self._more_btn.setStyleSheet("QToolButton::menu-indicator { image: none; width: 0; }")
         menu = QMenu(self._more_btn)
-        self._default_action = QAction("Use for new projects", self)
+        self._default_action = QAction("Use at startup", self)
         self._default_action.setCheckable(True)
         self._default_action.triggered.connect(self._toggle_default)
         menu.addAction(self._default_action)
@@ -221,7 +221,7 @@ class TemplateBar(QWidget):
         for template in self._store.templates():
             is_default = template.name == self._store.default_name
             self._combo.addItem(f"★ {template.name}" if is_default else template.name, template.name)
-            tooltip = describe(template) + ("\n★ Used for new projects" if is_default else "")
+            tooltip = describe(template) + ("\n★ Used at startup" if is_default else "")
             self._combo.setItemData(self._combo.count() - 1, tooltip, role=Qt.ItemDataRole.ToolTipRole)
         if self._combo.count() == 0:
             self._combo.setPlaceholderText("No templates yet — use Save…")
@@ -238,7 +238,7 @@ class TemplateBar(QWidget):
         self._delete_action.setEnabled(has)
         self._default_action.setEnabled(has)
         self._default_action.setChecked(has and self._store.default_name == template.name)
-        tooltip = "Saved dataset templates (★ = used for new projects)"
+        tooltip = "Saved dataset templates (★ = used at startup)"
         self._combo.setToolTip(f"{describe(template)}\n\n{tooltip}" if has else tooltip)
 
     def _toggle_default(self, checked: bool) -> None:
@@ -246,8 +246,8 @@ class TemplateBar(QWidget):
         if not name:
             return
         self._store.set_default(name if checked else "")
-        self.message.emit(f"New projects will use “{name}”." if checked
-                          else "New projects will not use a template.")
+        self.message.emit(f"The application will start with “{name}”." if checked
+                          else "The application will start without a template.")
 
     def _rename(self) -> None:
         old = self.selected_name()

@@ -273,7 +273,7 @@ class ArtifactsWidget(QWidget):
         if dataset is None or not dataset.is_dir():
             self._found = _empty_found()
             self._dataset_info.setText(
-                "Load a project, or choose its output folder." if dataset is None
+                "Load the project metadata, or choose its output folder." if dataset is None
                 else "⚠ This folder does not exist."
             )
         else:
@@ -476,8 +476,8 @@ class ArtifactsWidget(QWidget):
                 self._summary.setText(text + conflict_text)
             else:
                 self._summary.setText(
-                    f"{verb} {len(files)} file(s), {size}. Labelled segments, signals, metadata and "
-                    "the project file stay in the dataset." + conflict_text
+                    f"{verb} {len(files)} file(s), {size}. Labelled segments, signals and metadata "
+                    "stay in the dataset." + conflict_text
                 )
             self._run_btn.setText(f"{verb} {len(files)} file(s) ({size}) …")
         else:

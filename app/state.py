@@ -105,7 +105,6 @@ class LabelInterval:
 
 @dataclass
 class ProjectState:
-    project_path: str = ""
     output_directory: str = ""
     metadata_path: str = ""
     num_cameras: int = 2
@@ -159,30 +158,6 @@ class ProjectState:
         d = dict(d)
         tracks = [VideoTrack.from_dict(t) for t in d.pop("tracks", [])]
         intervals = [LabelInterval.from_dict(i) for i in d.pop("intervals", [])]
-        # Backward compat: old "signal_mode" → new "include_signal_average"
-        old_mode = d.pop("signal_mode", None)
-        if old_mode is not None and "include_signal_average" not in d:
-            d["include_signal_average"] = (old_mode == "average")
-        # Projects created before ECG support stored HR in generic signal fields.
-        if "hr_signal_paths" not in d:
-            d["hr_signal_paths"] = list(d.get("signal_paths", []))
-        if "synced_hr_path" not in d:
-            d["synced_hr_path"] = d.get("synced_signal_path", "")
-        if "synced_hr_paths" not in d:
-            legacy_hr = d.get("synced_hr_path") or d.get("synced_signal_path")
-            d["synced_hr_paths"] = [legacy_hr] if legacy_hr else []
-        if "synced_ecg_paths" not in d:
-            legacy_ecg = d.get("synced_ecg_path")
-            d["synced_ecg_paths"] = [legacy_ecg] if legacy_ecg else []
-        if "legacy_synced_paths" not in d:
-            legacy_paths = [
-                d.get("synced_signal_path"),
-                d.get("synced_hr_path"),
-                d.get("synced_ecg_path"),
-            ]
-            d["legacy_synced_paths"] = list(dict.fromkeys(
-                path for path in legacy_paths if path
-            ))
         valid = {k for k in cls.__dataclass_fields__}
         filtered = {k: v for k, v in d.items() if k in valid}
         state = cls(**filtered)
@@ -190,87 +165,22 @@ class ProjectState:
         state.intervals = intervals
         return state
 
-    def save(self, path) -> None:
-        p = Path(path)
-        self.project_path = str(p)
-        d = self.to_dict()
-        base = p.parent
-        d = _relativise_paths(d, base)
-        p.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    @classmethod
-    def load(cls, path) -> "ProjectState":
-        p = Path(path)
-        raw = json.loads(p.read_text(encoding="utf-8"))
-        base = p.parent
-        raw = _resolve_paths(raw, base)
-        state = cls.from_dict(raw)
-        state.project_path = str(p)
-        return state
+def dataset_directory(state: ProjectState) -> Optional[Path]:
+    """The project output folder (the folder containing ``labelled_segments``)."""
+    if state.output_directory:
+        return Path(state.output_directory)
+    if state.segments_manifest_path:
+        return Path(state.segments_manifest_path).parent.parent
+    return None
 
 
-_PATH_KEYS = {
-    "project_path", "output_directory", "metadata_path", "concatenated_path",
-    "trimstart_path", "final_output_path", "ffmpeg_path",
-    "synced_signal_path", "synced_hr_path", "synced_ecg_path",
-    "synthetic_ppg_path", "synthetic_ppg_hr_path", "synthetic_ppg_hrv_path",
-    "synthetic_rr_path", "synthetic_ppg_source_ecg_path",
-    "segments_manifest_path", "folder",
-}
-_PATH_LIST_KEYS = {
-    "segment_paths", "signal_paths", "hr_signal_paths", "ecg_signal_paths",
-    "synced_hr_paths", "synced_ecg_paths", "legacy_synced_paths",
-}
-
-
-def _try_relative(p: str, base: Path) -> str:
-    if not p:
-        return p
-    try:
-        return str(Path(p).relative_to(base))
-    except ValueError:
-        return p
-
-
-def _try_resolve(p: str, base: Path) -> str:
-    if not p:
-        return p
-    candidate = base / p
-    if candidate.exists():
-        return str(candidate.resolve())
-    return p
-
-
-def _relativise_paths(d, base):
-    if isinstance(d, dict):
-        out = {}
-        for k, v in d.items():
-            if k in _PATH_KEYS and isinstance(v, str):
-                out[k] = _try_relative(v, base)
-            elif k in _PATH_LIST_KEYS and isinstance(v, list):
-                out[k] = [_try_relative(s, base) for s in v]
-            else:
-                out[k] = _relativise_paths(v, base)
-        return out
-    if isinstance(d, list):
-        return [_relativise_paths(item, base) for item in d]
-    return d
-
-
-def _resolve_paths(d, base):
-    if isinstance(d, dict):
-        out = {}
-        for k, v in d.items():
-            if k in _PATH_KEYS and isinstance(v, str):
-                out[k] = _try_resolve(v, base)
-            elif k in _PATH_LIST_KEYS and isinstance(v, list):
-                out[k] = [_try_resolve(s, base) for s in v]
-            else:
-                out[k] = _resolve_paths(v, base)
-        return out
-    if isinstance(d, list):
-        return [_resolve_paths(item, base) for item in d]
-    return d
+def is_other_dataset(state: ProjectState, metadata_path: str) -> bool:
+    """Whether the sidecar *metadata_path* describes another dataset than *state*'s."""
+    current = dataset_directory(state)
+    if current is None:
+        return bool(state.tracks or state.intervals)
+    return current.resolve() != Path(metadata_path).resolve().parent
 
 
 def load_labelled_segments_manifest(path: str, state: ProjectState) -> list[LabelInterval]:
@@ -307,11 +217,11 @@ def load_labelled_segments_manifest(path: str, state: ProjectState) -> list[Labe
 
 
 # ---------------------------------------------------------------------------
-# Metadata sidecar (.vrt-meta.json)
+# Metadata sidecar (project_meta.json)
 # ---------------------------------------------------------------------------
 
 def generate_sidecar(state: ProjectState) -> str:
-    """Write a ``_meta.json`` sidecar alongside the final videos.
+    """Write the ``project_meta.json`` sidecar alongside the final videos.
 
     Returns the path of the generated file.
     """
@@ -319,8 +229,7 @@ def generate_sidecar(state: ProjectState) -> str:
     if not out_dir:
         raise ValueError("No output directory set in project state.")
 
-    project_name = Path(state.project_path).stem if state.project_path else "project"
-    sidecar_path = str(Path(out_dir) / f"{project_name}_meta.json")
+    sidecar_path = str(Path(out_dir) / "project_meta.json")
 
     cameras = []
     for t in state.tracks:

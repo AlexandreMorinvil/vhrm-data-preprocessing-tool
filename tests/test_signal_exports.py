@@ -6,7 +6,6 @@ from unittest.mock import patch
 import pandas as pd
 
 from app.signals import load_signal_files, read_synced_signal_csvs, write_synced_signal_csvs
-from app.state import ProjectState
 
 
 class SignalExportTests(unittest.TestCase):
@@ -115,19 +114,6 @@ class SignalExportTests(unittest.TestCase):
 
             self.assertIsNotNone(frame)
             self.assertEqual(list(frame.columns), ["timestamp_utc", "Synthetic_Ppg"])
-
-    def test_migrates_legacy_project_signal_paths(self) -> None:
-        state = ProjectState.from_dict({
-            "synced_signal_path": "hr_synced.csv",
-            "synced_ecg_path": "ecg_synced.csv",
-        })
-
-        self.assertEqual(state.synced_hr_paths, ["hr_synced.csv"])
-        self.assertEqual(state.synced_ecg_paths, ["ecg_synced.csv"])
-        self.assertEqual(
-            state.legacy_synced_paths,
-            ["hr_synced.csv", "ecg_synced.csv"],
-        )
 
 
 if __name__ == "__main__":

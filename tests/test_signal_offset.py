@@ -142,16 +142,13 @@ class SignalOffsetTests(unittest.TestCase):
         self.assertEqual(segment_applied_offset(meta, self.state), 0.0)
         self.assertEqual(segment_reference_start(meta, self.interval, self.state), ANCHOR)
 
-    def test_offset_survives_project_and_sidecar_round_trips(self) -> None:
+    def test_offset_survives_sidecar_round_trip(self) -> None:
         apply_signal_offset(self.state, -6.53, note="jzc11 baseline")
-        project = self.root / "project.vrt"
-        self.state.save(project)
-        self.assertEqual(ProjectState.load(project).video_signal_offset_sec, -6.53)
         loaded = ProjectState()
         load_sidecar(str(self.sidecar), loaded)
         self.assertEqual(loaded.video_signal_offset_sec, -6.53)
         self.assertEqual(loaded.video_signal_offset_note, "jzc11 baseline")
-        for path in (project, self.sidecar, self.root / "ppg_alignment" / "alignment.json",
+        for path in (self.sidecar, self.root / "ppg_alignment" / "alignment.json",
                      self.segment / "meta.json"):
             with self.subTest(path=path.name):
                 self.assertEqual(read_offset_file(path)[0], -6.53)

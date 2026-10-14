@@ -15,7 +15,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -59,7 +59,9 @@ from ..signal_offset import (
     segment_applied_offset,
     segment_reference_start,
 )
-from ..state import LabelInterval, ProjectState, load_labelled_segments_manifest, load_sidecar
+from ..state import (
+    LabelInterval, ProjectState, is_other_dataset, load_labelled_segments_manifest, load_sidecar,
+)
 from ..widgets.alignment_plot import AlignmentPlot
 from ..widgets.frame_preview import MultiCameraPlayer
 from ..widgets.layout import ModeWorkspace
@@ -103,6 +105,10 @@ def _default_camera(labels: list[str]) -> int:
 
 
 class PpgAlignmentWidget(QWidget):
+    # Emitted with a metadata path of another dataset: the main window clears
+    # every section and loads it.
+    dataset_requested = pyqtSignal(str)
+
     def __init__(self, state: ProjectState, parent=None):
         super().__init__(parent)
         self.state = state
@@ -305,7 +311,7 @@ class PpgAlignmentWidget(QWidget):
         import_btn = QPushButton("Import offset …")
         import_btn.setToolTip(
             "Read the offset applied in another project (its ppg_alignment/alignment.json,\n"
-            "metadata sidecar, a segment meta.json or the .vrt project) to inspect it here."
+            "metadata sidecar or a segment meta.json) to inspect it here."
         )
         import_btn.clicked.connect(self._import_offset)
         io_row.addWidget(import_btn)
@@ -399,6 +405,9 @@ class PpgAlignmentWidget(QWidget):
             "Metadata sidecar (*.json);;All files (*)",
         )
         if not path:
+            return
+        if is_other_dataset(self.state, path):
+            self.dataset_requested.emit(path)
             return
         try:
             load_sidecar(path, self.state)
@@ -758,7 +767,7 @@ class PpgAlignmentWidget(QWidget):
     def _import_offset(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "Import offset", str(Path(self.state.output_directory).parent) if self.state.output_directory else "",
-            "Offset sources (alignment.json *_meta.json meta.json *.json *.vrt);;All files (*)",
+            "Offset sources (alignment.json *_meta.json meta.json *.json);;All files (*)",
         )
         if not path:
             return
@@ -860,8 +869,8 @@ class PpgAlignmentWidget(QWidget):
         lines = [f"Applied {report.offset_sec:+.3f} s to {report.segments_updated} segment(s)."]
         if report.resliced:
             lines.append("Re-sliced: " + ", ".join(report.resliced) + ".")
-        lines.append("Metadata sidecar updated." if report.sidecar_updated else "No metadata sidecar to update.")
-        lines.append("Save the project (Ctrl+S) to keep the offset in the .vrt file.")
+        lines.append("Metadata sidecar updated." if report.sidecar_updated else
+                     "No metadata sidecar to update: the offset is kept only until the application closes.")
         lines.extend(f"⚠ {warning}" for warning in report.warnings)
         self._apply_status.setText("\n".join(lines))
         self._progress.setValue(100)

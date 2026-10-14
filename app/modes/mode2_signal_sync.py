@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from PyQt6.QtCore import QSettings, Qt, QTime
+from PyQt6.QtCore import QSettings, Qt, QTime, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -44,6 +44,7 @@ from ..state import (
     effective_signal_anchor,
     format_time_coherence_warnings,
     generate_sidecar,
+    is_other_dataset,
     load_sidecar,
     project_signal_anchor,
     video_timeline_duration_sec,
@@ -112,6 +113,10 @@ def _qtime_to_secs(t: QTime) -> float:
 
 
 class Mode2Widget(QWidget):
+    # Emitted with a metadata path of another dataset: the main window clears
+    # every section and loads it.
+    dataset_requested = pyqtSignal(str)
+
     def __init__(self, state: ProjectState, parent=None):
         super().__init__(parent)
         self.state = state
@@ -335,6 +340,9 @@ class Mode2Widget(QWidget):
             self, "Select metadata sidecar", "", _META_FILTER,
         )
         if not path:
+            return
+        if is_other_dataset(self.state, path):
+            self.dataset_requested.emit(path)
             return
         try:
             load_sidecar(path, self.state)

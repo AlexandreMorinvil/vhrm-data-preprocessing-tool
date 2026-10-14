@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from PyQt6.QtCore import QSettings, Qt, QTime
+from PyQt6.QtCore import QSettings, Qt, QTime, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -54,6 +54,7 @@ from ..state import (
     effective_signal_anchor,
     format_time_coherence_warnings,
     load_labelled_segments_manifest,
+    is_other_dataset,
     load_sidecar,
     project_signal_anchor,
     video_timeline_duration_sec,
@@ -142,6 +143,10 @@ def _subdivide_interval(iv: LabelInterval, mode: str, value: float, color: str) 
 
 
 class Mode3Widget(QWidget):
+    # Emitted with a metadata path of another dataset: the main window clears
+    # every section and loads it.
+    dataset_requested = pyqtSignal(str)
+
     def __init__(self, state: ProjectState, parent=None):
         super().__init__(parent)
         self.state = state
@@ -563,6 +568,9 @@ class Mode3Widget(QWidget):
             self, "Select metadata sidecar", "", _META_FILTER,
         )
         if not path:
+            return
+        if is_other_dataset(self.state, path):
+            self.dataset_requested.emit(path)
             return
         try:
             load_sidecar(path, self.state)

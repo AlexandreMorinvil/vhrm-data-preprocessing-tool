@@ -1,6 +1,4 @@
 import unittest
-import tempfile
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -12,7 +10,6 @@ from app.synthetic_ppg import (
     generate_synthetic_ppg,
     synthesize_from_peak_times,
 )
-from app.state import ProjectState
 
 
 class SyntheticPpgTimingTests(unittest.TestCase):
@@ -255,34 +252,6 @@ class SyntheticPpgTimingTests(unittest.TestCase):
             delta=0.4,
         )
         self.assertGreater(heart_rate["heart_rate_bpm"].nunique(), 1)
-
-    def test_project_round_trip_preserves_synthetic_artifact_paths(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
-            ppg_path = root / "synthetic_ppg.csv"
-            artifact_paths = [
-                ppg_path,
-                root / "synthetic_ppg_hr.csv",
-                root / "synthetic_ppg_hrv.csv",
-                root / "synthetic_ppg_rr.csv",
-            ]
-            for artifact_path in artifact_paths:
-                artifact_path.touch()
-            project_path = root / "project.vrt"
-            state = ProjectState(
-                synthetic_ppg_path=str(artifact_paths[0]),
-                synthetic_ppg_hr_path=str(artifact_paths[1]),
-                synthetic_ppg_hrv_path=str(artifact_paths[2]),
-                synthetic_rr_path=str(artifact_paths[3]),
-            )
-
-            state.save(project_path)
-            loaded = ProjectState.load(project_path)
-
-            self.assertTrue(Path(loaded.synthetic_ppg_path).samefile(ppg_path))
-            self.assertTrue(
-                Path(loaded.synthetic_ppg_hr_path).samefile(artifact_paths[1])
-            )
 
 
 if __name__ == "__main__":

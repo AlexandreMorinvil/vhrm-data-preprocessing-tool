@@ -9,7 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
 
-from .state import ProjectState, _relativise_paths
+from .state import ProjectState
 
 
 def validate_camera_labels(labels: list[str]) -> list[str]:
@@ -212,9 +212,6 @@ def rename_cameras(
     updated = ProjectState.from_dict(updated_data)
     for path, raw in documents.items():
         documents[path] = update_paths(raw, path.parent)
-    if state.project_path:
-        project = Path(state.project_path).resolve()
-        documents[project] = _relativise_paths(updated.to_dict(), project.parent)
 
     # Stage all source files first (supports case-only renames on Windows),
     # then publish each target. Metadata writes use sibling atomic replacements.

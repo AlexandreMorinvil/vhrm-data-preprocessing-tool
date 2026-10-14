@@ -42,10 +42,8 @@ class CameraRenameTests(unittest.TestCase):
         self.state.intervals = [LabelInterval("Wrong", 0, 12, folder=str(folder))]
         return folder
 
-    def test_renames_videos_metadata_project_and_live_track(self):
+    def test_renames_videos_metadata_and_live_track(self):
         folder = self.add_segment()
-        project = self.root / "session.vrt"
-        self.state.save(project)
         raw = json.loads(self.sidecar.read_text())
         raw["extra_field"] = {"preserved": "Wrong"}
         self.sidecar.write_text(json.dumps(raw), encoding="utf-8")
@@ -72,9 +70,6 @@ class CameraRenameTests(unittest.TestCase):
         sidecar = json.loads(self.sidecar.read_text())
         self.assertEqual(sidecar["extra_field"], {"preserved": "Wrong"})
         self.assertEqual(sidecar["cameras"][0]["final_video_path"], new_video.name)
-        loaded = ProjectState.load(project)
-        self.assertEqual(loaded.tracks[0].camera_label, "Front")
-        self.assertEqual(loaded.tracks[0].final_output_path, str(new_video))
         from_sidecar = ProjectState()
         load_sidecar(str(self.sidecar), from_sidecar)
         self.assertEqual(from_sidecar.tracks[0].final_output_path, str(new_video))
@@ -307,7 +302,6 @@ class CameraRenameUiTests(unittest.TestCase):
         window._mode_widgets = [SimpleNamespace(refresh_camera_names=refresh)]
         window._background_task_running = lambda: MainWindow._background_task_running(window)
         window._players = lambda: [player]
-        window._reload_modes = Mock()
         window.statusBar = lambda: Mock()
         events = []
         player.suspend_for_camera_rename.side_effect = lambda: events.append("release")
@@ -334,7 +328,6 @@ class CameraRenameUiTests(unittest.TestCase):
         player.shutdown.assert_not_called()
         player.resume_after_camera_rename.assert_called_once_with({}, ["Front"])
         refresh.assert_called_once()
-        window._reload_modes.assert_not_called()
 
     def test_progress_dialog_cancel_waits_until_rollback_finishes(self):
         from app.widgets.camera_rename_progress import CameraRenameProgressDialog
@@ -386,7 +379,6 @@ class CameraRenameUiTests(unittest.TestCase):
         window._background_task_running = lambda: MainWindow._background_task_running(window)
         player = Mock()
         window._players = lambda: [player]
-        window._reload_modes = Mock()
         status = Mock()
         window.statusBar = lambda: status
         with patch("app.widgets.camera_rename_dialog.CameraRenameDialog") as dialog_type, \
@@ -437,7 +429,6 @@ class CameraRenameUiTests(unittest.TestCase):
         window._background_task_running = lambda: MainWindow._background_task_running(window)
         player = Mock()
         window._players = lambda: [player]
-        window._reload_modes = Mock()
         with patch("app.widgets.camera_rename_dialog.CameraRenameDialog") as dialog_type, \
                 patch("app.camera_rename_worker.rename_cameras", side_effect=PermissionError("locked video")), \
                 patch("main.QMessageBox.critical") as message:
@@ -447,7 +438,6 @@ class CameraRenameUiTests(unittest.TestCase):
         self.assertEqual(window.state.tracks[0].camera_label, "Wrong")
         message.assert_called_once()
         player.resume_after_camera_rename.assert_called_once_with({}, ["Front"])
-        window._reload_modes.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from .signal_offset import ALIGNMENT_DIRECTORY
-from .state import ProjectState
+from .state import ProjectState, dataset_directory
 
 log = logging.getLogger(__name__)
 
@@ -97,15 +97,6 @@ def _empty_categories() -> dict[str, list[ArtifactFile]]:
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
-
-def dataset_directory(state: ProjectState) -> Optional[Path]:
-    """The project output folder (the folder containing ``labelled_segments``)."""
-    if state.output_directory:
-        return Path(state.output_directory)
-    if state.segments_manifest_path:
-        return Path(state.segments_manifest_path).parent.parent
-    return None
-
 
 def default_artifacts_name(dataset_dir: str | Path) -> str:
     return f"{Path(dataset_dir).resolve().name}{ARTIFACTS_SUFFIX}"

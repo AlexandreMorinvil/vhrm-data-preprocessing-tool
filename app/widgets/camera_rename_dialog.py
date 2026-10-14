@@ -17,7 +17,7 @@ class CameraRenameDialog(QDialog):
         layout = QVBoxLayout(self)
         explanation = QLabel(
             "Rename cameras throughout this project, including final videos, "
-            "labelled clips, metadata and the saved project.\n"
+            "labelled clips and metadata.\n"
             "Original recordings and sensor files are not changed. "
             "Existing text drawn into exported mosaics or images cannot be changed; "
             "export those again to use the new names."

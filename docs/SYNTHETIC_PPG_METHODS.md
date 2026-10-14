@@ -12,7 +12,7 @@ The implementation is in:
 - `app/synthetic_ppg.py`: ECG peak detection, PPG synthesis, HR, and HRV.
 - `app/modes/mode3_synthetic_ppg.py`: GUI workflow, reference selection,
   persistence, comparison, and output organization.
-- `app/state.py`: project and metadata-sidecar persistence.
+- `app/state.py`: shared state and metadata-sidecar persistence.
 - `tests/test_synthetic_ppg.py` and `tests/test_synthetic_ppg_widget.py`:
   behavioral regression tests.
 
@@ -326,13 +326,13 @@ All generated artifacts are stored under `<project output>/synthetic_ppg/`:
 | `synthetic_ppg_hr.csv` | `timestamp_utc`, `heart_rate_bpm` | Windowed FFT HR |
 | `synthetic_ppg_hrv.csv` | `timestamp_utc`, `sdnn_ms`, `rmssd_ms`, `accepted_intervals`, `rejected_intervals`, `quality_fraction` | Rolling HRV and interval quality |
 
-The `.vrt` project and `_meta.json` sidecar store paths to these artifacts and
+The `project_meta.json` sidecar stores paths to these artifacts and
 the source synchronized ECG. Nested paths are relative to the project output
 directory for portability. Regeneration writes the new files first, then removes
 or archives legacy root-level copies according to the application cleanup
 policy.
 
-For a publication, archive the project file, sidecar, generated folder, source
+For a publication, archive the metadata sidecar, generated folder, source
 synchronized ECG, relevant HR reference, software revision, Python version, and
 dependency environment. Record any GUI parameter changes from the defaults
 listed above.

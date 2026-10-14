@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from PyQt6.QtCore import QTimer, QUrl
+from PyQt6.QtCore import QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -30,6 +30,7 @@ from ..state import (
     ProjectState,
     effective_signal_anchor,
     load_labelled_segments_manifest,
+    is_other_dataset,
     load_sidecar,
 )
 from ..widgets.frame_preview import MultiCameraPlayer
@@ -76,6 +77,10 @@ class _SegmentInfo:
 
 
 class Mode4Widget(QWidget):
+    # Emitted with a metadata path of another dataset: the main window clears
+    # every section and loads it.
+    dataset_requested = pyqtSignal(str)
+
     def __init__(self, state: ProjectState, parent=None):
         super().__init__(parent)
         self.state = state
@@ -236,6 +241,9 @@ class Mode4Widget(QWidget):
             self, "Select metadata sidecar", "", "Metadata sidecar (*.json);;All files (*)",
         )
         if not path:
+            return
+        if is_other_dataset(self.state, path):
+            self.dataset_requested.emit(path)
             return
         try:
             load_sidecar(path, self.state)
