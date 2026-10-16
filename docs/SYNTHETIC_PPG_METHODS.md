@@ -149,9 +149,47 @@ $$
 \exp\left[-\left(\frac{\theta-\theta_j}{b_j}\right)^2\right].
 $$
 
-The initial state is $(-1,0,0)$. SciPy `solve_ivp` integrates the system with
-RK45 at requested output times. The generated $z$ trajectory is min-max
-normalized to $[0,1]$.
+The initial state is $(-1,0,0)$, so every beat starts at the R peak with
+$\theta=\pm\pi$. The generated $z$ trajectory is min-max normalized to $[0,1]$.
+
+### Closed-form evaluation
+
+The system is evaluated exactly rather than integrated numerically. Within beat
+$i$ the oscillator turns at the constant rate $\omega_i$, so the phase at time
+$t$ is known exactly from the beat's R peak $B_{i-1}$:
+
+$$
+\theta(t) = -\pi + 2\pi\,\frac{t-B_{i-1}}{RR_i},
+$$
+
+and the amplitude equation integrates in closed form:
+
+$$
+F(\theta)=\sum_{j=1}^{2}\frac{a_j b_j^2}{4}
+\exp\left[-\left(\frac{\theta-\theta_j}{b_j}\right)^2\right].
+$$
+
+The model's $z$ is $F(\theta)$ plus a constant step $F(\pi)-F(-\pi)$
+($\approx -0.001$, 0.6% of the beat amplitude) added at every beat. Over
+thousands of beats that step becomes a ramp that min-max normalization would
+squash the pulse against, so it is spread linearly over each beat and removed:
+
+$$
+z(t)=F(\theta)-F(-\pi)-\left[F(\pi)-F(-\pi)\right]\frac{t-B_{i-1}}{RR_i}.
+$$
+
+Apart from that ramp, this matches a tight-tolerance numerical solution of the
+equations to within $10^{-9}$. The systolic peak sits at a constant 24.7% of
+every RR interval.
+
+The earlier implementation integrated the equations with SciPy `solve_ivp`
+(RK45, default tolerances). Its phase error accumulated from beat to beat. On
+the 2,198 s `jzc02` session (2,835 beats), the pulse moved from 23% of the RR
+interval at the start to 92% of the previous interval at the end. That is a
+drift of 0.34 beat, about 0.3 s, against the ECG peaks the PPG was made from.
+Segments of one session therefore could not all be aligned to the video with
+a single offset (see [Implementation change record](#implementation-change-record)).
+The closed form removes that drift and takes about 1 s for that session.
 
 ### Exact cumulative RR boundaries
 
@@ -164,7 +202,7 @@ $$
 B_i=\sum_{k=1}^{i}RR_k.
 $$
 
-At solver time $t$, the active interval is the first $i$ for which $B_i>t$.
+At time $t$, the active interval is the first $i$ for which $B_i>t$.
 The output duration is $\sum_i RR_i$ and the sample count is
 $\lceil f_s\sum_i RR_i\rceil$. This choice preserves the measured cumulative
 beat timing and was made specifically to avoid long-recording time dilation.
@@ -381,8 +419,10 @@ generalizability, or equivalence to Zephyr.
 1. **Use synchronized ECG only.** This keeps the generated signal inside the
    same data boundary as videos and labels and avoids hidden dependence on
    samples outside the imported interval.
-2. **Use exact cumulative RR boundaries.** This removes systematic timing drift
-   from per-interval upward sample rounding.
+2. **Use exact cumulative RR boundaries and evaluate the model in closed form.**
+   This removes systematic timing drift from per-interval upward sample rounding
+   and from the phase error of numerical integration. Each pulse stays at the
+   same place within its RR interval for the whole recording.
 3. **Separate HR and HRV estimators.** FFT HR is robust to secondary pulse
    extrema, whereas HRV fundamentally requires beat intervals.
 4. **Match HR reference timestamps, not values.** This provides equal sample
@@ -395,8 +435,8 @@ generalizability, or equivalence to Zephyr.
    begins immediately or persists. Neither imposes a universal maximum HR.
 7. **Keep generated artifacts together.** A dedicated directory improves
    provenance, portability, cleanup, and labelled-segment integration.
-8. **Run generation off the GUI thread.** Long ECG recordings and ODE
-   integration do not block interface event handling.
+8. **Run generation off the GUI thread.** Peak detection and HR/HRV estimation
+   on long ECG recordings do not block interface event handling.
 
 ## Implementation change record
 
@@ -413,6 +453,7 @@ generalizability, or equivalence to Zephyr.
 | 2026-09-24 | Grouped outputs under `synthetic_ppg/` | Kept waveform, RR, HR, and HRV provenance together and simplified cleanup and transfer. |
 | 2026-09-28 | Added history-gated, autocorrelation-supported second-harmonic correction | Fixed long and start-of-recording harmonic locks that could defeat recent-HR continuity while limiting false subharmonic selection; jzc17 large-error points fell from 154 to 19. |
 | 2026-09-29 | Changed HRV from a fixed 300-interval window to an expanding 30-300 interval window | Recordings shorter than 300 beats previously produced an empty HRV file; a 175 s jzc02 baseline now yields 144 estimates. |
+| 2026-10-15 | Replaced RK45 integration of the waveform model with its closed-form solution | The integrated pulse drifted against the ECG (0.34 beat, about 0.3 s, over the 2,198 s jzc02 session), so segments of one session needed different video offsets. The pulse now stays at 24.7% of every RR interval. Waveforms generated earlier must be regenerated; the PPG alignment step warns when a project's synthetic PPG drifts. RR intervals are unchanged. On jzc02, FFT HR changed by a median of 0.09 BPM (99th percentile 0.9 BPM, with isolated larger jumps where harmonic correction flips). HRV changed more: the pulse-interval RMSSD over the session fell from 59.6 to 49.9 ms (ECG RR: 65.4 ms), and windowed RMSSD changed by a median of 3.9 ms. The integration error had partly masked the model's smoothing of beat-to-beat intervals (see [Known limitations](#known-limitations-and-reporting-cautions)). |
 
 Changes after a study analysis begins should be treated as analysis-pipeline
 changes. Regenerate all affected outputs and record the software revision rather
@@ -423,7 +464,17 @@ than mixing artifacts produced by different rows of this table.
 - The synthetic morphology uses fixed default Gaussian parameters and is not
   fitted to an individual measured PPG.
 - Pulse transit time from ECG R peak to peripheral optical pulse is not modeled
-  as a subject-specific physiological delay.
+  as a subject-specific physiological delay. The pulse peaks at a fixed 24.7% of
+  each RR interval, so its delay after the R peak shortens as the heart rate
+  rises (about 0.25 s at 60 BPM, 0.14 s at 105 BPM). A real pulse delay changes
+  less, so the best video offset can differ by about 0.1 s between resting and
+  exercise segments.
+- For the same reason, the interval between two pulses is a weighted average
+  of consecutive RR intervals, $0.753\,RR_i + 0.247\,RR_{i+1}$. Pulse-interval
+  HRV is therefore smoothed: on jzc02, RMSSD was 49.9 ms from the synthetic
+  pulses against 65.4 ms from the ECG RR intervals, while SDNN was 125.5 against
+  128.6 ms. Report HRV computed from the ECG RR intervals when beat-to-beat
+  accuracy matters.
 - Min-max normalization removes absolute amplitude units.
 - ECG peak errors propagate into RR timing, PPG morphology, and HRV.
 - The exact Zephyr artifact correction and normal-beat classification are not
@@ -451,7 +502,9 @@ the study protocol rather than copied without verification:
 > threshold of four times the median absolute deviation of the filtered signal.
 > Consecutive R-peak intervals drove a two-Gaussian dynamical PPG model sampled
 > at 125 Hz. RR values changed at exact cumulative interval boundaries to avoid
-> sample-rounding drift, and the resulting waveform was min-max normalized.
+> sample-rounding drift, the model was evaluated in closed form so that each
+> pulse kept a constant position within its RR interval, and the resulting
+> waveform was min-max normalized.
 > Heart rate was estimated every second from overlapping 10-s windows using
 > smoothness-prior detrending, a 0.6-3.3 Hz band-pass, an oversampled FFT,
 > log-parabolic peak interpolation, and continuity- and

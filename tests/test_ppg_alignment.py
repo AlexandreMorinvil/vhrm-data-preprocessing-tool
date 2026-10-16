@@ -18,7 +18,10 @@ from app.ppg_alignment import (
     prepare_reference,
     roi_from_face,
     save_trace,
+    pool_windows,
     scan_lags,
+    window_correlations,
+    windowed_correlation,
 )
 from app.rppg import RPPG_METHODS, dominant_rate_bpm, estimate_pulse
 
@@ -100,6 +103,57 @@ class LagScanTests(unittest.TestCase):
         pulse[self.pulse_times > 30] = np.random.default_rng(3).normal(size=(self.pulse_times > 30).sum())
         scan = scan_lags(self.pulse_times, pulse, reference_t, reference, -4, 4, window=(0.0, 30.0))
         self.assertAlmostEqual(scan.best(), 2.0, delta=0.015)
+
+    def test_unreliable_windows_are_left_out(self) -> None:
+        reference_t, reference = prepare_reference(self.reference_times, self.reference)
+        pulse = self._pulse_with_offset(1.0)
+        noisy = self.pulse_times > 30
+        # Motion: a strong 2.6 Hz oscillation dominates the pulse in the second half.
+        pulse[noisy] = 5 * np.sin(2 * np.pi * 2.6 * self.pulse_times[noisy])
+        detected = np.ones(len(pulse), dtype=bool)
+
+        sums = windowed_correlation(self.pulse_times, pulse, FS, reference_t, reference, -3, 3,
+                                    window_sec=20, hop_sec=10, detected=detected)
+        self.assertEqual(sums.windows, 5)
+        self.assertEqual(sums.accepted, 2)  # 0-20 s and 10-30 s
+        self.assertAlmostEqual(sums.scan().best(), 1.0, delta=0.03)
+
+        detected[:] = False
+        lost = windowed_correlation(self.pulse_times, pulse, FS, reference_t, reference, -3, 3,
+                                    window_sec=20, hop_sec=10, detected=detected)
+        self.assertEqual(lost.accepted, 0)
+        self.assertFalse(lost.scan().valid)
+
+    def test_reliability_criteria_apply_after_scanning(self) -> None:
+        reference_t, reference = prepare_reference(self.reference_times, self.reference)
+        # A rPPG locked on 1.6 Hz: correlated with nothing, at the wrong heart rate.
+        pulse = np.sin(2 * np.pi * 1.6 * self.pulse_times)
+        lags, windows = window_correlations(self.pulse_times, pulse, FS, reference_t, reference, -3, 3,
+                                            window_sec=20, hop_sec=10)
+        self.assertEqual(len(windows), 5)
+        self.assertTrue(all(np.isfinite(window.correlation).any() for window in windows))
+        self.assertEqual(pool_windows(lags, windows).accepted, 0)
+        self.assertEqual(pool_windows(lags, windows, max_hr_difference_bpm=None).accepted, 5)
+        self.assertAlmostEqual(windows[0].video_hr, 96.0, delta=1.5)
+
+    def test_pooling_segments_at_different_heart_rates_resolves_the_beat_ambiguity(self) -> None:
+        offset = 1.3
+        segments = []
+        # Resting and exercise, perfectly periodic so each segment alone is ambiguous
+        # (their peaks coincide again only 20 s away, outside the search range).
+        for rate_hz in (1.0, 1.45):
+            reference_times = np.arange(-15, 75, 1 / 125.0)
+            reference_t, reference = prepare_reference(reference_times, np.sin(2 * np.pi * rate_hz * reference_times))
+            pulse = np.sin(2 * np.pi * rate_hz * (self.pulse_times - offset))
+            segments.append(windowed_correlation(self.pulse_times, pulse, FS, reference_t, reference, -4, 4))
+        single_ratios = [segment.scan().peak_ratio() for segment in segments]
+        self.assertLess(max(single_ratios), 1.02)
+
+        pooled = segments[0]
+        pooled.add(segments[1])
+        self.assertEqual(pooled.accepted, 6)
+        self.assertAlmostEqual(pooled.scan().best(), offset, delta=0.03)
+        self.assertGreater(pooled.scan().peak_ratio(), max(single_ratios) + 0.01)
 
     def test_no_overlap_gives_an_invalid_scan(self) -> None:
         scan = scan_lags(self.pulse_times, self._pulse_with_offset(0.0), np.array([500.0, 501.0]),

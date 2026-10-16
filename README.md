@@ -292,7 +292,20 @@ the offset from the video itself.
    back and **Full range** shows everything. Ctrl+drag pans and the wheel zooms
    time in both modes.
 5. Check other segments: the offset is kept when you change segment, so you can
-   see whether it also aligns them.
+   see whether it also aligns them. **Pool all estimated segments** (Search)
+   replaces the correlation with its average over every 30 s window of every
+   segment estimated for the camera (**Estimate all** first). It leaves out
+   windows where the face was lost or where the rPPG and PPG heart rates differ
+   by more than **Max HR difference** (3 bpm by default; changing it takes
+   effect at once). If no window passes, the graph pools every window where the
+   face was found instead, marked **unreliable**, and each segment lists the
+   video / PPG heart rate of its windows. That means the rPPG is not following
+   the pulse: try another method or camera before trusting the offset. In a single window the correlation peaks every heartbeat
+   with almost equal heights. Segments at different heart rates put those
+   neighbouring peaks at different offsets but share the true one, so pooling
+   makes it stand out; the peak buttons then work on the pooled curve. Below the
+   summary, each segment lists its own peak nearest the offset: they should
+   agree within about 0.1 s.
 6. **Apply to project …** stores the offset and rewrites the HR, ECG and
    synthetic PPG slices and the timing (`signal_anchor_datetime_utc`,
    `segment_start/end_datetime_utc`, `video_signal_offset_sec`) of every
@@ -326,8 +339,15 @@ Conventions and notes:
 - The heart rate of the rPPG and of the synthetic PPG are shown for the window;
   when they differ, the estimate is unreliable there (motion, lighting, face
   lost) and the window or segment should be changed.
-- After exercise the pulse transit time changes, so segments of one session can
-  differ by about 0.1–0.2 s; estimate the offset on calm segments.
+- The synthetic PPG places each pulse at a fixed fraction of its RR interval, so
+  its delay after the R peak shortens at high heart rates. Together with real
+  changes in pulse transit time, segments of one session can differ by up to
+  about 0.1 s; prefer calm (resting) segments.
+- Synthetic PPGs generated before 2026-10-15 drift against their own ECG peaks
+  (by about 0.3 s over a 35-minute session), so no single offset aligns every
+  segment. The section shows a warning for such a file: regenerate it in
+  **Synthetic PPG**, then apply the offset here, which re-slices every exported
+  segment.
 
 ## Cleaning up artifacts
 

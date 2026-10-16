@@ -34,7 +34,7 @@ import numpy as np
 from scipy import signal as sp_signal
 
 from .face_privacy import FacePrivacySettings, detect_faces_scored
-from .rppg import PULSE_BAND_HZ, bandpass, standardise
+from .rppg import PULSE_BAND_HZ, bandpass, dominant_rate_bpm, standardise
 
 log = logging.getLogger(__name__)
 
@@ -463,6 +463,12 @@ class LagScan:
     correlation: np.ndarray
     peaks: np.ndarray  # indices of local maxima
 
+    @classmethod
+    def from_curve(cls, lags: np.ndarray, correlation: np.ndarray) -> "LagScan":
+        peaks, _ = sp_signal.find_peaks(np.nan_to_num(correlation, nan=-2.0))
+        peaks = np.asarray([p for p in peaks if np.isfinite(correlation[p])], dtype=int)
+        return cls(lags=lags, correlation=correlation, peaks=peaks)
+
     @property
     def valid(self) -> bool:
         return bool(np.isfinite(self.correlation).any())
@@ -544,6 +550,144 @@ def scan_lags(pulse_times: np.ndarray, pulse: np.ndarray,
             denominator = np.sqrt((a * a).sum() * (b * b).sum())
             if denominator > 0:
                 correlation[index] = float((a * b).sum() / denominator)
-    peaks, _ = sp_signal.find_peaks(np.nan_to_num(correlation, nan=-2.0))
-    peaks = np.asarray([p for p in peaks if np.isfinite(correlation[p])], dtype=int)
-    return LagScan(lags=lags, correlation=correlation, peaks=peaks)
+    return LagScan.from_curve(lags, correlation)
+
+
+# ---------------------------------------------------------------------------
+# Pooling windows and segments
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CorrelationSum:
+    """Correlation curves of several analysis windows, averaged per lag.
+
+    The pulse is nearly periodic, so a single window has a peak every heartbeat
+    with almost the same height. Windows (and segments) at different heart
+    rates put those neighbouring peaks at different offsets, while the true
+    offset is common to all of them: averaging makes it stand out.
+    """
+
+    lags: np.ndarray
+    total: np.ndarray       # sum of the accepted windows' correlation per lag
+    count: np.ndarray       # accepted windows with a correlation at each lag
+    accepted: int = 0
+    windows: int = 0
+
+    @classmethod
+    def empty(cls, lags: np.ndarray) -> "CorrelationSum":
+        return cls(lags=lags, total=np.zeros(len(lags)), count=np.zeros(len(lags), dtype=int))
+
+    def add_curve(self, correlation: np.ndarray) -> None:
+        finite = np.isfinite(correlation)
+        self.total[finite] += correlation[finite]
+        self.count[finite] += 1
+
+    def add(self, other: "CorrelationSum") -> None:
+        if len(other.lags) != len(self.lags) or not np.allclose(other.lags, self.lags):
+            raise ValueError("Correlation sums computed on different offset grids")
+        self.total += other.total
+        self.count += other.count
+        self.accepted += other.accepted
+        self.windows += other.windows
+
+    def scan(self) -> LagScan:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            mean = np.where(self.count > 0, self.total / np.maximum(self.count, 1), np.nan)
+        return LagScan.from_curve(self.lags, mean)
+
+
+@dataclass
+class WindowCorrelation:
+    """Correlation curve of one analysis window, with what tells whether to trust it."""
+
+    start: float
+    end: float
+    face_coverage: float     # fraction of the window's frames where the face was found
+    video_hr: float          # dominant rate of the rPPG (bpm)
+    reference_hr: float      # dominant rate of the reference over the same time (bpm)
+    correlation: np.ndarray  # per lag; NaN where the reference does not cover the window
+
+    def reliable(self, max_hr_difference_bpm: Optional[float] = 3.0,
+                 min_face_coverage: float = 0.9) -> bool:
+        """Face found in most frames and, unless *max_hr_difference_bpm* is None,
+        rPPG and reference heart rates within that difference."""
+        if self.face_coverage < min_face_coverage or not np.isfinite(self.correlation).any():
+            return False
+        if max_hr_difference_bpm is None:
+            return True
+        return bool(np.isfinite(self.video_hr) and np.isfinite(self.reference_hr)
+                    and abs(self.video_hr - self.reference_hr) <= max_hr_difference_bpm)
+
+
+def window_correlations(pulse_times: np.ndarray, pulse: np.ndarray, fs: float,
+                        reference_times: np.ndarray, reference: np.ndarray,
+                        lag_min: float, lag_max: float, step: float = 0.02, *,
+                        window_sec: float = 30.0, hop_sec: float = 15.0,
+                        detected: Optional[np.ndarray] = None) -> tuple[np.ndarray, list[WindowCorrelation]]:
+    """Offset grid and the correlation of every analysis window of one segment.
+
+    The segment is cut into *window_sec* windows every *hop_sec*. Every window
+    is scanned, so the reliability criteria (:meth:`WindowCorrelation.reliable`)
+    can be changed afterwards without scanning again. The search range is a few
+    seconds, much shorter than heart-rate changes, so the reference heart rate is
+    measured over the same time without shifting it.
+    """
+    pulse_times = np.asarray(pulse_times, dtype=np.float64)
+    pulse = np.asarray(pulse, dtype=np.float64)
+    reference_times = np.asarray(reference_times, dtype=np.float64)
+    reference = np.asarray(reference, dtype=np.float64)
+    lag_min, lag_max = sorted((float(lag_min), float(lag_max)))
+    lags = np.arange(lag_min, lag_max + step / 2, step)
+    windows: list[WindowCorrelation] = []
+    if len(pulse_times) < 2 or len(reference_times) < 2:
+        return lags, windows
+    reference_rate = 1.0 / float(np.median(np.diff(reference_times)))
+    start, end = float(pulse_times[0]), float(pulse_times[-1]) + 1.0 / fs  # the last frame lasts 1/fs
+    span = min(window_sec, end - start)
+    for window_start in np.arange(start, end - span + 1e-6, hop_sec):
+        window = (float(window_start), float(window_start + span))
+        in_window = (pulse_times >= window[0]) & (pulse_times <= window[1])
+        in_reference = (reference_times >= window[0]) & (reference_times <= window[1])
+        scan = scan_lags(pulse_times, pulse, reference_times, reference, lag_min, lag_max,
+                         step=step, window=window)
+        windows.append(WindowCorrelation(
+            start=window[0], end=window[1],
+            face_coverage=float(np.mean(np.asarray(detected)[in_window])) if detected is not None else 1.0,
+            video_hr=dominant_rate_bpm(pulse[in_window], fs),
+            reference_hr=dominant_rate_bpm(reference[in_reference], reference_rate),
+            correlation=scan.correlation,
+        ))
+    return lags, windows
+
+
+def pool_windows(lags: np.ndarray, windows: list[WindowCorrelation], *,
+                 max_hr_difference_bpm: Optional[float] = 3.0,
+                 min_face_coverage: float = 0.9) -> CorrelationSum:
+    """Average of the reliable windows (see :meth:`WindowCorrelation.reliable`)."""
+    result = CorrelationSum.empty(lags)
+    for window in windows:
+        result.windows += 1
+        if window.reliable(max_hr_difference_bpm, min_face_coverage):
+            result.add_curve(window.correlation)
+            result.accepted += 1
+    return result
+
+
+def windowed_correlation(pulse_times: np.ndarray, pulse: np.ndarray, fs: float,
+                         reference_times: np.ndarray, reference: np.ndarray,
+                         lag_min: float, lag_max: float, step: float = 0.02, *,
+                         window_sec: float = 30.0, hop_sec: float = 15.0,
+                         max_hr_difference_bpm: Optional[float] = 3.0,
+                         detected: Optional[np.ndarray] = None,
+                         min_face_coverage: float = 0.9) -> CorrelationSum:
+    """Average correlation of the reliable analysis windows of one segment.
+
+    A window is used only when the face was found in most of its frames and the
+    heart rate of the rPPG matches that of the reference over the same time
+    (they differ when motion or lighting dominate the rPPG).
+    """
+    lags, windows = window_correlations(pulse_times, pulse, fs, reference_times, reference,
+                                        lag_min, lag_max, step, window_sec=window_sec,
+                                        hop_sec=hop_sec, detected=detected)
+    return pool_windows(lags, windows, max_hr_difference_bpm=max_hr_difference_bpm,
+                        min_face_coverage=min_face_coverage)

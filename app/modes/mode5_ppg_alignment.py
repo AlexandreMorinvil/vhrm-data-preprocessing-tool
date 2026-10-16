@@ -15,13 +15,14 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from PyQt6.QtCore import QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QHBoxLayout,
     QInputDialog,
@@ -31,6 +32,8 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -38,6 +41,7 @@ from PyQt6.QtWidgets import (
 from ..ffmpeg_utils import FFmpegWorker, find_ffmpeg
 from ..ppg_alignment import (
     Cancelled,
+    CorrelationSum,
     FaceTrace,
     FaceTraceSettings,
     LagScan,
@@ -47,7 +51,10 @@ from ..ppg_alignment import (
     load_trace,
     prepare_reference,
     save_trace,
+    WindowCorrelation,
+    pool_windows,
     scan_lags,
+    window_correlations,
 )
 from ..rppg import RPPG_METHODS, dominant_rate_bpm, estimate_pulse
 from ..signal_offset import (
@@ -62,6 +69,7 @@ from ..signal_offset import (
 from ..state import (
     LabelInterval, ProjectState, is_other_dataset, load_labelled_segments_manifest, load_sidecar,
 )
+from ..synthetic_ppg import pulse_phase_drift
 from ..widgets.alignment_plot import AlignmentPlot
 from ..widgets.frame_preview import MultiCameraPlayer
 from ..widgets.layout import ModeWorkspace
@@ -71,6 +79,10 @@ log = logging.getLogger(__name__)
 _ROI_PREFIX = "Face ROI"
 _SCAN_STEP_SEC = 0.02
 _HR_MISMATCH_BPM = 8.0
+_POOL_WINDOW_SEC = 30.0
+_POOL_HOP_SEC = 15.0
+_POOL_HR_BPM = 3.0
+_DRIFT_WARNING_BEATS = 0.05
 
 
 class _Segment:
@@ -95,6 +107,43 @@ class _Segment:
         if not found:
             found = [(path.stem, path) for path in sorted(self.folder.glob("cam*.mp4"))]
         return found
+
+
+class _ScrollingLabel(QScrollArea):
+    """Shows a label at its text height, up to ``max_lines``, then scrolls."""
+
+    def __init__(self, label: QLabel, max_lines: int):
+        super().__init__()
+        self._label = label
+        self._max_height = label.fontMetrics().lineSpacing() * max_lines
+        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.setWidget(label)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        # A new text changes the label's height hint: resize to follow it.
+        self.viewport().installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self.viewport() and event.type() == QEvent.Type.LayoutRequest:
+            self.updateGeometry()
+        return super().eventFilter(watched, event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if event.size().width() != event.oldSize().width():
+            self.updateGeometry()  # wrapping, hence the text height, depends on the width
+
+    def sizeHint(self) -> QSize:
+        width = self.viewport().width() or self._label.sizeHint().width()
+        height = self._label.heightForWidth(width)
+        if height < 0:
+            height = self._label.sizeHint().height()
+        return QSize(super().sizeHint().width(), min(height, self._max_height))
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, min(self.sizeHint().height(), self._label.fontMetrics().lineSpacing()))
 
 
 def _default_camera(labels: list[str]) -> int:
@@ -125,11 +174,23 @@ class PpgAlignmentWidget(QWidget):
         self._window: Optional[tuple[float, float]] = None
         self._reference_cache: dict[str, tuple[float, np.ndarray, np.ndarray]] = {}
         self._visible_views: set[str] = set()
+        self._selected_camera = ""
         self._new_segment = False
         self._estimate_worker: Optional[FFmpegWorker] = None
         self._estimate_failures: list[str] = []
         self._apply_worker: Optional[FFmpegWorker] = None
         self._apply_report = None
+        # Pooled correlation: every window of every segment, keyed by everything
+        # it depends on (None when that segment failed); the segments shown with
+        # their pooled sums; whether the heart-rate check had to be dropped.
+        self._pool_windows: dict[tuple, Optional[tuple[np.ndarray, list[WindowCorrelation]]]] = {}
+        self._pool_errors: dict[tuple, str] = {}
+        self._pool_segments: list[tuple[str, tuple, Optional[CorrelationSum]]] = []
+        self._pool_fallback = False
+        self._pool_missing = 0
+        self._pool_worker: Optional[FFmpegWorker] = None
+        self._pool_results: dict[tuple, Optional[tuple[np.ndarray, list[WindowCorrelation]]]] = {}
+        self._drift_cache: dict[tuple, float] = {}
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -253,13 +314,37 @@ class PpgAlignmentWidget(QWidget):
         full_btn.clicked.connect(lambda: self._plot.show_full_range())
         window_row.addWidget(full_btn, 1, 1)
         search_lay.addLayout(window_row)
-        hint = QLabel(
-            "The correlation uses the shaded window of the graph; drag its edges to "
-            "restrict it to a calm part of the segment."
+        self._pool_cb = QCheckBox("Pool all estimated segments")
+        self._pool_cb.setToolTip(
+            f"Average the correlation of every {_POOL_WINDOW_SEC:.0f} s window of every segment estimated\n"
+            "for this camera. Windows where the face was lost or the rPPG and PPG heart rates differ\n"
+            "by more than the maximum heart-rate difference are left out.\n\n"
+            "One window has a correlation peak every heartbeat, all of similar height. Segments at\n"
+            "different heart rates put those neighbouring peaks at different offsets, while the true\n"
+            "offset is the same for all of them, so it stands out once they are pooled."
         )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #8a8a8a;")
-        search_lay.addWidget(hint)
+        self._pool_cb.toggled.connect(self._on_pool_toggled)
+        search_lay.addWidget(self._pool_cb)
+        hr_row = QHBoxLayout()
+        hr_row.addWidget(QLabel("Max HR difference:"))
+        self._pool_hr_spin = QDoubleSpinBox()
+        self._pool_hr_spin.setRange(1.0, 60.0)
+        self._pool_hr_spin.setDecimals(0)
+        self._pool_hr_spin.setSuffix(" bpm")
+        self._pool_hr_spin.setValue(_POOL_HR_BPM)
+        self._pool_hr_spin.setToolTip(
+            "A pooled window is used only when the heart rate of its rPPG is within this difference of\n"
+            "the synthetic PPG's. Raise it when the rPPG is noisy and few windows pass."
+        )
+        self._pool_hr_spin.setEnabled(False)
+        self._pool_hr_spin.valueChanged.connect(self._schedule_scan)
+        hr_row.addWidget(self._pool_hr_spin, 1)
+        search_lay.addLayout(hr_row)
+        self._search_hint = QLabel("")
+        self._search_hint.setWordWrap(True)
+        self._search_hint.setStyleSheet("color: #8a8a8a;")
+        search_lay.addWidget(self._search_hint)
+        self._update_search_hint()
         ws.add_section("Search", search_box)
 
         # -- offset -----------------------------------------------------------------
@@ -348,10 +433,16 @@ class PpgAlignmentWidget(QWidget):
         plot_area = QWidget()
         plot_lay = QVBoxLayout(plot_area)
         plot_lay.setContentsMargins(0, 0, 0, 0)
+        self._reference_warning = QLabel("")
+        self._reference_warning.setWordWrap(True)
+        self._reference_warning.setStyleSheet("color: #d08000;")
+        self._reference_warning.setVisible(False)
+        plot_lay.addWidget(self._reference_warning)
         self._metrics_label = QLabel("Select a segment and estimate its rPPG.")
         self._metrics_label.setWordWrap(True)
         self._metrics_label.setStyleSheet("font-family: Consolas, 'Courier New', monospace;")
-        plot_lay.addWidget(self._metrics_label)
+        # Pooling lists every window: past a few lines the text scrolls.
+        plot_lay.addWidget(_ScrollingLabel(self._metrics_label, max_lines=10))
         self._plot = AlignmentPlot()
         plot_lay.addWidget(self._plot, 1)
         ws.add_work(plot_area, 420)
@@ -485,6 +576,7 @@ class PpgAlignmentWidget(QWidget):
         self._update_segment_marks()  # the marks depend on the camera, known only now
         if not self._visible_views:
             self._visible_views = {self._camera_label(), _ROI_PREFIX}
+        self._follow_camera()
         self._window = None
         self._new_segment = True
         self._plot.set_segment_duration(self._segment.duration)
@@ -494,9 +586,18 @@ class PpgAlignmentWidget(QWidget):
         self._update_applied_label()
 
     def _on_camera_changed(self, *_args) -> None:
+        self._follow_camera()
         self._update_segment_marks()
         if self._segment is not None:
             self._load_trace()
+
+    def _follow_camera(self) -> None:
+        """Show the selected camera's video in place of the previously selected one."""
+        camera = self._camera_label()
+        if self._selected_camera in self._visible_views and camera not in self._visible_views:
+            self._visible_views.discard(self._selected_camera)
+            self._visible_views.add(camera)
+        self._selected_camera = camera
 
     # ------------------------------------------------------------------ video views
     def _rebuild_views(self, include_roi: bool = True) -> None:
@@ -550,14 +651,52 @@ class PpgAlignmentWidget(QWidget):
         self._plot.set_cursor(frame / fps if fps > 0 else 0.0)
 
     # ------------------------------------------------------------------ signals
-    def _reference_source(self) -> Optional[Path]:
+    def _reference_source(self, segment: Optional[_Segment] = None) -> Optional[Path]:
+        segment = segment or self._segment
         if self.state.synthetic_ppg_path and Path(self.state.synthetic_ppg_path).exists():
             return Path(self.state.synthetic_ppg_path)
-        if self._segment is not None:
-            relative = self._segment.meta.get("synthetic_ppg_path") or (self._segment.meta.get("ppg_files") or [None])[0]
-            if relative and (self._segment.folder / relative).exists():
-                return self._segment.folder / relative
+        if segment is not None:
+            relative = segment.meta.get("synthetic_ppg_path") or (segment.meta.get("ppg_files") or [None])[0]
+            if relative and (segment.folder / relative).exists():
+                return segment.folder / relative
         return None
+
+    def _peaks_source(self, source: Path, segment: Optional[_Segment]) -> Optional[Path]:
+        """ECG peak file the synthetic PPG *source* was generated from."""
+        if self.state.synthetic_ppg_path and source == Path(self.state.synthetic_ppg_path):
+            candidate = Path(self.state.synthetic_rr_path) if self.state.synthetic_rr_path else None
+        elif segment is not None and segment.meta.get("synthetic_rr_path"):
+            candidate = segment.folder / segment.meta["synthetic_rr_path"]
+        else:
+            candidate = source.with_name("synthetic_ppg_rr.csv")
+        return candidate if candidate is not None and candidate.exists() else None
+
+    def _check_reference_drift(self, source: Path, epoch: np.ndarray, values: np.ndarray) -> None:
+        """Warn when the synthetic PPG drifts against its ECG peaks (generated before the fix)."""
+        peaks_path = self._peaks_source(source, self._segment)
+        drift = float("nan")
+        if peaks_path is not None:
+            key = (str(source), source.stat().st_mtime, str(peaks_path), peaks_path.stat().st_mtime)
+            drift = self._drift_cache.get(key, float("nan"))
+            if key not in self._drift_cache:
+                try:
+                    stamps = pd.to_datetime(pd.read_csv(peaks_path, usecols=["timestamp_utc"])["timestamp_utc"],
+                                            format="mixed", utc=True, errors="coerce")
+                    peaks_epoch = (stamps - pd.Timestamp(0, tz="UTC")).dt.total_seconds().to_numpy(np.float64)
+                    drift = pulse_phase_drift(epoch, values, peaks_epoch[np.isfinite(peaks_epoch)])
+                except Exception:
+                    log.exception("Cannot check the synthetic PPG timing against %s", peaks_path)
+                self._drift_cache[key] = drift
+        if np.isfinite(drift) and drift > _DRIFT_WARNING_BEATS:
+            self._reference_warning.setText(
+                f"⚠ This synthetic PPG drifts by {drift:.2f} beat against the ECG peaks it was made "
+                "from: it was generated by an earlier version, so no single offset aligns every "
+                "segment. Regenerate it in Synthetic PPG, then apply the offset here (applying "
+                "re-slices every exported segment)."
+            )
+            self._reference_warning.setVisible(True)
+        else:
+            self._reference_warning.setVisible(False)
 
     def _read_reference(self, path: Path) -> tuple[np.ndarray, np.ndarray]:
         mtime = path.stat().st_mtime
@@ -574,28 +713,37 @@ class PpgAlignmentWidget(QWidget):
         self._reference_cache[str(path)] = (mtime, epoch, values)
         return epoch, values
 
+    def _segment_reference(self, segment: _Segment, margin: float):
+        """Raw synthetic PPG around *segment* in segment time: (source, times, values) or None."""
+        source = self._reference_source(segment)
+        start = segment_reference_start(segment.meta, segment.interval, self.state)
+        if source is None or start is None:
+            return None
+        epoch, values = self._read_reference(source)
+        start_epoch = start.timestamp()
+        keep = (epoch >= start_epoch - margin) & (epoch <= start_epoch + segment.duration + margin)
+        return source, epoch[keep] - start_epoch, values[keep]
+
     def _load_reference(self) -> None:
         self._reference_t = np.empty(0)
         self._reference = np.empty(0)
         self._reference_margin = float("inf")  # nothing more to load unless a source is found
         segment = self._segment
-        source = self._reference_source()
-        start = segment_reference_start(segment.meta, segment.interval, self.state) if segment else None
-        if segment is None or source is None or start is None:
-            self._plot.set_reference(self._reference_t, self._reference)
-            return
+        self._reference_warning.setVisible(False)
         try:
-            epoch, values = self._read_reference(source)
+            loaded = self._segment_reference(segment, self._search_margin()) if segment else None
         except Exception as exc:
             log.exception("Cannot read synthetic PPG")
-            self._metrics_label.setText(f"Cannot read the synthetic PPG {source.name}: {exc}")
+            self._metrics_label.setText(f"Cannot read the synthetic PPG: {exc}")
             return
-        start_epoch = start.timestamp()
-        margin = self._search_margin()
-        self._reference_margin = margin
-        keep = (epoch >= start_epoch - margin) & (epoch <= start_epoch + segment.duration + margin)
-        self._reference_t, self._reference = prepare_reference(epoch[keep] - start_epoch, values[keep])
+        if loaded is None:
+            self._plot.set_reference(self._reference_t, self._reference)
+            return
+        source, times, values = loaded
+        self._reference_margin = self._search_margin()
+        self._reference_t, self._reference = prepare_reference(times, values)
         self._plot.set_reference(self._reference_t, self._reference)
+        self._check_reference_drift(source, *self._read_reference(source))
 
     def _load_trace(self) -> None:
         self._trace = None
@@ -616,6 +764,9 @@ class PpgAlignmentWidget(QWidget):
             self._estimate_label.setText(
                 "Not estimated yet for this camera." if self._segment is not None else ""
             )
+            if self._pool_cb.isChecked():  # the other segments may be estimated
+                self._schedule_scan()
+                return
             self._scan = None
             self._plot.set_scan(None)
             self._update_metrics()
@@ -647,6 +798,9 @@ class PpgAlignmentWidget(QWidget):
     def _run_scan(self) -> None:
         if self._segment is not None and self._search_margin() > self._reference_margin:
             self._load_reference()  # the search range grew beyond the loaded signal
+        if self._pool_cb.isChecked():
+            self._run_pooled_scan()
+            return
         if self._pulse is None or not len(self._reference_t):
             self._scan = None
             self._plot.set_scan(None)
@@ -659,12 +813,196 @@ class PpgAlignmentWidget(QWidget):
         self._plot.set_scan(self._scan)
         self._update_metrics()
 
+    # ------------------------------------------------------------------ pooled scan
+    def _update_search_hint(self) -> None:
+        if self._pool_cb.isChecked():
+            self._search_hint.setText(
+                "The correlation pools every segment estimated for this camera; the shaded "
+                "window is not used."
+            )
+        else:
+            self._search_hint.setText(
+                "The correlation uses the shaded window of the graph; drag its edges to "
+                "restrict it to a calm part of the segment."
+            )
+
+    def _on_pool_toggled(self, on: bool) -> None:
+        self._pool_hr_spin.setEnabled(on)
+        self._update_search_hint()
+        self._run_scan()
+
+    def _pool_jobs(self) -> tuple[list[tuple[str, tuple]], list[dict]]:
+        """(name, key) of every estimated segment in order, and the jobs not computed yet."""
+        cache_dir = self._cache_dir()
+        method = self._method_combo.currentText()
+        lag_range = (round(self._lag_min.value(), 3), round(self._lag_max.value(), 3))
+        margin = self._search_margin()
+        order: list[tuple[str, tuple]] = []
+        jobs: list[dict] = []
+        self._pool_missing = 0
+        for segment in self._segments:
+            video = dict(segment.cameras()).get(self._camera_label())
+            trace_key = self._key(segment)
+            trace_path = cache_paths(cache_dir, trace_key)[0] if cache_dir is not None else None
+            if video is None or trace_path is None or not trace_path.exists():
+                self._pool_missing += 1
+                continue
+            source = self._reference_source(segment)
+            start = segment_reference_start(segment.meta, segment.interval, self.state)
+            if source is None or start is None:
+                self._pool_missing += 1
+                continue
+            key = (segment.folder.name, trace_key, method, lag_range, trace_path.stat().st_mtime_ns,
+                   str(source), source.stat().st_mtime, start.timestamp())
+            order.append((segment.folder.name, key))
+            if key in self._pool_windows:
+                continue
+            try:
+                _source, times, values = self._segment_reference(segment, margin)
+            except Exception as exc:
+                log.exception("Cannot read synthetic PPG")
+                self._pool_windows[key] = None
+                self._pool_errors[key] = str(exc)
+                continue
+            jobs.append({"key": key, "video": str(video), "trace_key": trace_key,
+                         "reference_t": times, "reference": values})
+        return order, jobs
+
+    def _run_pooled_scan(self) -> None:
+        if self._pool_worker is not None:
+            return  # _on_pool_finished runs the scan again with the current settings
+        order, jobs = self._pool_jobs()
+        if jobs:
+            self._metrics_label.setText(f"Pooling {len(jobs)} segment(s)…")
+            self._pool_results = {}
+            worker = FFmpegWorker(
+                self._pool_job, jobs=jobs, cache_dir=self._cache_dir(), settings=self._trace_settings(),
+                method=self._method_combo.currentText(),
+                lag_range=(self._lag_min.value(), self._lag_max.value()),
+            )
+            worker.progress.connect(lambda _value, message: self._metrics_label.setText(message))
+            worker.finished.connect(self._on_pool_finished)
+            self._pool_worker = worker
+            worker.start()
+            return
+        def pooled(max_hr_difference_bpm):
+            return [(name, key, pool_windows(*self._pool_windows[key], max_hr_difference_bpm=max_hr_difference_bpm)
+                     if self._pool_windows.get(key) is not None else None) for name, key in order]
+
+        self._pool_segments = pooled(self._pool_hr_spin.value())
+        self._pool_fallback = False
+        if not any(segment_sum.accepted for _name, _key, segment_sum in self._pool_segments if segment_sum):
+            # Rather than an empty graph, show every window where the face was found
+            # (flagged as unreliable in the metrics).
+            fallback = pooled(None)
+            if any(segment_sum.accepted for _name, _key, segment_sum in fallback if segment_sum):
+                self._pool_segments = fallback
+                self._pool_fallback = True
+        sums = [segment_sum for _name, _key, segment_sum in self._pool_segments if segment_sum is not None]
+        if sums:
+            total = CorrelationSum.empty(sums[0].lags)
+            for segment_sum in sums:
+                total.add(segment_sum)
+            self._scan = total.scan()
+        else:
+            self._scan = None
+        self._plot.set_scan(self._scan)
+        self._update_metrics()
+
+    def _pool_job(self, *, jobs, cache_dir, settings, method, lag_range, worker):
+        for number, job in enumerate(jobs):
+            if worker.is_cancelled:
+                return
+            worker.progress.emit(int(100 * number / len(jobs)),
+                                 f"Pooling segment {number + 1}/{len(jobs)} ({job['key'][0]})…")
+            try:
+                trace = load_trace(cache_dir, job["trace_key"], job["video"], settings)
+                if trace is None:
+                    raise RuntimeError("the rPPG estimate is out of date; estimate this segment again")
+                pulse = estimate_pulse(trace.rgb, trace.fs, method)
+                reference_t, reference = prepare_reference(job["reference_t"], job["reference"])
+                self._pool_results[job["key"]] = window_correlations(
+                    trace.times, pulse, trace.fs, reference_t, reference, *lag_range, step=_SCAN_STEP_SEC,
+                    window_sec=_POOL_WINDOW_SEC, hop_sec=_POOL_HOP_SEC, detected=trace.detected,
+                )
+            except Exception as exc:
+                log.exception("Pooling failed for %s", job["key"][0])
+                self._pool_results[job["key"]] = None
+                self._pool_errors[job["key"]] = str(exc)
+
+    def _on_pool_finished(self, ok: bool, message: str) -> None:
+        self._pool_worker = None
+        self._pool_windows.update(self._pool_results)
+        self._pool_results = {}
+        if not ok:
+            self._metrics_label.setText(f"Pooling failed: {message}")
+            return
+        if self._pool_cb.isChecked():
+            self._run_scan()  # computes what changed meanwhile, or shows the result
+
+    def _pooled_metrics(self) -> str:
+        names = [name for name, _key, _sum in self._pool_segments]
+        if not names:
+            return ("No segment is estimated for this camera yet: estimate them (Estimate all) "
+                    "to pool their correlation.")
+        parts = [f"Offset {self._offset:+.3f} s"]
+        if self._scan is not None and self._scan.valid:
+            here = self._scan.at(self._offset)
+            parts.append(f"pooled r = {here:.2f}" if np.isfinite(here) else "r = n/a (outside the search range)")
+            parts.append(
+                f"best {self._scan.best():+.3f} s (r = {np.nanmax(self._scan.correlation):.2f}, "
+                f"{self._scan.peak_ratio():.2f}× next peak)"
+            )
+        lines = ["  |  ".join(parts)]
+        sums = [segment_sum for _name, _key, segment_sum in self._pool_segments if segment_sum is not None]
+        accepted = sum(segment_sum.accepted for segment_sum in sums)
+        windows = sum(segment_sum.windows for segment_sum in sums)
+        tolerance = self._pool_hr_spin.value()
+        if self._pool_fallback:
+            lines.append(
+                f"⚠ No window passed the heart-rate check (±{tolerance:.0f} bpm): the curve pools all "
+                f"{accepted} of {windows} windows where the face was found and is UNRELIABLE. The rPPG does "
+                "not follow the heart rate here (video / PPG rates per window below): try another method or "
+                "camera, or raise Max HR difference."
+            )
+        else:
+            lines.append(
+                f"Pooled {accepted} of {windows} windows ({_POOL_WINDOW_SEC:.0f} s) from {len(names)} "
+                f"segment(s); windows where the face was lost or the heart rates differ by more than "
+                f"{tolerance:.0f} bpm are left out."
+            )
+        if self._pool_missing:
+            lines[-1] += f" {self._pool_missing} segment(s) not estimated for this camera."
+        width = max(len(name) for name in names)
+        for name, key, segment_sum in self._pool_segments:
+            if segment_sum is None:
+                lines.append(f"  {name:<{width}}  failed: {self._pool_errors.get(key, 'unknown error')}")
+                continue
+            counts = f"{segment_sum.accepted:>2}/{segment_sum.windows:<2} windows"
+            scan = segment_sum.scan()
+            if not scan.valid or not len(scan.peaks):
+                lines.append(f"  {name:<{width}}  {counts}  no usable window")
+            else:
+                peaks = scan.peak_lags
+                nearest = float(peaks[np.argmin(np.abs(peaks - self._offset))])
+                lines.append(f"  {name:<{width}}  {counts}  peak nearest the offset {nearest:+.2f} s, "
+                             f"best {scan.best():+.2f} s")
+            _lags, windows = self._pool_windows[key]
+            if self._pool_fallback or not any(window.reliable(tolerance) for window in windows):
+                rates = ", ".join(f"{window.video_hr:.0f}/{window.reference_hr:.0f}" for window in windows)
+                lines.append(f"  {'':<{width}}  HR video/PPG (bpm): {rates}")
+        return "\n".join(lines)
+
     def _window_bounds(self) -> tuple[float, float]:
         if self._window is not None:
             return self._window
         return 0.0, self._segment.duration if self._segment else 0.0
 
     def _update_metrics(self) -> None:
+        if self._pool_cb.isChecked():
+            if self._pool_worker is None:
+                self._metrics_label.setText(self._pooled_metrics())
+            return
         if self._segment is None:
             return
         if not len(self._reference_t):
@@ -728,7 +1066,11 @@ class PpgAlignmentWidget(QWidget):
 
     def _require_scan(self) -> bool:
         if self._scan is None or not self._scan.valid:
-            QMessageBox.information(self, "PPG alignment", "Estimate the rPPG of this segment first.")
+            QMessageBox.information(
+                self, "PPG alignment",
+                "Estimate the rPPG of some segments first (pooling needs at least one usable window)."
+                if self._pool_cb.isChecked() else "Estimate the rPPG of this segment first.",
+            )
             return False
         return True
 
@@ -785,6 +1127,24 @@ class PpgAlignmentWidget(QWidget):
 
     def _estimate_record(self) -> dict:
         record = {"note_source": self._offset_note}
+        if self._pool_cb.isChecked():
+            if self._scan is not None and self._scan.valid:
+                used = [(name, segment_sum) for name, _key, segment_sum in self._pool_segments
+                        if segment_sum is not None and segment_sum.accepted]
+                record.update({
+                    "segment": "pooled",
+                    "segments": [name for name, _sum in used],
+                    "windows": sum(segment_sum.accepted for _name, segment_sum in used),
+                    "window_length_sec": _POOL_WINDOW_SEC,
+                    # None: no window passed the check, so every window with the face was used.
+                    "max_hr_difference_bpm": None if self._pool_fallback else self._pool_hr_spin.value(),
+                    "camera": self._camera_label(),
+                    "method": self._method_combo.currentText(),
+                    "correlation": round(self._scan.at(self._offset), 4),
+                    "best_offset_sec": self._scan.best(),
+                    "best_correlation": round(float(np.nanmax(self._scan.correlation)), 4),
+                })
+            return record
         if self._segment is not None and self._scan is not None and self._scan.valid:
             start, end = self._window_bounds()
             record.update({
@@ -803,7 +1163,12 @@ class PpgAlignmentWidget(QWidget):
             return
         segments = [s for s in self._segments if (s.folder / "meta.json").exists()]
         default_note = self._offset_note
-        if self._segment is not None and self._offset_note in ("best", "peak", "manual"):
+        if self._pool_cb.isChecked() and self._offset_note in ("best", "peak", "manual"):
+            pooled = sum(1 for _name, _key, segment_sum in self._pool_segments
+                         if segment_sum is not None and segment_sum.accepted)
+            default_note = (f"{self._offset_note} on {pooled} pooled segment(s) "
+                            f"({self._camera_label()}, {self._method_combo.currentText()})")
+        elif self._segment is not None and self._offset_note in ("best", "peak", "manual"):
             default_note = (f"{self._offset_note} on {self._segment.folder.name} "
                             f"({self._camera_label()}, {self._method_combo.currentText()})")
         note, ok = QInputDialog.getText(
