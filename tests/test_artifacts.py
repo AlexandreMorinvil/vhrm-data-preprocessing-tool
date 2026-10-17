@@ -375,18 +375,22 @@ class ArtifactsWidgetTests(ArtifactTestCase):
         self.assertEqual(len(widget._result.done), 1)
         self.assertTrue((self.base / "jzc11_artifacts" / "cam1_Front_final.mp4").exists())
         widget._rescan()
-        self.assertFalse(widget._category_checks[FULL_VIDEOS].isEnabled())
+        check = widget._category_checks[FULL_VIDEOS]
+        self.assertIn("none found", check.text())
+        self.assertTrue(check.isEnabled())
+        check.setChecked(False)
+        self.assertFalse(check.isChecked())
 
     def test_restore_mode_lists_the_artifacts_folder_and_moves_back(self):
         artifacts_dir = self.base / "jzc11_artifacts"
         move_artifacts(self.found()[FULL_VIDEOS], self.dataset, artifacts_dir)
         _write(artifacts_dir / "notes.txt")
         widget = self.widget()
-        self.assertFalse(widget._category_checks[FULL_VIDEOS].isEnabled())
+        self.assertIn("none found", widget._category_checks[FULL_VIDEOS].text())
 
         widget._restore_radio.setChecked(True)
 
-        self.assertTrue(widget._category_checks[FULL_VIDEOS].isEnabled())
+        self.assertIn("1 file(s)", widget._category_checks[FULL_VIDEOS].text())
         self.assertEqual([item.relative for item in widget._selected_files()], [Path("cam1_Front_final.mp4")])
         self.assertIn("Restore 1 file(s)", widget._run_btn.text())
         self.assertEqual(widget._destination_caption.text(), "Artifacts folder:")

@@ -304,7 +304,8 @@ class ArtifactsWidget(QWidget):
                 check.setText(f"{CATEGORY_TITLES[category]} — {len(files)} file(s), {size}")
             else:
                 check.setText(f"{CATEGORY_TITLES[category]} — none {where}")
-            check.setEnabled(bool(files) and self._worker is None)
+            # Empty categories stay checkable: the choice is remembered for the next dataset.
+            check.setEnabled(self._worker is None)
 
     def _on_categories_changed(self, *_args) -> None:
         selected = [category for category, check in self._category_checks.items() if check.isChecked()]
