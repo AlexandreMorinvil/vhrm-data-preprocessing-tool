@@ -10,7 +10,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 import pandas as pd
-from PyQt6.QtWidgets import QApplication, QCheckBox, QMessageBox
+from PyQt6.QtCore import QPoint, Qt
+from PyQt6.QtWidgets import QApplication, QCheckBox, QMenu, QMessageBox
 
 from app.modes.mode5_ppg_alignment import PpgAlignmentWidget
 from app.ppg_alignment import FaceTrace, FaceTraceSettings, cache_key, cache_paths, save_trace
@@ -52,6 +53,47 @@ class SegmentMarkTests(unittest.TestCase):
             texts = [widget._segment_list.item(row).text() for row in range(widget._segment_list.count())]
             self.assertFalse(texts[0].endswith("✓"))
             self.assertTrue(texts[1].endswith("✓"))
+            widget._player.shutdown()
+
+
+class EstimateByLabelTests(unittest.TestCase):
+    def test_estimate_all_can_be_limited_to_one_label(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            intervals = []
+            for index, label in enumerate(("Resting", "Curl", "Resting")):
+                folder = root / "labelled_segments" / f"{index:04d}_{label}"
+                folder.mkdir(parents=True)
+                (folder / "cam1_Camera_Front.mp4").write_bytes(b"")
+                (folder / "meta.json").write_text(json.dumps(
+                    {"cameras": [{"label": "Camera_Front", "video_file": "cam1_Camera_Front.mp4"}]}),
+                    encoding="utf-8")
+                intervals.append(LabelInterval(label, index * 100.0, index * 100.0 + 60.0, folder=str(folder)))
+            state = ProjectState()
+            state.output_directory = str(root)
+            state.ffmpeg_path = "ffmpeg"
+            state.intervals = intervals
+            widget = PpgAlignmentWidget(state)
+            combo = widget._estimate_label_combo
+            self.assertEqual([combo.itemText(i) for i in range(combo.count())],
+                             ["All labels", "Resting (2)", "Curl (1)"])
+
+            def queued() -> list[str]:
+                with mock.patch.object(widget, "_estimate_job") as job:
+                    widget._start_estimate(all_segments=True)
+                    deadline = time.time() + 30
+                    while widget._estimate_worker is not None and time.time() < deadline:
+                        _app.processEvents()
+                        time.sleep(0.01)
+                return [name for name, *_rest in job.call_args.kwargs["jobs"]]
+
+            combo.setCurrentIndex(combo.findData("Resting"))
+            self.assertEqual(queued(), ["0000_Resting", "0002_Resting"])
+            # The chosen label survives a refresh of the list.
+            widget.refresh_from_state()
+            self.assertEqual(combo.currentData(), "Resting")
+            combo.setCurrentIndex(0)
+            self.assertEqual(queued(), ["0000_Resting", "0001_Curl", "0002_Resting"])
             widget._player.shutdown()
 
 
@@ -213,6 +255,70 @@ class PooledScanTests(unittest.TestCase):
         self.widget._pool_cb.setChecked(False)
         self._wait_for_pool()
         self.assertNotIn("Pooled", self.widget._metrics_label.text())
+
+    def test_pools_only_the_ticked_segments(self) -> None:
+        self._open([
+            _write_segment(self.root, 0, "Resting", 0.0, rr_sec=0.95, offset=1.3, seed=1),
+            _write_segment(self.root, 1, "Curl", 500.0, rr_sec=0.6, offset=1.3, seed=2),
+        ])
+        items = [self.widget._segment_list.item(row) for row in range(2)]
+        self.assertIsNone(items[0].data(Qt.ItemDataRole.CheckStateRole))  # no tick box until pooling
+        self.widget._pool_cb.setChecked(True)
+        self._wait_for_pool()
+        self.assertEqual([item.checkState() for item in items], [Qt.CheckState.Checked] * 2)
+
+        items[0].setCheckState(Qt.CheckState.Unchecked)
+        self._wait_for_pool()
+        self.assertEqual([name for name, _key, _sum in self.widget._pool_segments], ["0001_Curl"])
+        self.assertIn("1 estimated segment(s) unticked", self.widget._metrics_label.text())
+        self.assertEqual(self.widget._estimate_record()["segments"], ["0001_Curl"])
+
+        self.widget._select_pooled(False)
+        self._wait_for_pool()
+        self.assertEqual(self.widget._pool_segments, [])
+        self.assertIn("No segment is pooled", self.widget._metrics_label.text())
+
+        # The selection is kept while pooling is off and when the list is refreshed.
+        self.widget._pool_cb.setChecked(False)
+        self.assertIsNone(items[0].data(Qt.ItemDataRole.CheckStateRole))
+        self.widget._select_pooled(True)
+        self.widget._pool_cb.setChecked(True)
+        self.widget._segment_list.item(0).setCheckState(Qt.CheckState.Unchecked)
+        self.widget.refresh_from_state()
+        self._wait_for_pool()
+        self.assertEqual(self.widget._segment_list.item(0).checkState(), Qt.CheckState.Unchecked)
+        self.assertEqual([name for name, _key, _sum in self.widget._pool_segments], ["0001_Curl"])
+
+    def test_right_click_ticks_the_segments_of_a_label(self) -> None:
+        self._open([
+            _write_segment(self.root, 0, "Resting", 0.0, rr_sec=0.95, offset=1.3, seed=1),
+            _write_segment(self.root, 1, "Curl", 500.0, rr_sec=0.6, offset=1.3, seed=2),
+            _write_segment(self.root, 2, "Resting", 1000.0, rr_sec=0.8, offset=1.3, seed=3),
+        ])
+        segment_list = self.widget._segment_list
+        self.widget._pool_cb.setChecked(True)
+        self._wait_for_pool()
+
+        def right_click(row: int, choice: str) -> None:
+            def choose(menu, *_args):
+                return next(action for action in menu.actions() if action.text().startswith(choice))
+            with mock.patch.object(segment_list, "itemAt", return_value=segment_list.item(row)), \
+                    mock.patch.object(QMenu, "exec", new=choose):
+                self.widget._segment_menu(QPoint(0, 0))
+            self._wait_for_pool()
+
+        def ticked() -> list[bool]:
+            return [segment_list.item(row).checkState() == Qt.CheckState.Checked for row in range(3)]
+
+        right_click(2, "Untick all “Resting” segments (2)")
+        self.assertEqual(ticked(), [False, True, False])
+        self.assertEqual([name for name, _key, _sum in self.widget._pool_segments], ["0001_Curl"])
+        right_click(0, "Tick all “Resting”")
+        self.assertEqual(ticked(), [True, True, True])
+        right_click(0, "Tick only “Resting”")
+        self.assertEqual(ticked(), [True, False, True])
+        self.assertEqual([name for name, _key, _sum in self.widget._pool_segments],
+                         ["0000_Resting", "0002_Resting"])
 
     def test_shows_every_window_when_none_passes_the_heart_rate_check(self) -> None:
         self._open([_write_segment(self.root, 0, "Resting", 0.0, rr_sec=0.8, offset=0.5, seed=3,

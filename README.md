@@ -271,7 +271,8 @@ the offset from the video itself.
    pixels of the inner face box in every frame and turns the colour into a pulse
    waveform with POS, CHROM or Green. A 60 s clip takes about 10 s with hardware
    decoding. Results are cached in `<output>/ppg_alignment/cache/`.
-   **Estimate all** does the same for every segment.
+   **Estimate all** does the same for every segment not estimated yet, or only
+   for the segments of one label when one is chosen in **Estimate all for**.
 3. The graph overlays the estimated rPPG (blue) and the synthetic PPG (orange)
    shifted by the current offset. Below it, the correlation for every offset of
    the search range (default ±10 s) is computed on the shaded window; drag its
@@ -292,9 +293,13 @@ the offset from the video itself.
    back and **Full range** shows everything. Ctrl+drag pans and the wheel zooms
    time in both modes.
 5. Check other segments: the offset is kept when you change segment, so you can
-   see whether it also aligns them. **Pool all estimated segments** (Search)
-   replaces the correlation with its average over every 30 s window of every
-   segment estimated for the camera (**Estimate all** first). It leaves out
+   see whether it also aligns them. **Pool estimated segments** (Search)
+   replaces the correlation with its average over every 30 s window of the
+   segments estimated for the camera (**Estimate all** first). While pooling,
+   each segment of the list has a tick box: untick a segment to leave it out
+   (**Pooled segments: All / None** ticks or unticks them all; right-click a
+   segment to tick or untick every segment with its label, or tick only those).
+   It leaves out
    windows where the face was lost or where the rPPG and PPG heart rates differ
    by more than **Max HR difference** (3 bpm by default; changing it takes
    effect at once). If no window passes, the graph pools every window where the

@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -188,6 +189,9 @@ class PpgAlignmentWidget(QWidget):
         self._pool_segments: list[tuple[str, tuple, Optional[CorrelationSum]]] = []
         self._pool_fallback = False
         self._pool_missing = 0
+        # Folders of the segments unticked in the list: left out of the pool.
+        self._pool_excluded: set[str] = set()
+        self._pool_unticked = 0
         self._pool_worker: Optional[FFmpegWorker] = None
         self._pool_results: dict[tuple, Optional[tuple[np.ndarray, list[WindowCorrelation]]]] = {}
         self._drift_cache: dict[tuple, float] = {}
@@ -221,6 +225,9 @@ class PpgAlignmentWidget(QWidget):
         self._segment_list.setMinimumHeight(160)
         self._segment_list.setToolTip("✓ = rPPG already estimated for the selected camera")
         self._segment_list.currentRowChanged.connect(self._on_segment_selected)
+        self._segment_list.itemChanged.connect(self._on_segment_item_changed)
+        self._segment_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._segment_list.customContextMenuRequested.connect(self._segment_menu)
         seg_lay.addWidget(self._segment_list)
         nav = QHBoxLayout()
         prev_btn = QPushButton("◀ Previous")
@@ -257,6 +264,10 @@ class PpgAlignmentWidget(QWidget):
         )
         self._skin_cb.toggled.connect(self._on_camera_changed)
         form.addRow("", self._skin_cb)
+        self._estimate_label_combo = QComboBox()
+        self._estimate_label_combo.setToolTip("Label of the segments that Estimate all estimates")
+        self._estimate_label_combo.addItem("All labels", "")
+        form.addRow("Estimate all for:", self._estimate_label_combo)
         est_lay.addLayout(form)
         est_buttons = QHBoxLayout()
         self._estimate_btn = QPushButton("Estimate this segment")
@@ -264,7 +275,9 @@ class PpgAlignmentWidget(QWidget):
         self._estimate_btn.clicked.connect(lambda: self._start_estimate(all_segments=False))
         est_buttons.addWidget(self._estimate_btn)
         self._estimate_all_btn = QPushButton("Estimate all")
-        self._estimate_all_btn.setToolTip("Estimate every segment not yet estimated for this camera")
+        self._estimate_all_btn.setToolTip(
+            "Estimate every segment (of the label chosen in Estimate all for) not yet estimated for this camera"
+        )
         self._estimate_all_btn.clicked.connect(lambda: self._start_estimate(all_segments=True))
         est_buttons.addWidget(self._estimate_all_btn)
         self._cancel_btn = QPushButton("Cancel")
@@ -314,17 +327,30 @@ class PpgAlignmentWidget(QWidget):
         full_btn.clicked.connect(lambda: self._plot.show_full_range())
         window_row.addWidget(full_btn, 1, 1)
         search_lay.addLayout(window_row)
-        self._pool_cb = QCheckBox("Pool all estimated segments")
+        self._pool_cb = QCheckBox("Pool estimated segments")
         self._pool_cb.setToolTip(
-            f"Average the correlation of every {_POOL_WINDOW_SEC:.0f} s window of every segment estimated\n"
-            "for this camera. Windows where the face was lost or the rPPG and PPG heart rates differ\n"
-            "by more than the maximum heart-rate difference are left out.\n\n"
+            f"Average the correlation of every {_POOL_WINDOW_SEC:.0f} s window of the segments estimated\n"
+            "for this camera and ticked in the Segments list. Windows where the face was lost or the\n"
+            "rPPG and PPG heart rates differ by more than the maximum heart-rate difference are left out.\n\n"
             "One window has a correlation peak every heartbeat, all of similar height. Segments at\n"
             "different heart rates put those neighbouring peaks at different offsets, while the true\n"
             "offset is the same for all of them, so it stands out once they are pooled."
         )
         self._pool_cb.toggled.connect(self._on_pool_toggled)
         search_lay.addWidget(self._pool_cb)
+        select_row = QHBoxLayout()
+        select_row.addWidget(QLabel("Pooled segments:"))
+        self._pool_all_btn = QPushButton("All")
+        self._pool_all_btn.setToolTip("Tick every segment in the Segments list")
+        self._pool_all_btn.clicked.connect(lambda: self._select_pooled(True))
+        select_row.addWidget(self._pool_all_btn)
+        self._pool_none_btn = QPushButton("None")
+        self._pool_none_btn.setToolTip("Untick every segment, then tick the ones to pool")
+        self._pool_none_btn.clicked.connect(lambda: self._select_pooled(False))
+        select_row.addWidget(self._pool_none_btn)
+        for button in (self._pool_all_btn, self._pool_none_btn):
+            button.setEnabled(False)
+        search_lay.addLayout(select_row)
         hr_row = QHBoxLayout()
         hr_row.addWidget(QLabel("Max HR difference:"))
         self._pool_hr_spin = QDoubleSpinBox()
@@ -473,7 +499,9 @@ class PpgAlignmentWidget(QWidget):
         for segment in self._segments:
             self._segment_list.addItem(segment.title)
         self._segment_list.blockSignals(False)
+        self._update_pool_checks()
         self._update_segment_marks()
+        self._update_label_choices()
         if self._segments:
             self._data_label.setText(f"{len(self._segments)} labelled segment(s).")
         else:
@@ -554,6 +582,98 @@ class PpgAlignmentWidget(QWidget):
                 continue
             done = cache_dir is not None and cache_paths(cache_dir, self._key(segment))[0].exists()
             item.setText(segment.title + ("  ✓" if done else ""))
+
+    def _update_label_choices(self) -> None:
+        """Offer each label of the segments to Estimate all, keeping the chosen one."""
+        current = self._estimate_label_combo.currentData() or ""
+        counts: dict[str, int] = {}
+        for segment in self._segments:
+            counts[segment.interval.label] = counts.get(segment.interval.label, 0) + 1
+        self._estimate_label_combo.clear()
+        self._estimate_label_combo.addItem("All labels", "")
+        for label, count in counts.items():
+            self._estimate_label_combo.addItem(f"{label} ({count})", label)
+        self._estimate_label_combo.setCurrentIndex(max(0, self._estimate_label_combo.findData(current)))
+
+    def _update_pool_checks(self) -> None:
+        """While pooling, a tick box on each segment chooses whether it is pooled."""
+        pooling = self._pool_cb.isChecked()
+        self._segment_list.blockSignals(True)
+        for row, segment in enumerate(self._segments):
+            item = self._segment_list.item(row)
+            if item is None:
+                continue
+            if pooling:
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(Qt.CheckState.Unchecked if str(segment.folder) in self._pool_excluded
+                                   else Qt.CheckState.Checked)
+            else:
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                item.setData(Qt.ItemDataRole.CheckStateRole, None)  # hides the tick box
+        self._segment_list.blockSignals(False)
+        self._segment_list.setToolTip(
+            "✓ = rPPG already estimated for the selected camera"
+            + ("\nTick box = segment pooled in the correlation" if pooling else "")
+        )
+
+    def _on_segment_item_changed(self, item) -> None:
+        if not item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+            return
+        row = self._segment_list.row(item)
+        if not 0 <= row < len(self._segments):
+            return
+        folder = str(self._segments[row].folder)
+        excluded = item.checkState() != Qt.CheckState.Checked
+        if excluded == (folder in self._pool_excluded):
+            return  # the text changed, not the tick
+        if excluded:
+            self._pool_excluded.add(folder)
+        else:
+            self._pool_excluded.discard(folder)
+        self._schedule_scan()
+
+    def _select_pooled(self, include: bool) -> None:
+        self._pool_excluded = set() if include else {str(segment.folder) for segment in self._segments}
+        self._update_pool_checks()
+        self._schedule_scan()
+
+    def _select_pooled_label(self, label: str, include: bool, only: bool = False) -> None:
+        """Tick (or untick) every segment of *label*; with *only*, untick all the others."""
+        for segment in self._segments:
+            folder = str(segment.folder)
+            if segment.interval.label == label:
+                if include:
+                    self._pool_excluded.discard(folder)
+                else:
+                    self._pool_excluded.add(folder)
+            elif only:
+                self._pool_excluded.add(folder)
+        self._update_pool_checks()
+        self._schedule_scan()
+
+    def _segment_menu(self, pos) -> None:
+        item = self._segment_list.itemAt(pos)
+        row = self._segment_list.row(item) if item is not None else -1
+        if not 0 <= row < len(self._segments):
+            return
+        label = self._segments[row].interval.label
+        count = sum(1 for segment in self._segments if segment.interval.label == label)
+        menu = QMenu(self)
+        tick = menu.addAction(f"Tick all “{label}” segments ({count})")
+        untick = menu.addAction(f"Untick all “{label}” segments ({count})")
+        only = menu.addAction(f"Tick only “{label}” segments")
+        if not self._pool_cb.isChecked():
+            for action in (tick, untick, only):
+                action.setEnabled(False)
+            menu.addSeparator()
+            menu.addAction("Turn on Pool estimated segments (Search) to tick segments").setEnabled(False)
+        chosen = menu.exec(self._segment_list.viewport().mapToGlobal(pos))
+        if chosen is tick:
+            self._select_pooled_label(label, True)
+        elif chosen is untick:
+            self._select_pooled_label(label, False)
+        elif chosen is only:
+            self._select_pooled_label(label, True, only=True)
 
     def _on_segment_selected(self, row: int) -> None:
         if row < 0 or row >= len(self._segments):
@@ -817,8 +937,8 @@ class PpgAlignmentWidget(QWidget):
     def _update_search_hint(self) -> None:
         if self._pool_cb.isChecked():
             self._search_hint.setText(
-                "The correlation pools every segment estimated for this camera; the shaded "
-                "window is not used."
+                "The correlation pools the segments estimated for this camera and ticked in "
+                "the Segments list; the shaded window is not used."
             )
         else:
             self._search_hint.setText(
@@ -828,11 +948,14 @@ class PpgAlignmentWidget(QWidget):
 
     def _on_pool_toggled(self, on: bool) -> None:
         self._pool_hr_spin.setEnabled(on)
+        self._pool_all_btn.setEnabled(on)
+        self._pool_none_btn.setEnabled(on)
+        self._update_pool_checks()
         self._update_search_hint()
         self._run_scan()
 
     def _pool_jobs(self) -> tuple[list[tuple[str, tuple]], list[dict]]:
-        """(name, key) of every estimated segment in order, and the jobs not computed yet."""
+        """(name, key) of every estimated, ticked segment in order, and the jobs not computed yet."""
         cache_dir = self._cache_dir()
         method = self._method_combo.currentText()
         lag_range = (round(self._lag_min.value(), 3), round(self._lag_max.value(), 3))
@@ -840,6 +963,7 @@ class PpgAlignmentWidget(QWidget):
         order: list[tuple[str, tuple]] = []
         jobs: list[dict] = []
         self._pool_missing = 0
+        self._pool_unticked = 0
         for segment in self._segments:
             video = dict(segment.cameras()).get(self._camera_label())
             trace_key = self._key(segment)
@@ -851,6 +975,9 @@ class PpgAlignmentWidget(QWidget):
             start = segment_reference_start(segment.meta, segment.interval, self.state)
             if source is None or start is None:
                 self._pool_missing += 1
+                continue
+            if str(segment.folder) in self._pool_excluded:
+                self._pool_unticked += 1
                 continue
             key = (segment.folder.name, trace_key, method, lag_range, trace_path.stat().st_mtime_ns,
                    str(source), source.stat().st_mtime, start.timestamp())
@@ -943,6 +1070,9 @@ class PpgAlignmentWidget(QWidget):
     def _pooled_metrics(self) -> str:
         names = [name for name, _key, _sum in self._pool_segments]
         if not names:
+            if self._pool_unticked:
+                return (f"No segment is pooled: tick some of the {self._pool_unticked} estimated "
+                        "segment(s) in the Segments list (or Pooled segments: All).")
             return ("No segment is estimated for this camera yet: estimate them (Estimate all) "
                     "to pool their correlation.")
         parts = [f"Offset {self._offset:+.3f} s"]
@@ -971,6 +1101,8 @@ class PpgAlignmentWidget(QWidget):
                 f"segment(s); windows where the face was lost or the heart rates differ by more than "
                 f"{tolerance:.0f} bpm are left out."
             )
+        if self._pool_unticked:
+            lines[-1] += f" {self._pool_unticked} estimated segment(s) unticked."
         if self._pool_missing:
             lines[-1] += f" {self._pool_missing} segment(s) not estimated for this camera."
         width = max(len(name) for name in names)
@@ -1068,7 +1200,7 @@ class PpgAlignmentWidget(QWidget):
         if self._scan is None or not self._scan.valid:
             QMessageBox.information(
                 self, "PPG alignment",
-                "Estimate the rPPG of some segments first (pooling needs at least one usable window)."
+                "Estimate and tick some segments first (pooling needs at least one usable window)."
                 if self._pool_cb.isChecked() else "Estimate the rPPG of this segment first.",
             )
             return False
@@ -1258,7 +1390,9 @@ class PpgAlignmentWidget(QWidget):
             QMessageBox.information(self, "PPG alignment", "Select a labelled segment first.")
             return
         camera = self._camera_label()
-        candidates = self._segments if all_segments else [self._segment]
+        label = (self._estimate_label_combo.currentData() or "") if all_segments else ""
+        candidates = ([s for s in self._segments if not label or s.interval.label == label]
+                      if all_segments else [self._segment])
         jobs = []
         for segment in candidates:
             video = dict(segment.cameras()).get(camera)
@@ -1270,7 +1404,8 @@ class PpgAlignmentWidget(QWidget):
             trace_path, roi_path = cache_paths(cache_dir, key)
             jobs.append((segment.folder.name, str(video), key, str(roi_path)))
         if not jobs:
-            self._estimate_label.setText(f"Every segment is already estimated for {camera}.")
+            which = f"{label} segment" if label else "segment"
+            self._estimate_label.setText(f"Every {which} is already estimated for {camera}.")
             return
         # Release the ROI video of the shown segment: it may be rewritten.
         self._rebuild_views(include_roi=False)
