@@ -4,9 +4,10 @@ Pipeline (one labelled-segment camera clip at a time):
 
 1. FFmpeg decodes the clip at ``fs`` frames per second, scaled down so face
    detection and colour averaging stay fast (hardware decoding when available).
-2. YuNet finds the face every few frames; the box is smoothed between
-   detections. The region of interest (ROI) is the inner part of the face box,
-   restricted to skin-coloured pixels.
+2. YuNet finds the face every few frames (optionally every frame); the box is
+   smoothed between detections (optionally without lag, for head motion). The
+   region of interest (ROI) is the inner part of the face box, restricted to
+   skin-coloured pixels.
 3. The mean R, G, B of the ROI per frame is cached; the ROI itself is written
    to a small H.264 video so it can be played next to the cameras.
 4. An rPPG method (see :mod:`app.rppg`) turns the colour trace into a pulse
@@ -19,12 +20,14 @@ timeline. The correlation for offset ``L`` compares the pulse at video time
 """
 from __future__ import annotations
 
+import bisect
 import json
 import logging
 import os
 import re
 import subprocess
 import threading
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -41,6 +44,12 @@ log = logging.getLogger(__name__)
 CACHE_VERSION = 1
 ROI_VIDEO_SIZE = (150, 200)  # width, height of the ROI preview video
 _NO_FACE_GREY = 40
+# Centred smoothing: box position averaged over 3 frames, size (median) over 15.
+_CENTRED_POSITION_FRAMES = 3
+_CENTRED_SIZE_FRAMES = 15
+# Settings left out of the cache signature while off, so traces cached before they
+# existed stay valid.
+_OPTIONAL_SETTINGS = ("detect_every_frame", "centred_smoothing")
 
 
 @dataclass
@@ -53,6 +62,9 @@ class FaceTraceSettings:
     roi_width_fraction: float = 0.8   # keep the central part of the face box (drops background)
     skin_mask: bool = True
     hardware_decoding: bool = True
+    # Options for head motion (off: the original tracking). See _BoxTracker.
+    detect_every_frame: bool = False  # detection in every frame instead of every detect_every
+    centred_smoothing: bool = False   # box interpolated between detections, smoothed without lag
 
     @classmethod
     def from_dict(cls, data: dict) -> "FaceTraceSettings":
@@ -154,6 +166,86 @@ def roi_preview_frame(crop_bgr: np.ndarray, mask: Optional[np.ndarray]) -> np.nd
         shown = crop_bgr.copy()
         shown[~mask] = (shown[~mask] * 0.3).astype(np.uint8)
     return cv2.resize(shown, (width, height), interpolation=cv2.INTER_AREA)
+
+
+class _BoxTracker:
+    """Face box of every frame, from face detections run on some of the frames.
+
+    Original tracking: a detection every ``detect_every`` frames, blended into the
+    previous box (``box_smoothing``). Cheap and steady, but the box trails a head
+    that moves quickly (e.g. during squats) and partly leaves the face.
+
+    ``detect_every_frame`` runs the detection in every frame. ``centred_smoothing``
+    interpolates the box between detections and smooths it over a window centred on
+    each frame, so it does not lag behind the head; a frame is then released a few
+    frames later, once the detections it depends on are known.
+
+    :meth:`push` and :meth:`flush` return ``(frame, box or None, detected)`` in frame order.
+    """
+
+    def __init__(self, settings: FaceTraceSettings, detect: Callable[[np.ndarray], list]):
+        self._settings = settings
+        self._detect = detect
+        self._interval = 1 if settings.detect_every_frame else max(1, settings.detect_every)
+        self._hold_frames = int(2.0 * settings.fs)  # a face not re-detected for 2 s is flagged
+        self._frames_since_detection = 10 ** 9
+        self._face: Optional[np.ndarray] = None  # original: smoothed box; centred: last detection
+        # Centred smoothing: successful detections and the frames waiting for later ones.
+        self._indices: list[int] = []
+        self._boxes: list[np.ndarray] = []
+        self._pending: deque = deque()
+        self._latest = -1
+        self._lookahead = self._interval + _CENTRED_SIZE_FRAMES // 2
+
+    def push(self, index: int, frame: np.ndarray) -> list[tuple[np.ndarray, Optional[np.ndarray], bool]]:
+        if self._face is None or index % self._interval == 0:
+            found = choose_face(self._detect(frame), self._face)
+            if found is not None:
+                if self._settings.centred_smoothing:
+                    self._face = found
+                    self._indices.append(index)
+                    self._boxes.append(found)
+                else:
+                    smoothing = self._settings.box_smoothing
+                    self._face = found if self._face is None else (1.0 - smoothing) * self._face + smoothing * found
+                self._frames_since_detection = 0
+        self._frames_since_detection += 1
+        detected = self._frames_since_detection <= self._hold_frames
+        if self._face is None:
+            return [(frame, None, False)]
+        if not self._settings.centred_smoothing:
+            return [(frame, self._face, detected)]
+        self._latest = index
+        self._pending.append((index, frame, detected))
+        return self._release(index - self._lookahead)
+
+    def flush(self) -> list[tuple[np.ndarray, Optional[np.ndarray], bool]]:
+        return self._release(self._latest)
+
+    def _release(self, last: int) -> list[tuple[np.ndarray, Optional[np.ndarray], bool]]:
+        released = []
+        while self._pending and self._pending[0][0] <= last:
+            index, frame, detected = self._pending.popleft()
+            released.append((frame, self._centred_box(index), detected))
+        return released
+
+    def _centred_box(self, index: int) -> np.ndarray:
+        half = _CENTRED_SIZE_FRAMES // 2
+        frames = np.arange(max(0, index - half), min(self._latest, index + half) + 1)
+        # Detections around the window (one more on each side to interpolate from).
+        lo = max(0, bisect.bisect_left(self._indices, frames[0]) - 1)
+        hi = bisect.bisect_right(self._indices, frames[-1]) + 1
+        indices = np.asarray(self._indices[lo:hi], dtype=np.float64)
+        boxes = np.asarray(self._boxes[lo:hi], dtype=np.float64)
+        centres = boxes[:, :2] + boxes[:, 2:] / 2.0
+        track = np.column_stack([np.interp(frames, indices, centres[:, 0]),
+                                 np.interp(frames, indices, centres[:, 1]),
+                                 np.interp(frames, indices, boxes[:, 2]),
+                                 np.interp(frames, indices, boxes[:, 3])])
+        near = np.abs(frames - index) <= _CENTRED_POSITION_FRAMES // 2
+        centre = track[near, :2].mean(axis=0)
+        size = np.median(track[:, 2:], axis=0)
+        return np.concatenate([centre - size / 2.0, size])
 
 
 # ---------------------------------------------------------------------------
@@ -301,9 +393,24 @@ def extract_face_trace(
     colours: list[np.ndarray] = []
     detected: list[bool] = []
     boxes: list[tuple[float, float, float, float]] = []
-    face: Optional[np.ndarray] = None
-    frames_since_detection = 10 ** 9
-    hold_frames = int(2.0 * settings.fs)  # a face not re-detected for 2 s is flagged
+    tracker = _BoxTracker(settings, lambda frame: detect_faces_scored(frame, detector_settings))
+
+    def record(frame: np.ndarray, face: Optional[np.ndarray], face_detected: bool) -> None:
+        if face is None:
+            colours.append(np.full(3, np.nan))
+            detected.append(False)
+            boxes.append((np.nan,) * 4)
+            if writer:
+                writer.write(roi_preview_frame(np.empty((0, 0, 3), np.uint8), None))
+            return
+        x, y, w, h = roi_from_face(face, settings.roi_width_fraction, size)
+        crop = frame[y:y + h, x:x + w]
+        colour, mask = roi_mean_rgb(crop, settings.skin_mask)
+        colours.append(colour)
+        detected.append(face_detected)
+        boxes.append((x, y, w, h))
+        if writer:
+            writer.write(roi_preview_frame(crop, mask))
 
     def frames():
         if settings.hardware_decoding:
@@ -325,31 +432,12 @@ def extract_face_trace(
         for index, frame in enumerate(frames()):
             if cancel is not None and cancel():
                 raise Cancelled("Cancelled by user")
-            if face is None or index % max(1, settings.detect_every) == 0:
-                found = choose_face(detect_faces_scored(frame, detector_settings), face)
-                if found is not None:
-                    face = found if face is None else (
-                        (1.0 - settings.box_smoothing) * face + settings.box_smoothing * found
-                    )
-                    frames_since_detection = 0
-            frames_since_detection += 1
-            if face is None:
-                colours.append(np.full(3, np.nan))
-                detected.append(False)
-                boxes.append((np.nan,) * 4)
-                if writer:
-                    writer.write(roi_preview_frame(np.empty((0, 0, 3), np.uint8), None))
-            else:
-                x, y, w, h = roi_from_face(face, settings.roi_width_fraction, size)
-                crop = frame[y:y + h, x:x + w]
-                colour, mask = roi_mean_rgb(crop, settings.skin_mask)
-                colours.append(colour)
-                detected.append(frames_since_detection <= hold_frames)
-                boxes.append((x, y, w, h))
-                if writer:
-                    writer.write(roi_preview_frame(crop, mask))
+            for released in tracker.push(index, frame):
+                record(*released)
             if progress is not None and index % 15 == 0:
                 progress(index + 1, max(expected, index + 1))
+        for released in tracker.flush():
+            record(*released)
         finished = True
     finally:
         if writer:
@@ -380,12 +468,16 @@ def cache_key(segment_folder: str, camera_label: str) -> str:
 
 def _signature(video_path: str, settings: FaceTraceSettings) -> dict:
     stat = os.stat(video_path)
+    values = asdict(settings)
+    for name in _OPTIONAL_SETTINGS:
+        if not values[name]:
+            del values[name]
     return {
         "version": CACHE_VERSION,
         "video": Path(video_path).name,
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
-        "settings": asdict(settings),
+        "settings": values,
     }
 
 

@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -11,6 +12,7 @@ from app.ffmpeg_utils import find_ffmpeg
 from app.ppg_alignment import (
     FaceTrace,
     FaceTraceSettings,
+    _BoxTracker,
     cache_paths,
     choose_face,
     extract_face_trace,
@@ -178,7 +180,83 @@ class FaceRoiTests(unittest.TestCase):
         self.assertIsNone(choose_face([], previous))
 
 
+def _track(settings: FaceTraceSettings, faces: np.ndarray) -> tuple[np.ndarray, list[int]]:
+    """Boxes of _BoxTracker for a face at *faces[i]* in frame i, and the frames detected on."""
+    detected_on: list[int] = []
+
+    def detect(index):
+        detected_on.append(int(index))
+        return [(*faces[index], 0.9)]
+
+    # The tracker passes the frame to the detector: here the frame is its index.
+    tracker = _BoxTracker(settings, detect)
+    released = []
+    for index in range(len(faces)):
+        released += tracker.push(index, index)
+    released += tracker.flush()
+    assert [frame for frame, _box, _detected in released] == list(range(len(faces)))
+    return np.array([box for _frame, box, _detected in released]), detected_on
+
+
+class BoxTrackerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # A face bobbing up and down 3 face heights every 2 s (squats), at 30 frames/s.
+        t = np.arange(120) / FS
+        y = 200 + 150 * np.sin(2 * np.pi * 0.5 * t)
+        self.faces = np.column_stack([np.full(len(t), 100.0), y, np.full(len(t), 100.0), np.full(len(t), 100.0)])
+
+    def _lag(self, boxes: np.ndarray) -> float:
+        """Median vertical error of the box, in face heights."""
+        return float(np.median(np.abs(boxes[:, 1] - self.faces[:, 1])) / 100.0)
+
+    def test_original_tracking_detects_every_tenth_frame_and_blends(self) -> None:
+        settings = FaceTraceSettings()
+        boxes, detected_on = _track(settings, self.faces)
+        self.assertEqual(detected_on, list(range(0, 120, 10)))
+        np.testing.assert_allclose(boxes[0], self.faces[0])
+        blended = (1 - settings.box_smoothing) * self.faces[0] + settings.box_smoothing * self.faces[10]
+        np.testing.assert_allclose(boxes[10], blended)
+        np.testing.assert_allclose(boxes[15], blended)  # held until the next detection
+        self.assertGreater(self._lag(boxes), 0.5)  # trails the moving face
+
+    def test_detecting_every_frame_follows_a_moving_face(self) -> None:
+        boxes, detected_on = _track(FaceTraceSettings(detect_every_frame=True), self.faces)
+        self.assertEqual(detected_on, list(range(120)))
+        self.assertLess(self._lag(boxes), 0.2)
+
+    def test_centred_smoothing_does_not_lag(self) -> None:
+        boxes, _ = _track(FaceTraceSettings(detect_every_frame=True, centred_smoothing=True), self.faces)
+        self.assertLess(self._lag(boxes), 0.02)
+        # Between detections every 10th frame, the box is interpolated rather than held.
+        boxes, detected_on = _track(FaceTraceSettings(centred_smoothing=True), self.faces)
+        self.assertEqual(detected_on, list(range(0, 120, 10)))
+        self.assertLess(self._lag(boxes), 0.15)
+
+    def test_centred_smoothing_keeps_the_face_size_steady(self) -> None:
+        faces = self.faces.copy()
+        faces[50, 2:] = 160.0  # one oversized detection
+        boxes, _ = _track(FaceTraceSettings(detect_every_frame=True, centred_smoothing=True), faces)
+        np.testing.assert_allclose(boxes[50, 2:], [100.0, 100.0])
+
+
 class TraceCacheTests(unittest.TestCase):
+    def test_traces_cached_before_the_tracking_options_stay_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            video = Path(directory) / "cam2_Front.mp4"
+            video.write_bytes(b"video")
+            trace = FaceTrace(fs=30.0, rgb=np.ones((4, 3)), detected=np.ones(4, bool),
+                              boxes=np.zeros((4, 4)), frame_size=(540, 960),
+                              video_path=str(video), settings=FaceTraceSettings())
+            save_trace(directory, "key", trace)
+            with np.load(cache_paths(directory, "key")[0]) as data:
+                stored = json.loads(str(data["signature"]))["settings"]
+            self.assertNotIn("detect_every_frame", stored)
+            self.assertNotIn("centred_smoothing", stored)
+            self.assertIsNotNone(load_trace(directory, "key", str(video), FaceTraceSettings()))
+            self.assertIsNone(load_trace(directory, "key", str(video), FaceTraceSettings(detect_every_frame=True)))
+            self.assertIsNone(load_trace(directory, "key", str(video), FaceTraceSettings(centred_smoothing=True)))
+
+
     def test_cache_is_reused_only_for_the_same_video_and_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             video = Path(directory) / "cam2_Front.mp4"

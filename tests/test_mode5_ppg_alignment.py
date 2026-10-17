@@ -53,6 +53,21 @@ class SegmentMarkTests(unittest.TestCase):
             texts = [widget._segment_list.item(row).text() for row in range(widget._segment_list.count())]
             self.assertFalse(texts[0].endswith("✓"))
             self.assertTrue(texts[1].endswith("✓"))
+
+            # The face tracking options are off by default (original estimates) and keep
+            # their own estimates apart.
+            segment = widget._segments[1]
+            self.assertEqual(widget._key(segment), cache_key(str(estimated), "Camera_Front_skin"))
+            self.assertEqual(widget._trace_settings(), FaceTraceSettings())
+            widget._every_frame_cb.setChecked(True)
+            widget._centred_cb.setChecked(True)
+            self.assertEqual(widget._key(segment), cache_key(str(estimated), "Camera_Front_skin_every_frame_centred"))
+            self.assertTrue(widget._trace_settings().detect_every_frame)
+            self.assertTrue(widget._trace_settings().centred_smoothing)
+            self.assertFalse(widget._segment_list.item(1).text().endswith("✓"))
+            widget._every_frame_cb.setChecked(False)
+            widget._centred_cb.setChecked(False)
+            self.assertTrue(widget._segment_list.item(1).text().endswith("✓"))
             widget._player.shutdown()
 
 

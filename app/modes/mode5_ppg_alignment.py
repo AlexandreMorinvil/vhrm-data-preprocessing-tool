@@ -264,6 +264,24 @@ class PpgAlignmentWidget(QWidget):
         )
         self._skin_cb.toggled.connect(self._on_camera_changed)
         form.addRow("", self._skin_cb)
+        self._every_frame_cb = QCheckBox("Detect the face in every frame")
+        self._every_frame_cb.setToolTip(
+            "Run the face detection in every analysed frame instead of every 10th. Helps when\n"
+            "the head moves (squats, bench): otherwise the ROI box trails the face. Slower.\n"
+            "Changing this requires a new estimate (kept apart from the estimate without it)."
+        )
+        self._every_frame_cb.toggled.connect(self._on_camera_changed)
+        form.addRow("", self._every_frame_cb)
+        self._centred_cb = QCheckBox("Smooth the face box without lag")
+        self._centred_cb.setToolTip(
+            "Interpolate the face box between detections and smooth it over a window centred\n"
+            "on each frame, instead of blending each detection into the previous box (which\n"
+            "trails a moving head). Helps when there is head motion; best together with\n"
+            "Detect the face in every frame. Changing this requires a new estimate (kept\n"
+            "apart from the estimate without it)."
+        )
+        self._centred_cb.toggled.connect(self._on_camera_changed)
+        form.addRow("", self._centred_cb)
         self._estimate_label_combo = QComboBox()
         self._estimate_label_combo.setToolTip("Label of the segments that Estimate all estimates")
         self._estimate_label_combo.addItem("All labels", "")
@@ -560,7 +578,14 @@ class PpgAlignmentWidget(QWidget):
         return directory / "cache" if directory is not None else None
 
     def _trace_settings(self) -> FaceTraceSettings:
-        return FaceTraceSettings(skin_mask=self._skin_cb.isChecked())
+        return FaceTraceSettings(skin_mask=self._skin_cb.isChecked(),
+                                 detect_every_frame=self._every_frame_cb.isChecked(),
+                                 centred_smoothing=self._centred_cb.isChecked())
+
+    def _tracking_options(self) -> list[str]:
+        """Face tracking options in use (empty: the original tracking)."""
+        return [name for name, box in (("every_frame", self._every_frame_cb), ("centred", self._centred_cb))
+                if box.isChecked()]
 
     # ------------------------------------------------------------------ segments
     def _step_segment(self, step: int) -> None:
@@ -572,7 +597,9 @@ class PpgAlignmentWidget(QWidget):
         return self._camera_combo.currentText()
 
     def _key(self, segment: _Segment) -> str:
-        return cache_key(str(segment.folder), f"{self._camera_label()}_{'skin' if self._skin_cb.isChecked() else 'box'}")
+        # The tracking options extend the key, so estimates with and without them are kept side by side.
+        variant = "_".join(["skin" if self._skin_cb.isChecked() else "box", *self._tracking_options()])
+        return cache_key(str(segment.folder), f"{self._camera_label()}_{variant}")
 
     def _update_segment_marks(self) -> None:
         cache_dir = self._cache_dir()
@@ -1276,6 +1303,8 @@ class PpgAlignmentWidget(QWidget):
                     "best_offset_sec": self._scan.best(),
                     "best_correlation": round(float(np.nanmax(self._scan.correlation)), 4),
                 })
+                if self._tracking_options():
+                    record["face_tracking"] = self._tracking_options()
             return record
         if self._segment is not None and self._scan is not None and self._scan.valid:
             start, end = self._window_bounds()
@@ -1288,6 +1317,8 @@ class PpgAlignmentWidget(QWidget):
                 "best_offset_sec": self._scan.best(),
                 "best_correlation": round(float(np.nanmax(self._scan.correlation)), 4),
             })
+            if self._tracking_options():
+                record["face_tracking"] = self._tracking_options()
         return record
 
     def _apply_offset(self) -> None:
